@@ -27,6 +27,7 @@ The first delivery is a deterministic scheduler simulator. It establishes placem
 - [Backup and restore](docs/operations/backup-and-restore.md)
 - [Service-name DNS plan](docs/superpowers/plans/2026-10-19-service-name-dns.md) · [testing notes](docs/testing/service-name-dns.md)
 - [M7 hardware-aware scheduling](docs/planning/m7-hardware-aware-scheduling.md)
+- [Roadmap (post-M7)](docs/planning/roadmap.md)
 
 ## Running the MVP
 
