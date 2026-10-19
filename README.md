@@ -25,6 +25,7 @@ The first delivery is a deterministic scheduler simulator. It establishes placem
 - [M5 storage and dev workflow](docs/planning/m5-storage-and-dev-workflow.md)
 - [M6 reconciliation and operations](docs/planning/m6-reconciliation-and-operations.md)
 - [Backup and restore](docs/operations/backup-and-restore.md)
+- [M7 service-name DNS plan](docs/superpowers/plans/2026-10-19-service-name-dns.md) · [testing notes](docs/testing/service-name-dns.md)
 
 ## Running the M2 prototype
 

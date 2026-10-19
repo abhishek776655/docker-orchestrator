@@ -113,6 +113,7 @@ type submitRequest struct {
 	MemoryBytes         int64               `json:"memory_bytes"`
 	Architecture        string              `json:"architecture"`
 	HostPorts           []int               `json:"host_ports"`
+	ContainerPorts      []int               `json:"container_ports"`
 	StorageClass        string              `json:"storage_class"`
 	StoragePinnedNodeID string              `json:"storage_pinned_node_id"`
 	Volumes             []model.VolumeMount `json:"volumes"`
@@ -144,6 +145,7 @@ func (svc *Service) handleSubmit(w http.ResponseWriter, r *http.Request) {
 			Architecture: req.Architecture,
 			HostPorts:    req.HostPorts,
 		},
+		ContainerPorts: req.ContainerPorts,
 		Storage: model.StoragePolicy{
 			Class:        storageClass,
 			PinnedNodeID: req.StoragePinnedNodeID,

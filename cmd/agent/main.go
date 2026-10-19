@@ -18,12 +18,14 @@ func main() {
 		NodeID:          envOr("HACO_NODE_ID", "node-local"),
 		Address:         envOr("HACO_NODE_ADDRESS", "127.0.0.1"),
 		ControlPlaneURL: envOr("HACO_CONTROLPLANE_URL", "http://localhost:8080"),
+		DNSAddress:      envOr("HACO_DNS_ADDRESS", ""),
+		DNSSuffix:       envOr("HACO_DNS_SUFFIX", "haco"),
 	}
 
 	home, _ := os.UserHomeDir()
 	dataDir := envOr("HACO_DATA_DIR", filepath.Join(home, ".haco", "volumes", cfg.NodeID))
 
-	docker, err := agent.NewDocker(dataDir)
+	docker, err := agent.NewDocker(dataDir, cfg.DNSAddress, cfg.DNSSuffix)
 	if err != nil {
 		log.Fatalf("docker client: %v", err)
 	}

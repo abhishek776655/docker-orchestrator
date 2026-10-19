@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -35,16 +37,37 @@ const (
 // Agents talk to Docker exclusively over this local client; the socket
 // itself is never exposed to the LAN (SRS §11).
 type Docker struct {
-	cli     *client.Client
-	dataDir string // root for node-local persistent volumes (SRS §10)
+	cli       *client.Client
+	dataDir   string // root for node-local persistent volumes (SRS §10)
+	dnsIP     string // control plane's service-name resolver; "" disables it
+	dnsSuffix string // e.g. "haco"; search domain becomes "<project>.<suffix>"
 }
 
-func NewDocker(dataDir string) (*Docker, error) {
+// NewDocker builds a Docker client. dnsAddr is the control plane's
+// service-name resolver address (host:port, e.g. "10.0.0.1:53"); pass ""
+// to disable container DNS configuration. Docker's container-level DNS
+// setting (HostConfig.DNS) always queries port 53 — there is no way to
+// point it at a custom port — so a dnsAddr whose port isn't "53" is
+// accepted but has no effect on containers, only a logged warning: see
+// the M7 doc for why a local dev machine usually can't bind 53 itself.
+func NewDocker(dataDir, dnsAddr, dnsSuffix string) (*Docker, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return nil, fmt.Errorf("docker client: %w", err)
 	}
-	return &Docker{cli: cli, dataDir: dataDir}, nil
+	d := &Docker{cli: cli, dataDir: dataDir, dnsSuffix: dnsSuffix}
+	if dnsAddr != "" {
+		host, port, err := net.SplitHostPort(dnsAddr)
+		if err != nil {
+			return nil, fmt.Errorf("dns address %q: %w", dnsAddr, err)
+		}
+		if port == "53" {
+			d.dnsIP = host
+		} else {
+			log.Printf("dns address %s does not use port 53; container-native DNS resolution needs port 53 and will not be configured (M7 known limitation)", dnsAddr)
+		}
+	}
+	return d, nil
 }
 
 // VolumeHostPath derives the on-disk directory for one of a workload's
@@ -56,6 +79,26 @@ func NewDocker(dataDir string) (*Docker, error) {
 func (d *Docker) VolumeHostPath(workloadKey, containerPath string) string {
 	sanitize := strings.NewReplacer("/", "_", ":", "_")
 	return filepath.Join(d.dataDir, sanitize.Replace(workloadKey), sanitize.Replace(containerPath))
+}
+
+// dnsServers returns the container-level nameserver list, or nil when no
+// usable (port-53) resolver is configured.
+func (d *Docker) dnsServers() []string {
+	if d.dnsIP == "" {
+		return nil
+	}
+	return []string{d.dnsIP}
+}
+
+// dnsSearchDomains returns the project-scoped search domain so a workload
+// can look up a dependency by its bare service name (e.g. `metaapi`
+// resolves via the search domain to `metaapi.<project>.<suffix>`), matching
+// the registry's project-scoped namespacing (SRS 8.3).
+func (d *Docker) dnsSearchDomains(project string) []string {
+	if d.dnsIP == "" || d.dnsSuffix == "" {
+		return nil
+	}
+	return []string{project + "." + d.dnsSuffix}
 }
 
 // prepareVolumes ensures each node-local persistent mount's host
@@ -192,6 +235,8 @@ func (d *Docker) EnsureRunning(ctx context.Context, w model.Workload) (container
 		&container.HostConfig{
 			PortBindings: bindings,
 			Mounts:       mounts,
+			DNS:          d.dnsServers(),
+			DNSSearch:    d.dnsSearchDomains(w.Project),
 			Resources: container.Resources{
 				NanoCPUs: w.Resources.CPUMillis * 1_000_000,
 				Memory:   w.Resources.MemoryBytes,

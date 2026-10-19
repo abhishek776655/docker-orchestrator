@@ -7,6 +7,7 @@ require (
 	github.com/docker/docker v24.0.9+incompatible
 	github.com/docker/go-connections v0.4.0
 	github.com/jackc/pgx/v5 v5.11.0
+	github.com/miekg/dns v1.1.73
 	golang.org/x/sys v0.49.0
 )
 

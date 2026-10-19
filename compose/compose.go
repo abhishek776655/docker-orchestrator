@@ -150,20 +150,35 @@ func convertService(project, workingDir, name string, svc types.ServiceConfig) (
 		wl.Env[k] = *v
 	}
 
-	var hostPorts []int
+	// Every declared port is an internal container port, usable for
+	// service-to-service DNS discovery whether or not it's ever published
+	// (SRS review focus: "An internal-only container port must be
+	// discoverable without creating a host-port binding"). Only a port
+	// with an explicit `published:` value gets a host binding at all —
+	// bare `ports: ["5000"]` or `expose:` is internal-only, not an
+	// implicit host exposure.
+	var hostPorts, containerPorts []int
 	for _, p := range svc.Ports {
 		target := int(p.Target)
 		if target == 0 {
 			continue
 		}
-		if p.Published != "" {
-			if pub, err := strconv.Atoi(p.Published); err == nil && pub != target {
-				warnings = append(warnings, fmt.Sprintf("%s: published port %d differs from container port %d; the prototype binds 1:1 on the container port, not the published port (see M2/M4 simplifications)", name, pub, target))
-			}
+		containerPorts = append(containerPorts, target)
+		if p.Published == "" {
+			continue
+		}
+		if pub, err := strconv.Atoi(p.Published); err == nil && pub != target {
+			warnings = append(warnings, fmt.Sprintf("%s: published port %d will be bound to the host as container port %d; independent host/container port remapping is not implemented yet (see M2/M7 simplifications)", name, pub, target))
 		}
 		hostPorts = append(hostPorts, target)
 	}
+	for _, e := range svc.Expose {
+		if p, err := strconv.Atoi(e); err == nil {
+			containerPorts = append(containerPorts, p)
+		}
+	}
 	wl.Constraints.HostPorts = hostPorts
+	wl.ContainerPorts = containerPorts
 
 	for dep := range svc.DependsOn {
 		wl.DependsOn = append(wl.DependsOn, dep)

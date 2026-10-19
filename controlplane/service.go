@@ -168,5 +168,5 @@ func (svc *Service) Metrics(ctx context.Context) (*store.Metrics, error) {
 // ListServiceInstances resolves a logical service name to its current
 // ready endpoints, from any node (SRS 8.1-8.2, UC-06, FR-010, FR-011).
 func (svc *Service) ListServiceInstances(ctx context.Context, project, service string) ([]model.ServiceInstance, error) {
-	return svc.store.ListServiceInstances(ctx, project, service)
+	return svc.store.ListReadyServiceInstances(ctx, project, service)
 }

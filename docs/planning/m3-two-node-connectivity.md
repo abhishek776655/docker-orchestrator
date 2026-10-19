@@ -1,5 +1,14 @@
 # M3 — Two-Node Connectivity
 
+> **Superseded (M7):** the `<SERVICE>_HOST`/`<SERVICE>_PORT` env-injection
+> mechanism described below has been replaced by real service-name DNS
+> resolution — see
+> [docs/testing/service-name-dns.md](../testing/service-name-dns.md). A
+> workload's environment is no longer mutated by dependency resolution;
+> `DependsOn` still gates *when* a workload starts, but *where* it connects
+> is resolved by the container's own DNS query, not an injected variable.
+> This doc is kept for its historical record of M3's acceptance proof.
+
 ## Goal
 
 Prove that an application scheduled on one node can reach a dependency

@@ -1,0 +1,19 @@
+services:
+  metaapi:
+    build:
+      context: ./metaapi
+    expose:
+      - "5000"
+    cpus: "0.25"
+    mem_limit: "67108864"
+
+  client:
+    build:
+      context: ./client
+    environment:
+      META_API_URL: http://metaapi:5000/
+    depends_on:
+      metaapi:
+        condition: service_started
+    cpus: "0.1"
+    mem_limit: "33554432"

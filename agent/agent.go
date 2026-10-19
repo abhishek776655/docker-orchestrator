@@ -26,6 +26,12 @@ type Config struct {
 	ControlPlaneURL string
 	HeartbeatPeriod time.Duration
 	PollPeriod      time.Duration
+	// DNSAddress and DNSSuffix point containers at the control plane's
+	// service-name resolver (SRS 8.3) instead of injecting endpoint
+	// variables: a workload's own environment is never mutated by
+	// dependency resolution (M7).
+	DNSAddress string
+	DNSSuffix  string
 }
 
 // Agent is one running node agent instance.
@@ -147,15 +153,17 @@ func (a *Agent) cleanupOrphans(ctx context.Context, assignedHere map[string]bool
 
 // execute drives one workload through pulling -> starting -> running ->
 // ready, reporting each transition (SRS 6.2, contracts "Runtime state").
-// DependsOn is resolved and gated first (SRS 7.1 depends_on, FR-014,
-// UC-05): a dependency's env is injected only once it has a ready
-// instance, resolved live via the control plane's service registry
-// (UC-06) rather than hard-coded — this is how a workload scheduled on
-// one node reaches a dependency placed on another (SRS FR-012).
+// DependsOn is gated first (SRS 7.1 depends_on, FR-014, UC-05): the
+// workload is only started once every dependency has a ready instance in
+// the registry. Unlike the M3 mechanism this replaces, dependency
+// resolution never mutates the workload's environment — a dependency's
+// actual address is resolved by the container's own DNS query against the
+// control plane's service-name resolver (SRS 8.3, UC-06), configured once
+// at container creation, not injected per-dependency here.
 func (a *Agent) execute(ctx context.Context, rec store.WorkloadRecord) {
 	key := rec.Key()
 
-	depEnv, ready, err := a.resolveDependencies(ctx, rec.Project, rec.DependsOn)
+	ready, err := a.dependenciesReady(ctx, rec.Project, rec.DependsOn)
 	if err != nil {
 		a.report(ctx, key, model.StatusFailed, "dependency resolution failed: "+err.Error(), "")
 		return
@@ -163,12 +171,6 @@ func (a *Agent) execute(ctx context.Context, rec store.WorkloadRecord) {
 	if !ready {
 		a.report(ctx, key, model.StatusWaitingDependencies, "waiting for: "+strings.Join(rec.DependsOn, ", "), "")
 		return
-	}
-	for k, v := range depEnv {
-		if rec.Env == nil {
-			rec.Env = map[string]string{}
-		}
-		rec.Env[k] = v
 	}
 
 	a.report(ctx, key, model.StatusPulling, "", "")
@@ -198,25 +200,22 @@ func (a *Agent) execute(ctx context.Context, rec store.WorkloadRecord) {
 	a.report(ctx, key, model.StatusReady, "", containerID)
 }
 
-// resolveDependencies looks up every dependency's current ready instance
-// via the control plane's service registry and returns the env vars to
-// inject (<SERVICE>_HOST, <SERVICE>_PORT). ready is false if any
-// dependency currently has no ready instance.
-func (a *Agent) resolveDependencies(ctx context.Context, project string, deps []string) (map[string]string, bool, error) {
-	env := map[string]string{}
+// dependenciesReady checks the control plane's service registry for every
+// entry in deps and reports whether all of them currently have at least
+// one ready instance (SRS UC-05, FR-014). It resolves nothing and mutates
+// no workload state — actual address resolution happens via DNS once the
+// container is running, not here.
+func (a *Agent) dependenciesReady(ctx context.Context, project string, deps []string) (bool, error) {
 	for _, dep := range deps {
 		var instances []model.ServiceInstance
 		if err := a.get(ctx, "/v1/services/"+project+"/"+dep, &instances); err != nil {
-			return nil, false, err
+			return false, err
 		}
 		if len(instances) == 0 {
-			return nil, false, nil
+			return false, nil
 		}
-		name := strings.ToUpper(strings.NewReplacer("-", "_").Replace(dep))
-		env[name+"_HOST"] = instances[0].Address
-		env[name+"_PORT"] = fmt.Sprint(instances[0].Port)
 	}
-	return env, true, nil
+	return true, nil
 }
 
 func (a *Agent) report(ctx context.Context, key string, status model.Status, reason, containerID string) {

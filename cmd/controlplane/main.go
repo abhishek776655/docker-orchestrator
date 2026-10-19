@@ -12,6 +12,7 @@ import (
 
 	"github.com/abhishek/hardware-aware-container-orchestrator/build"
 	"github.com/abhishek/hardware-aware-container-orchestrator/controlplane"
+	"github.com/abhishek/hardware-aware-container-orchestrator/discovery"
 	"github.com/abhishek/hardware-aware-container-orchestrator/store"
 	"github.com/docker/docker/client"
 )
@@ -43,6 +44,16 @@ func main() {
 	reconcileInterval := envDuration("HACO_RECONCILE_INTERVAL", 5*time.Second)
 	go svc.RunReconciler(ctx, reconcileInterval, heartbeatTimeout)
 	log.Printf("reconciler running every %s, heartbeat timeout %s", reconcileInterval, heartbeatTimeout)
+
+	dnsAddr := envOr("HACO_DNS_LISTEN_ADDR", ":8053")
+	dnsSuffix := envOr("HACO_DNS_SUFFIX", "haco")
+	dnsServer := discovery.NewServer(svc, dnsSuffix)
+	go func() {
+		if err := dnsServer.ListenAndServe(ctx, dnsAddr); err != nil {
+			log.Printf("dns server stopped: %v", err)
+		}
+	}()
+	log.Printf("service-name DNS listening on %s, suffix .%s", dnsAddr, dnsSuffix)
 
 	server := &http.Server{Addr: addr, Handler: controlplane.NewHandler(svc)}
 

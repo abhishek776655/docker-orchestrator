@@ -72,13 +72,16 @@ type Workload struct {
 	// non-empty (e.g. telling an app to listen on the specific host port
 	// this workload was assigned, given the M2/M3 1:1 host-port
 	// simplification in agent/docker.go).
-	Command      []string
-	Env          map[string]string
-	Resources    Resources
-	Constraints  Constraints
-	Storage      StoragePolicy
-	Volumes      []VolumeMount
-	DesiredState DesiredState
+	Command     []string
+	Env         map[string]string
+	Resources   Resources
+	Constraints Constraints
+	// ContainerPorts are service listening ports for internal, name-based
+	// communication. They are independent of optional host-published ports.
+	ContainerPorts []int
+	Storage        StoragePolicy
+	Volumes        []VolumeMount
+	DesiredState   DesiredState
 	// DependsOn lists logical service names (another workload's Service
 	// field) that must have at least one ready instance before this
 	// workload is started (SRS 7.1 depends_on, FR-014, UC-05).
@@ -133,8 +136,11 @@ type ServiceInstance struct {
 	Service string
 	NodeID  string
 	Address string
-	Port    int
-	Status  Status
+	// ContainerPort is the internal port applications use with the service
+	// name, for example metaapi:5000 — independent of any published host
+	// port, and discoverable even when the workload publishes none.
+	ContainerPort int
+	Status        Status
 }
 
 // Key returns the stable identity used to key reservations and decisions.

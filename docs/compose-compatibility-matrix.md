@@ -6,7 +6,7 @@
 | `build.context`, `dockerfile`, `args` | Supported | Central build produces immutable image |
 | `build.ssh`, build secrets | Supported | BuildKit mounts only; never image layers |
 | `environment`, `env_file` | Supported | Resolve at deploy time; redact secrets |
-| `ports` | Supported with validation | Detect planned node/binding conflicts |
+| `ports` | Supported with validation | Every declared port becomes an internal `ContainerPort`, discoverable via service-name DNS whether or not it is published. Only a port with an explicit `published:` value also becomes a host binding (`HostPorts`); `expose:`-only or unpublished ports never create one. The host binding still uses the container port's own number — independent host/container port remapping (e.g. publishing `5600` for a container listening on `5000`) is not implemented yet. Detect planned node/binding conflicts. |
 | `depends_on` conditions | Supported | Validate graph and gate readiness |
 | `healthcheck` | Supported | Warn for obvious placeholder checks |
 | named volumes | Supported with policy | Node-local by default; creates affinity |
