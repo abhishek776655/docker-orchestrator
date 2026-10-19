@@ -77,11 +77,23 @@ type Workload struct {
 	Resources    Resources
 	Constraints  Constraints
 	Storage      StoragePolicy
+	Volumes      []VolumeMount
 	DesiredState DesiredState
 	// DependsOn lists logical service names (another workload's Service
 	// field) that must have at least one ready instance before this
 	// workload is started (SRS 7.1 depends_on, FR-014, UC-05).
 	DependsOn []string
+}
+
+// VolumeMount is one node-local persistent mount for a workload with
+// Storage.Class == NodeLocalPersistent (SRS §10). The host-side path is
+// never specified directly — it is derived deterministically by the agent
+// from the workload key (see agent.VolumeHostPath), so the same workload
+// always lands on the same on-disk data no matter how many times its
+// container is recreated (FR-016, FR-017).
+type VolumeMount struct {
+	ContainerPath string `json:"container_path"`
+	ReadOnly      bool   `json:"read_only"`
 }
 
 // DesiredState is the controller's intent for a workload, independent of

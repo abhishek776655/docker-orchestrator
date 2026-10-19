@@ -186,6 +186,7 @@ func convertService(project, workingDir, name string, svc types.ServiceConfig) (
 				continue
 			}
 			wl.Storage = model.StoragePolicy{Class: model.NodeLocalPersistent, PinnedNodeID: pinned}
+			wl.Volumes = append(wl.Volumes, model.VolumeMount{ContainerPath: v.Target, ReadOnly: v.ReadOnly})
 		default:
 			warnings = append(warnings, fmt.Sprintf("%s: volume type %q is not evaluated for storage affinity", name, v.Type))
 		}

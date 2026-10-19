@@ -4,15 +4,19 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
+	"golang.org/x/sys/unix"
 
 	"github.com/abhishek/hardware-aware-container-orchestrator/model"
 )
@@ -22,15 +26,72 @@ import (
 // Agents talk to Docker exclusively over this local client; the socket
 // itself is never exposed to the LAN (SRS §11).
 type Docker struct {
-	cli *client.Client
+	cli     *client.Client
+	dataDir string // root for node-local persistent volumes (SRS §10)
 }
 
-func NewDocker() (*Docker, error) {
+func NewDocker(dataDir string) (*Docker, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return nil, fmt.Errorf("docker client: %w", err)
 	}
-	return &Docker{cli: cli}, nil
+	return &Docker{cli: cli, dataDir: dataDir}, nil
+}
+
+// VolumeHostPath derives the on-disk directory for one of a workload's
+// node-local persistent mounts, deterministically from the workload key
+// and container path — never from a user-supplied host path. The same
+// workload always resolves to the same directory, so recreating its
+// container (after a crash, an image update, or an agent restart) reuses
+// the existing data instead of starting from empty (SRS FR-016, FR-017).
+func (d *Docker) VolumeHostPath(workloadKey, containerPath string) string {
+	sanitize := strings.NewReplacer("/", "_", ":", "_")
+	return filepath.Join(d.dataDir, sanitize.Replace(workloadKey), sanitize.Replace(containerPath))
+}
+
+// prepareVolumes ensures each node-local persistent mount's host
+// directory exists and reports a warning if the filesystem backing it is
+// nearly full (SRS §10.2: "Storage capacity, mount permissions... must be
+// validated where possible").
+func (d *Docker) prepareVolumes(w model.Workload) ([]mount.Mount, []string, error) {
+	if w.Storage.Class != model.NodeLocalPersistent {
+		if len(w.Volumes) > 0 {
+			return nil, nil, fmt.Errorf("volumes declared but storage class is %q, not node_local_persistent", w.Storage.Class)
+		}
+		return nil, nil, nil
+	}
+
+	var mounts []mount.Mount
+	var warnings []string
+	for _, v := range w.Volumes {
+		hostPath := d.VolumeHostPath(w.Key(), v.ContainerPath)
+		if err := os.MkdirAll(hostPath, 0o755); err != nil {
+			return nil, nil, fmt.Errorf("create volume directory %s: %w", hostPath, err)
+		}
+		if pct, err := diskUsedPercent(hostPath); err == nil && pct > 90 {
+			warnings = append(warnings, fmt.Sprintf("volume %s is %.0f%% full", hostPath, pct))
+		}
+		mounts = append(mounts, mount.Mount{
+			Type:     mount.TypeBind,
+			Source:   hostPath,
+			Target:   v.ContainerPath,
+			ReadOnly: v.ReadOnly,
+		})
+	}
+	return mounts, warnings, nil
+}
+
+func diskUsedPercent(path string) (float64, error) {
+	var stat unix.Statfs_t
+	if err := unix.Statfs(path, &stat); err != nil {
+		return 0, err
+	}
+	total := float64(stat.Blocks) * float64(stat.Bsize)
+	free := float64(stat.Bavail) * float64(stat.Bsize)
+	if total == 0 {
+		return 0, nil
+	}
+	return (total - free) / total * 100, nil
 }
 
 // Capacity reports host CPU/memory as seen by the Docker daemon, used as
@@ -71,20 +132,25 @@ func ContainerName(key string) string {
 // Host ports are bound 1:1 to the same container port; the model has no
 // separate container-port field yet, so this is an M2 simplification to
 // revisit once the Compose importer (M4) supplies real port mappings.
-func (d *Docker) EnsureRunning(ctx context.Context, w model.Workload) (containerID string, err error) {
+func (d *Docker) EnsureRunning(ctx context.Context, w model.Workload) (containerID string, warnings []string, err error) {
 	name := ContainerName(w.Key())
+
+	mounts, warnings, err := d.prepareVolumes(w)
+	if err != nil {
+		return "", nil, fmt.Errorf("prepare volumes: %w", err)
+	}
 
 	existing, err := d.cli.ContainerInspect(ctx, name)
 	if err == nil {
 		if !existing.State.Running {
 			if err := d.cli.ContainerStart(ctx, existing.ID, types.ContainerStartOptions{}); err != nil {
-				return "", fmt.Errorf("restart existing container: %w", err)
+				return "", warnings, fmt.Errorf("restart existing container: %w", err)
 			}
 		}
-		return existing.ID, nil
+		return existing.ID, warnings, nil
 	}
 	if !client.IsErrNotFound(err) {
-		return "", fmt.Errorf("inspect %s: %w", name, err)
+		return "", warnings, fmt.Errorf("inspect %s: %w", name, err)
 	}
 
 	env := make([]string, 0, len(w.Env))
@@ -97,7 +163,7 @@ func (d *Docker) EnsureRunning(ctx context.Context, w model.Workload) (container
 	for _, p := range w.Constraints.HostPorts {
 		port, err := nat.NewPort("tcp", strconv.Itoa(p))
 		if err != nil {
-			return "", fmt.Errorf("port %d: %w", p, err)
+			return "", warnings, fmt.Errorf("port %d: %w", p, err)
 		}
 		exposed[port] = struct{}{}
 		bindings[port] = []nat.PortBinding{{HostIP: "0.0.0.0", HostPort: strconv.Itoa(p)}}
@@ -112,6 +178,7 @@ func (d *Docker) EnsureRunning(ctx context.Context, w model.Workload) (container
 		},
 		&container.HostConfig{
 			PortBindings: bindings,
+			Mounts:       mounts,
 			Resources: container.Resources{
 				NanoCPUs: w.Resources.CPUMillis * 1_000_000,
 				Memory:   w.Resources.MemoryBytes,
@@ -122,12 +189,12 @@ func (d *Docker) EnsureRunning(ctx context.Context, w model.Workload) (container
 		name,
 	)
 	if err != nil {
-		return "", fmt.Errorf("create container: %w", err)
+		return "", warnings, fmt.Errorf("create container: %w", err)
 	}
 	if err := d.cli.ContainerStart(ctx, resp.ID, types.ContainerStartOptions{}); err != nil {
-		return "", fmt.Errorf("start container: %w", err)
+		return "", warnings, fmt.Errorf("start container: %w", err)
 	}
-	return resp.ID, nil
+	return resp.ID, warnings, nil
 }
 
 // WaitRunning polls container state until it reports running or the

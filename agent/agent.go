@@ -143,10 +143,13 @@ func (a *Agent) execute(ctx context.Context, rec store.WorkloadRecord) {
 	}
 
 	a.report(ctx, key, model.StatusStarting, "", "")
-	containerID, err := a.docker.EnsureRunning(ctx, rec.Workload)
+	containerID, volWarnings, err := a.docker.EnsureRunning(ctx, rec.Workload)
 	if err != nil {
 		a.report(ctx, key, model.StatusFailed, "start failed: "+err.Error(), "")
 		return
+	}
+	for _, w := range volWarnings {
+		log.Printf("%s: %s", key, w)
 	}
 
 	if err := a.docker.WaitRunning(ctx, containerID, 30*time.Second); err != nil {

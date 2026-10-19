@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/abhishek/hardware-aware-container-orchestrator/agent"
@@ -19,10 +20,14 @@ func main() {
 		ControlPlaneURL: envOr("HACO_CONTROLPLANE_URL", "http://localhost:8080"),
 	}
 
-	docker, err := agent.NewDocker()
+	home, _ := os.UserHomeDir()
+	dataDir := envOr("HACO_DATA_DIR", filepath.Join(home, ".haco", "volumes", cfg.NodeID))
+
+	docker, err := agent.NewDocker(dataDir)
 	if err != nil {
 		log.Fatalf("docker client: %v", err)
 	}
+	log.Printf("node-local persistent volumes rooted at %s", dataDir)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

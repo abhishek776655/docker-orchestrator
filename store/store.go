@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS workloads (
 	host_ports           jsonb NOT NULL DEFAULT '[]',
 	storage_class        text NOT NULL,
 	storage_pinned_node  text NOT NULL DEFAULT '',
+	volumes              jsonb NOT NULL DEFAULT '[]',
 	depends_on           jsonb NOT NULL DEFAULT '[]',
 	desired_state        text NOT NULL,
 	status               text NOT NULL,
@@ -202,11 +203,12 @@ func (s *Store) CreateWorkload(ctx context.Context, w WorkloadRecord) error {
 	command, _ := json.Marshal(w.Command)
 	env, _ := json.Marshal(w.Env)
 	hostPorts, _ := json.Marshal(w.Constraints.HostPorts)
+	volumes, _ := json.Marshal(w.Volumes)
 	dependsOn, _ := json.Marshal(w.DependsOn)
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO workloads (key, project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, storage_class, storage_pinned_node, depends_on, desired_state, status, status_reason, node_id, container_id)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
-	`, w.Key(), w.Project, w.Service, w.Revision, w.Image, command, env, w.Resources.CPUMillis, w.Resources.MemoryBytes, w.Constraints.Architecture, hostPorts, string(w.Storage.Class), w.Storage.PinnedNodeID, dependsOn, string(w.DesiredState), string(w.Status), w.StatusReason, w.NodeID, w.ContainerID)
+		INSERT INTO workloads (key, project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, storage_class, storage_pinned_node, volumes, depends_on, desired_state, status, status_reason, node_id, container_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+	`, w.Key(), w.Project, w.Service, w.Revision, w.Image, command, env, w.Resources.CPUMillis, w.Resources.MemoryBytes, w.Constraints.Architecture, hostPorts, string(w.Storage.Class), w.Storage.PinnedNodeID, volumes, dependsOn, string(w.DesiredState), string(w.Status), w.StatusReason, w.NodeID, w.ContainerID)
 	return err
 }
 
@@ -226,7 +228,7 @@ func (s *Store) UpdateStatus(ctx context.Context, key string, status model.Statu
 // GetWorkload returns one workload by key.
 func (s *Store) GetWorkload(ctx context.Context, key string) (*WorkloadRecord, error) {
 	row := s.pool.QueryRow(ctx, `
-		SELECT project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, storage_class, storage_pinned_node, depends_on, desired_state, status, status_reason, node_id, container_id
+		SELECT project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, storage_class, storage_pinned_node, volumes, depends_on, desired_state, status, status_reason, node_id, container_id
 		FROM workloads WHERE key = $1
 	`, key)
 	return scanWorkload(row)
@@ -237,7 +239,7 @@ func (s *Store) GetWorkload(ctx context.Context, key string) (*WorkloadRecord, e
 // — this is the agent's pull-based assignment feed (SRS 6.2).
 func (s *Store) AssignedWorkloads(ctx context.Context, nodeID string) ([]WorkloadRecord, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, storage_class, storage_pinned_node, depends_on, desired_state, status, status_reason, node_id, container_id
+		SELECT project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, storage_class, storage_pinned_node, volumes, depends_on, desired_state, status, status_reason, node_id, container_id
 		FROM workloads WHERE node_id = $1 AND status NOT IN ('failed', 'stopped')
 	`, nodeID)
 	if err != nil {
@@ -307,9 +309,9 @@ func scanWorkload(row scannable) (*WorkloadRecord, error) {
 
 func scanWorkloadRow(row scannable) (*WorkloadRecord, error) {
 	var rec WorkloadRecord
-	var command, env, hostPorts, dependsOn []byte
+	var command, env, hostPorts, volumes, dependsOn []byte
 	var storageClass, status string
-	if err := row.Scan(&rec.Project, &rec.Service, &rec.Revision, &rec.Image, &command, &env, &rec.Resources.CPUMillis, &rec.Resources.MemoryBytes, &rec.Constraints.Architecture, &hostPorts, &storageClass, &rec.Storage.PinnedNodeID, &dependsOn, (*string)(&rec.DesiredState), &status, &rec.StatusReason, &rec.NodeID, &rec.ContainerID); err != nil {
+	if err := row.Scan(&rec.Project, &rec.Service, &rec.Revision, &rec.Image, &command, &env, &rec.Resources.CPUMillis, &rec.Resources.MemoryBytes, &rec.Constraints.Architecture, &hostPorts, &storageClass, &rec.Storage.PinnedNodeID, &volumes, &dependsOn, (*string)(&rec.DesiredState), &status, &rec.StatusReason, &rec.NodeID, &rec.ContainerID); err != nil {
 		return nil, err
 	}
 	rec.Status = model.Status(status)
@@ -318,6 +320,7 @@ func scanWorkloadRow(row scannable) (*WorkloadRecord, error) {
 	_ = json.Unmarshal(command, &rec.Command)
 	_ = json.Unmarshal(env, &rec.Env)
 	_ = json.Unmarshal(hostPorts, &rec.Constraints.HostPorts)
+	_ = json.Unmarshal(volumes, &rec.Volumes)
 	_ = json.Unmarshal(dependsOn, &rec.DependsOn)
 	return &rec, nil
 }

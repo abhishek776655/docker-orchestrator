@@ -99,19 +99,20 @@ func (svc *Service) handleListNodes(w http.ResponseWriter, r *http.Request) {
 }
 
 type submitRequest struct {
-	Project             string            `json:"project"`
-	Service             string            `json:"service"`
-	Revision            string            `json:"revision"`
-	Image               string            `json:"image"`
-	Command             []string          `json:"command"`
-	Env                 map[string]string `json:"env"`
-	CPUMillis           int64             `json:"cpu_millis"`
-	MemoryBytes         int64             `json:"memory_bytes"`
-	Architecture        string            `json:"architecture"`
-	HostPorts           []int             `json:"host_ports"`
-	StorageClass        string            `json:"storage_class"`
-	StoragePinnedNodeID string            `json:"storage_pinned_node_id"`
-	DependsOn           []string          `json:"depends_on"`
+	Project             string              `json:"project"`
+	Service             string              `json:"service"`
+	Revision            string              `json:"revision"`
+	Image               string              `json:"image"`
+	Command             []string            `json:"command"`
+	Env                 map[string]string   `json:"env"`
+	CPUMillis           int64               `json:"cpu_millis"`
+	MemoryBytes         int64               `json:"memory_bytes"`
+	Architecture        string              `json:"architecture"`
+	HostPorts           []int               `json:"host_ports"`
+	StorageClass        string              `json:"storage_class"`
+	StoragePinnedNodeID string              `json:"storage_pinned_node_id"`
+	Volumes             []model.VolumeMount `json:"volumes"`
+	DependsOn           []string            `json:"depends_on"`
 }
 
 func (svc *Service) handleSubmit(w http.ResponseWriter, r *http.Request) {
@@ -143,6 +144,7 @@ func (svc *Service) handleSubmit(w http.ResponseWriter, r *http.Request) {
 			Class:        storageClass,
 			PinnedNodeID: req.StoragePinnedNodeID,
 		},
+		Volumes:      req.Volumes,
 		DesiredState: model.DesiredRunning,
 		DependsOn:    req.DependsOn,
 	}
