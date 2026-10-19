@@ -109,7 +109,7 @@ func (svc *Service) Submit(ctx context.Context, w model.Workload) (*SubmitResult
 	if err != nil {
 		return nil, fmt.Errorf("list nodes: %w", err)
 	}
-	cpuMem, ports, err := svc.store.ActiveReservations(ctx)
+	cpuMem, ports, err := svc.store.ActiveReservations(ctx, w.Key())
 	if err != nil {
 		return nil, fmt.Errorf("load reservations: %w", err)
 	}

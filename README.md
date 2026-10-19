@@ -58,6 +58,7 @@ docker run -d --name haco-registry -p 5050:5000 registry:2
 ```bash
 go build -o bin/controlplane ./cmd/controlplane
 go build -o bin/agent ./cmd/agent
+go build -o bin/hacoctl ./cmd/hacoctl   # thin CLI over the control-plane API, used below
 ```
 
 ### 3. Start the control plane
@@ -76,7 +77,7 @@ Logs confirm the build service, reconciler, and DNS resolver all started.
 HACO_CONTROLPLANE_URL=http://localhost:8099 HACO_NODE_ID=node-a HACO_NODE_ADDRESS=host.docker.internal ./bin/agent &
 HACO_CONTROLPLANE_URL=http://localhost:8099 HACO_NODE_ID=node-b HACO_NODE_ADDRESS=127.0.0.2         ./bin/agent &
 
-curl -s http://localhost:8099/v1/nodes | python3 -m json.tool
+./bin/hacoctl nodes
 ```
 
 (On real hosts, each command runs on its own machine, no `DOCKER_HOST`
@@ -85,13 +86,7 @@ override needed, and `HACO_NODE_ADDRESS` is that host's real IP.)
 ### 5. Validate the Compose project (dry run, no side effects)
 
 ```bash
-cd examples/mvp-demo
-python3 -c "
-import json
-print(json.dumps({'project': 'mvpdemo', 'working_dir': '$(pwd)', 'yaml': open('docker-compose.yml').read()}))
-" > /tmp/mvpdemo.json
-
-curl -s -X POST http://localhost:8099/v1/compose/plan -d @/tmp/mvpdemo.json | python3 -m json.tool
+./bin/hacoctl plan mvpdemo examples/mvp-demo/docker-compose.yml
 ```
 
 Check `Rejections` is empty before continuing — a non-empty list means
@@ -101,28 +96,30 @@ something in the Compose file isn't supported yet (see
 ### 6. Deploy it
 
 ```bash
-curl -s -X POST http://localhost:8099/v1/compose/deploy -d @/tmp/mvpdemo.json | python3 -m json.tool
+./bin/hacoctl deploy mvpdemo examples/mvp-demo/docker-compose.yml
 ```
 
 This builds `api` from source, pushes it to the local registry, and
 schedules both services — `cache` (Redis, pinned with node-local
 persistent storage) and `api` (depends on `cache`, gated until it's
-ready).
+ready). Redeploying the same project+service+revision later is safe — it
+replaces the previous attempt rather than conflicting with it, even if
+that attempt never finished.
 
 ### 7. Check it's running
 
 ```bash
-curl -s http://localhost:8099/v1/workloads/mvpdemo/cache/latest | python3 -m json.tool
-curl -s http://localhost:8099/v1/workloads/mvpdemo/api/latest   | python3 -m json.tool
-curl -s http://localhost:8099/v1/services/mvpdemo/cache          # the service registry
-curl -s http://localhost:9090/                                   # the deployed api, directly
+./bin/hacoctl status mvpdemo cache latest
+./bin/hacoctl status mvpdemo api latest
+curl -s http://localhost:8099/v1/services/mvpdemo/cache   # the service registry
+curl -s http://localhost:9090/                            # the deployed api, directly
 ```
 
 ### 8. Try the operational endpoints
 
 ```bash
-curl -s http://localhost:8099/v1/events   | python3 -m json.tool   # audit trail
-curl -s http://localhost:8099/v1/metrics  | python3 -m json.tool   # node/workload counts
+./bin/hacoctl events    # audit trail
+./bin/hacoctl metrics   # node/workload counts
 ```
 
 ### 9. Prove reconciliation (optional)

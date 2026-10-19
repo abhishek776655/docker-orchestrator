@@ -293,11 +293,15 @@ func (s *Store) ListNodes(ctx context.Context) ([]model.Node, error) {
 // ActiveReservations sums the resources and host ports held by every
 // non-terminal workload per node, so the scheduler can be rebuilt from
 // the database without a separate reservation table.
-func (s *Store) ActiveReservations(ctx context.Context) (map[string]model.Resources, map[string][]int, error) {
+// excludeKey is typically the workload about to be (re)scheduled: a
+// redeploy must not see its own prior attempt's reservation as taken,
+// since that attempt is about to be replaced, not added to (see
+// CreateWorkload's ON CONFLICT). Pass "" to exclude nothing.
+func (s *Store) ActiveReservations(ctx context.Context, excludeKey string) (map[string]model.Resources, map[string][]int, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT node_id, cpu_millis, memory_bytes, host_ports FROM workloads
-		WHERE node_id != '' AND status NOT IN ('failed', 'stopped')
-	`)
+		WHERE node_id != '' AND status NOT IN ('failed', 'stopped') AND key != $1
+	`, excludeKey)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -342,9 +346,34 @@ func (s *Store) CreateWorkload(ctx context.Context, w WorkloadRecord) error {
 	containerPorts, _ := json.Marshal(w.ContainerPorts)
 	volumes, _ := json.Marshal(w.Volumes)
 	dependsOn, _ := json.Marshal(w.DependsOn)
+	// ON CONFLICT: redeploying the same project/service/revision (the
+	// common case — rerunning `hacoctl deploy`, or retrying after a
+	// previous attempt got stuck) must replace that workload's spec and
+	// restart its lifecycle, not fail with a duplicate-key error or leave
+	// stale fields behind. container_id is reset so the agent doesn't
+	// mistake a new spec for an already-running old container.
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO workloads (key, project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, storage_class, storage_pinned_node, volumes, depends_on, desired_state, status, status_reason, node_id, container_id)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+		ON CONFLICT (key) DO UPDATE SET
+			image = EXCLUDED.image,
+			command = EXCLUDED.command,
+			env = EXCLUDED.env,
+			cpu_millis = EXCLUDED.cpu_millis,
+			memory_bytes = EXCLUDED.memory_bytes,
+			architecture = EXCLUDED.architecture,
+			host_ports = EXCLUDED.host_ports,
+			container_ports = EXCLUDED.container_ports,
+			storage_class = EXCLUDED.storage_class,
+			storage_pinned_node = EXCLUDED.storage_pinned_node,
+			volumes = EXCLUDED.volumes,
+			depends_on = EXCLUDED.depends_on,
+			desired_state = EXCLUDED.desired_state,
+			status = EXCLUDED.status,
+			status_reason = EXCLUDED.status_reason,
+			node_id = EXCLUDED.node_id,
+			container_id = '',
+			updated_at = now()
 	`, w.Key(), w.Project, w.Service, w.Revision, w.Image, command, env, w.Resources.CPUMillis, w.Resources.MemoryBytes, w.Constraints.Architecture, hostPorts, containerPorts, string(w.Storage.Class), w.Storage.PinnedNodeID, volumes, dependsOn, string(w.DesiredState), string(w.Status), w.StatusReason, w.NodeID, w.ContainerID)
 	return err
 }

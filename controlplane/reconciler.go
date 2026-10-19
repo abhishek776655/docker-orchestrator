@@ -48,7 +48,7 @@ func (svc *Service) reconcileOnce(ctx context.Context, heartbeatTimeout time.Dur
 	if err != nil {
 		return err
 	}
-	cpuMem, ports, err := svc.store.ActiveReservations(ctx)
+	cpuMem, ports, err := svc.store.ActiveReservations(ctx, "")
 	if err != nil {
 		return err
 	}
