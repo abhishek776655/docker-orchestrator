@@ -155,6 +155,16 @@ func (svc *Service) ReportStatus(ctx context.Context, key string, status model.S
 	return svc.store.UpdateStatus(ctx, key, status, reason, containerID)
 }
 
+// ListEvents returns the most recent audit/history records (SRS FR-024).
+func (svc *Service) ListEvents(ctx context.Context, limit int) ([]store.Event, error) {
+	return svc.store.ListEvents(ctx, limit)
+}
+
+// Metrics returns a minimal operational summary (SRS §13).
+func (svc *Service) Metrics(ctx context.Context) (*store.Metrics, error) {
+	return svc.store.Metrics(ctx)
+}
+
 // ListServiceInstances resolves a logical service name to its current
 // ready endpoints, from any node (SRS 8.1-8.2, UC-06, FR-010, FR-011).
 func (svc *Service) ListServiceInstances(ctx context.Context, project, service string) ([]model.ServiceInstance, error) {

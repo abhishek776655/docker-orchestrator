@@ -127,6 +127,122 @@ func (s *Store) MarkStaleNodesUnavailable(ctx context.Context, timeout time.Dura
 	return err
 }
 
+// WorkloadsOnUnavailableNodes returns every non-terminal workload currently
+// assigned to a node the heartbeat timeout has marked unavailable — the
+// reconciler's input for deciding what to reschedule or fail (SRS §6.3,
+// FR-015).
+func (s *Store) WorkloadsOnUnavailableNodes(ctx context.Context) ([]WorkloadRecord, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT w.project, w.service, w.revision, w.image, w.command, w.env, w.cpu_millis, w.memory_bytes, w.architecture, w.host_ports, w.storage_class, w.storage_pinned_node, w.volumes, w.depends_on, w.desired_state, w.status, w.status_reason, w.node_id, w.container_id
+		FROM workloads w
+		JOIN nodes n ON n.id = w.node_id
+		WHERE n.availability = 'unavailable' AND w.status NOT IN ('failed', 'stopped')
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []WorkloadRecord
+	for rows.Next() {
+		rec, err := scanWorkloadRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *rec)
+	}
+	return out, rows.Err()
+}
+
+// Reassign moves a workload to a different node and resets it to
+// "assigned" so the new node's agent picks it up fresh (SRS §6.3
+// reconciliation: "issue safe corrective actions").
+func (s *Store) Reassign(ctx context.Context, key, newNodeID string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE workloads SET node_id = $2, status = 'assigned', status_reason = '', container_id = '', updated_at = now()
+		WHERE key = $1
+	`, key, newNodeID)
+	if err == nil {
+		_, _ = s.pool.Exec(ctx, `INSERT INTO events (workload_key, node_id, type, message) VALUES ($1, $2, 'reassigned', 'rescheduled after node loss')`, key, newNodeID)
+	}
+	return err
+}
+
+// Event is one audit/history record (SRS FR-024).
+type Event struct {
+	ID          int64
+	WorkloadKey string
+	NodeID      string
+	Type        string
+	Message     string
+	CreatedAt   time.Time
+}
+
+// ListEvents returns the most recent events, newest first (SRS §13, FR-024).
+func (s *Store) ListEvents(ctx context.Context, limit int) ([]Event, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, workload_key, node_id, type, message, created_at
+		FROM events ORDER BY id DESC LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Event
+	for rows.Next() {
+		var e Event
+		if err := rows.Scan(&e.ID, &e.WorkloadKey, &e.NodeID, &e.Type, &e.Message, &e.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// Metrics is a minimal operational summary (SRS §13 "required visibility"),
+// a JSON endpoint rather than a Prometheus exporter — see M6 doc for why.
+type Metrics struct {
+	NodesByAvailability map[string]int `json:"nodes_by_availability"`
+	WorkloadsByStatus   map[string]int `json:"workloads_by_status"`
+}
+
+func (s *Store) Metrics(ctx context.Context) (*Metrics, error) {
+	m := &Metrics{NodesByAvailability: map[string]int{}, WorkloadsByStatus: map[string]int{}}
+
+	rows, err := s.pool.Query(ctx, `SELECT availability, count(*) FROM nodes GROUP BY availability`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var k string
+		var c int
+		if err := rows.Scan(&k, &c); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		m.NodesByAvailability[k] = c
+	}
+	rows.Close()
+
+	rows, err = s.pool.Query(ctx, `SELECT status, count(*) FROM workloads GROUP BY status`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var k string
+		var c int
+		if err := rows.Scan(&k, &c); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		m.WorkloadsByStatus[k] = c
+	}
+	rows.Close()
+
+	return m, rows.Err()
+}
+
 // ListNodes returns every known node.
 func (s *Store) ListNodes(ctx context.Context) ([]model.Node, error) {
 	rows, err := s.pool.Query(ctx, `SELECT id, address, architecture, labels, capabilities, cpu_millis, memory_bytes, availability, heartbeat_at FROM nodes`)

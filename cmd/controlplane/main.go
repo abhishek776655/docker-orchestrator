@@ -39,6 +39,11 @@ func main() {
 		svc = svc.WithBuilder(build.New(dockerCli, registry))
 		log.Printf("compose build service enabled, pushing to %s", registry)
 	}
+	heartbeatTimeout := envDuration("HACO_HEARTBEAT_TIMEOUT", 15*time.Second)
+	reconcileInterval := envDuration("HACO_RECONCILE_INTERVAL", 5*time.Second)
+	go svc.RunReconciler(ctx, reconcileInterval, heartbeatTimeout)
+	log.Printf("reconciler running every %s, heartbeat timeout %s", reconcileInterval, heartbeatTimeout)
+
 	server := &http.Server{Addr: addr, Handler: controlplane.NewHandler(svc)}
 
 	go func() {
@@ -57,6 +62,15 @@ func main() {
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return fallback
+}
+
+func envDuration(key string, fallback time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
 	}
 	return fallback
 }

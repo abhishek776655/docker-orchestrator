@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strconv"
 
 	"github.com/abhishek/hardware-aware-container-orchestrator/model"
 )
@@ -28,6 +29,9 @@ func NewHandler(svc *Service) http.Handler {
 
 	mux.HandleFunc("POST /v1/compose/plan", svc.handleComposePlan)
 	mux.HandleFunc("POST /v1/compose/deploy", svc.handleComposeDeploy)
+
+	mux.HandleFunc("GET /v1/events", svc.handleListEvents)
+	mux.HandleFunc("GET /v1/metrics", svc.handleMetrics)
 
 	return logRequests(mux)
 }
@@ -236,6 +240,30 @@ func (svc *Service) handleComposeDeploy(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"plan": plan, "results": results})
+}
+
+func (svc *Service) handleListEvents(w http.ResponseWriter, r *http.Request) {
+	limit := 100
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	events, err := svc.ListEvents(r.Context(), limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, events)
+}
+
+func (svc *Service) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	m, err := svc.Metrics(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, m)
 }
 
 func (svc *Service) handleReportStatus(w http.ResponseWriter, r *http.Request) {

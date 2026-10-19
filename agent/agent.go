@@ -101,13 +101,48 @@ func (a *Agent) pollAndExecute(ctx context.Context) error {
 		return err
 	}
 
+	assignedHere := make(map[string]bool, len(assignments))
 	for _, rec := range assignments {
+		assignedHere[rec.Key()] = true
 		if rec.Status == model.StatusRunning || rec.Status == model.StatusReady {
-			continue // already brought up; nothing to do until reconciliation (M6) needs it
+			alive, err := a.docker.IsRunning(ctx, rec.Key())
+			if err != nil {
+				log.Printf("liveness check failed for %s: %v", rec.Key(), err)
+				continue
+			}
+			if alive {
+				continue
+			}
+			log.Printf("%s reported %s but its container is gone; re-executing (SRS safe retries)", rec.Key(), rec.Status)
 		}
 		a.execute(ctx, rec)
 	}
+
+	a.cleanupOrphans(ctx, assignedHere)
 	return nil
+}
+
+// cleanupOrphans removes any locally running container whose workload is
+// no longer assigned to this node — e.g. the control plane reconciler
+// rescheduled it elsewhere after a heartbeat gap, and this node later came
+// back. Without this, a recovered node would keep running a stale,
+// unmanaged instance alongside the new one (SRS §6.3, UC-08: "reconciles
+// actual state without blindly duplicating workload instances").
+func (a *Agent) cleanupOrphans(ctx context.Context, assignedHere map[string]bool) {
+	managed, err := a.docker.ManagedContainers(ctx)
+	if err != nil {
+		log.Printf("list managed containers failed: %v", err)
+		return
+	}
+	for _, c := range managed {
+		if assignedHere[c.WorkloadKey] {
+			continue
+		}
+		log.Printf("removing orphaned container for %s (no longer assigned to %s)", c.WorkloadKey, a.cfg.NodeID)
+		if err := a.docker.StopAndRemove(ctx, c.ContainerID); err != nil {
+			log.Printf("remove orphan %s failed: %v", c.ContainerID, err)
+		}
+	}
 }
 
 // execute drives one workload through pulling -> starting -> running ->

@@ -12,6 +12,7 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
@@ -19,6 +20,14 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/abhishek/hardware-aware-container-orchestrator/model"
+)
+
+// Labels attached to every container this agent creates, so reconciliation
+// can find them without parsing container names (SRS §6.3 "reconcile
+// actual state without blindly duplicating workload instances").
+const (
+	managedLabel = "haco.managed"
+	keyLabel     = "haco.workload.key"
 )
 
 // Docker wraps the subset of the Docker Engine API the M2 agent needs:
@@ -175,6 +184,10 @@ func (d *Docker) EnsureRunning(ctx context.Context, w model.Workload) (container
 			Cmd:          w.Command,
 			Env:          env,
 			ExposedPorts: exposed,
+			Labels: map[string]string{
+				managedLabel: "true",
+				keyLabel:     w.Key(),
+			},
 		},
 		&container.HostConfig{
 			PortBindings: bindings,
@@ -195,6 +208,50 @@ func (d *Docker) EnsureRunning(ctx context.Context, w model.Workload) (container
 		return "", warnings, fmt.Errorf("start container: %w", err)
 	}
 	return resp.ID, warnings, nil
+}
+
+// ManagedContainer is one container this agent created, identified by the
+// workload key it was created for.
+type ManagedContainer struct {
+	WorkloadKey string
+	ContainerID string
+}
+
+// ManagedContainers lists every container this agent has created (via its
+// labels), so the agent can reconcile them against the control plane's
+// current assignment and remove any that no longer belong here (SRS §6.3,
+// UC-08).
+func (d *Docker) ManagedContainers(ctx context.Context) ([]ManagedContainer, error) {
+	f := filters.NewArgs(filters.Arg("label", managedLabel+"=true"))
+	containers, err := d.cli.ContainerList(ctx, types.ContainerListOptions{All: true, Filters: f})
+	if err != nil {
+		return nil, fmt.Errorf("list managed containers: %w", err)
+	}
+	out := make([]ManagedContainer, 0, len(containers))
+	for _, c := range containers {
+		out = append(out, ManagedContainer{WorkloadKey: c.Labels[keyLabel], ContainerID: c.ID})
+	}
+	return out, nil
+}
+
+// IsRunning reports whether a workload's container currently exists and is
+// running, by its deterministic name. Used to detect a container that
+// disappeared or crashed after the agent already reported it ready, so it
+// can be safely recreated (SRS §6.3 "safe retries").
+func (d *Docker) IsRunning(ctx context.Context, workloadKey string) (bool, error) {
+	info, err := d.cli.ContainerInspect(ctx, ContainerName(workloadKey))
+	if client.IsErrNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return info.State.Running, nil
+}
+
+// StopAndRemove force-removes a container this agent no longer owns.
+func (d *Docker) StopAndRemove(ctx context.Context, containerID string) error {
+	return d.cli.ContainerRemove(ctx, containerID, types.ContainerRemoveOptions{Force: true})
 }
 
 // WaitRunning polls container state until it reports running or the
