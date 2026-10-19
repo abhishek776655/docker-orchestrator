@@ -24,6 +24,8 @@ func NewHandler(svc *Service) http.Handler {
 	mux.HandleFunc("GET /v1/agent/{node}/assignments", svc.handleAssignments)
 	mux.HandleFunc("POST /v1/agent/status", svc.handleReportStatus)
 
+	mux.HandleFunc("GET /v1/services/{project}/{service}", svc.handleListServiceInstances)
+
 	return logRequests(mux)
 }
 
@@ -98,6 +100,7 @@ type submitRequest struct {
 	Service             string            `json:"service"`
 	Revision            string            `json:"revision"`
 	Image               string            `json:"image"`
+	Command             []string          `json:"command"`
 	Env                 map[string]string `json:"env"`
 	CPUMillis           int64             `json:"cpu_millis"`
 	MemoryBytes         int64             `json:"memory_bytes"`
@@ -105,6 +108,7 @@ type submitRequest struct {
 	HostPorts           []int             `json:"host_ports"`
 	StorageClass        string            `json:"storage_class"`
 	StoragePinnedNodeID string            `json:"storage_pinned_node_id"`
+	DependsOn           []string          `json:"depends_on"`
 }
 
 func (svc *Service) handleSubmit(w http.ResponseWriter, r *http.Request) {
@@ -122,6 +126,7 @@ func (svc *Service) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		Service:  req.Service,
 		Revision: req.Revision,
 		Image:    req.Image,
+		Command:  req.Command,
 		Env:      req.Env,
 		Resources: model.Resources{
 			CPUMillis:   req.CPUMillis,
@@ -136,6 +141,7 @@ func (svc *Service) handleSubmit(w http.ResponseWriter, r *http.Request) {
 			PinnedNodeID: req.StoragePinnedNodeID,
 		},
 		DesiredState: model.DesiredRunning,
+		DependsOn:    req.DependsOn,
 	}
 
 	result, err := svc.Submit(r.Context(), wl)
@@ -174,6 +180,15 @@ type reportStatusRequest struct {
 	Status      model.Status `json:"status"`
 	Reason      string       `json:"reason"`
 	ContainerID string       `json:"container_id"`
+}
+
+func (svc *Service) handleListServiceInstances(w http.ResponseWriter, r *http.Request) {
+	instances, err := svc.ListServiceInstances(r.Context(), r.PathValue("project"), r.PathValue("service"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, instances)
 }
 
 func (svc *Service) handleReportStatus(w http.ResponseWriter, r *http.Request) {

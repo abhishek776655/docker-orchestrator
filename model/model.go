@@ -64,15 +64,24 @@ type Constraints struct {
 
 // Workload is a normalized placement request (SRS 12.1).
 type Workload struct {
-	Project      string
-	Service      string
-	Revision     string
-	Image        string
+	Project  string
+	Service  string
+	Revision string
+	Image    string
+	// Command overrides the image's default entrypoint arguments when
+	// non-empty (e.g. telling an app to listen on the specific host port
+	// this workload was assigned, given the M2/M3 1:1 host-port
+	// simplification in agent/docker.go).
+	Command      []string
 	Env          map[string]string
 	Resources    Resources
 	Constraints  Constraints
 	Storage      StoragePolicy
 	DesiredState DesiredState
+	// DependsOn lists logical service names (another workload's Service
+	// field) that must have at least one ready instance before this
+	// workload is started (SRS 7.1 depends_on, FR-014, UC-05).
+	DependsOn []string
 }
 
 // DesiredState is the controller's intent for a workload, independent of
@@ -98,7 +107,23 @@ const (
 	StatusReady    Status = "ready"
 	StatusFailed   Status = "failed"
 	StatusStopped  Status = "stopped"
+	// StatusWaitingDependencies means the agent picked up the assignment
+	// but at least one entry in DependsOn has no ready instance yet
+	// (SRS UC-05, FR-014). The agent re-checks on its next poll.
+	StatusWaitingDependencies Status = "waiting_dependencies"
 )
+
+// ServiceInstance is one reachable, ready endpoint for a logical service,
+// derived live from workload + node state rather than stored separately
+// (SRS 8.1-8.2, UC-06).
+type ServiceInstance struct {
+	Project string
+	Service string
+	NodeID  string
+	Address string
+	Port    int
+	Status  Status
+}
 
 // Key returns the stable identity used to key reservations and decisions.
 func (w Workload) Key() string {

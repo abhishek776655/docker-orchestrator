@@ -106,6 +106,7 @@ func (d *Docker) EnsureRunning(ctx context.Context, w model.Workload) (container
 	resp, err := d.cli.ContainerCreate(ctx,
 		&container.Config{
 			Image:        w.Image,
+			Cmd:          w.Command,
 			Env:          env,
 			ExposedPorts: exposed,
 		},

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/abhishek/hardware-aware-container-orchestrator/model"
@@ -111,8 +112,29 @@ func (a *Agent) pollAndExecute(ctx context.Context) error {
 
 // execute drives one workload through pulling -> starting -> running ->
 // ready, reporting each transition (SRS 6.2, contracts "Runtime state").
+// DependsOn is resolved and gated first (SRS 7.1 depends_on, FR-014,
+// UC-05): a dependency's env is injected only once it has a ready
+// instance, resolved live via the control plane's service registry
+// (UC-06) rather than hard-coded — this is how a workload scheduled on
+// one node reaches a dependency placed on another (SRS FR-012).
 func (a *Agent) execute(ctx context.Context, rec store.WorkloadRecord) {
 	key := rec.Key()
+
+	depEnv, ready, err := a.resolveDependencies(ctx, rec.Project, rec.DependsOn)
+	if err != nil {
+		a.report(ctx, key, model.StatusFailed, "dependency resolution failed: "+err.Error(), "")
+		return
+	}
+	if !ready {
+		a.report(ctx, key, model.StatusWaitingDependencies, "waiting for: "+strings.Join(rec.DependsOn, ", "), "")
+		return
+	}
+	for k, v := range depEnv {
+		if rec.Env == nil {
+			rec.Env = map[string]string{}
+		}
+		rec.Env[k] = v
+	}
 
 	a.report(ctx, key, model.StatusPulling, "", "")
 	if err := a.docker.PullImage(ctx, rec.Image); err != nil {
@@ -136,6 +158,27 @@ func (a *Agent) execute(ctx context.Context, rec store.WorkloadRecord) {
 	// M2 has no real readiness probe yet (healthcheck handling is part of
 	// the Compose importer, M4); a running container is immediately ready.
 	a.report(ctx, key, model.StatusReady, "", containerID)
+}
+
+// resolveDependencies looks up every dependency's current ready instance
+// via the control plane's service registry and returns the env vars to
+// inject (<SERVICE>_HOST, <SERVICE>_PORT). ready is false if any
+// dependency currently has no ready instance.
+func (a *Agent) resolveDependencies(ctx context.Context, project string, deps []string) (map[string]string, bool, error) {
+	env := map[string]string{}
+	for _, dep := range deps {
+		var instances []model.ServiceInstance
+		if err := a.get(ctx, "/v1/services/"+project+"/"+dep, &instances); err != nil {
+			return nil, false, err
+		}
+		if len(instances) == 0 {
+			return nil, false, nil
+		}
+		name := strings.ToUpper(strings.NewReplacer("-", "_").Replace(dep))
+		env[name+"_HOST"] = instances[0].Address
+		env[name+"_PORT"] = fmt.Sprint(instances[0].Port)
+	}
+	return env, true, nil
 }
 
 func (a *Agent) report(ctx context.Context, key string, status model.Status, reason, containerID string) {

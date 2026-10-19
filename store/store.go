@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS workloads (
 	service              text NOT NULL,
 	revision             text NOT NULL,
 	image                text NOT NULL,
+	command              jsonb NOT NULL DEFAULT '[]',
 	env                  jsonb NOT NULL DEFAULT '{}',
 	cpu_millis           bigint NOT NULL,
 	memory_bytes         bigint NOT NULL,
@@ -42,6 +43,7 @@ CREATE TABLE IF NOT EXISTS workloads (
 	host_ports           jsonb NOT NULL DEFAULT '[]',
 	storage_class        text NOT NULL,
 	storage_pinned_node  text NOT NULL DEFAULT '',
+	depends_on           jsonb NOT NULL DEFAULT '[]',
 	desired_state        text NOT NULL,
 	status               text NOT NULL,
 	status_reason        text NOT NULL DEFAULT '',
@@ -197,12 +199,14 @@ type WorkloadRecord struct {
 
 // CreateWorkload inserts a newly submitted, scheduled workload.
 func (s *Store) CreateWorkload(ctx context.Context, w WorkloadRecord) error {
+	command, _ := json.Marshal(w.Command)
 	env, _ := json.Marshal(w.Env)
 	hostPorts, _ := json.Marshal(w.Constraints.HostPorts)
+	dependsOn, _ := json.Marshal(w.DependsOn)
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO workloads (key, project, service, revision, image, env, cpu_millis, memory_bytes, architecture, host_ports, storage_class, storage_pinned_node, desired_state, status, status_reason, node_id, container_id)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
-	`, w.Key(), w.Project, w.Service, w.Revision, w.Image, env, w.Resources.CPUMillis, w.Resources.MemoryBytes, w.Constraints.Architecture, hostPorts, string(w.Storage.Class), w.Storage.PinnedNodeID, string(w.DesiredState), string(w.Status), w.StatusReason, w.NodeID, w.ContainerID)
+		INSERT INTO workloads (key, project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, storage_class, storage_pinned_node, depends_on, desired_state, status, status_reason, node_id, container_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+	`, w.Key(), w.Project, w.Service, w.Revision, w.Image, command, env, w.Resources.CPUMillis, w.Resources.MemoryBytes, w.Constraints.Architecture, hostPorts, string(w.Storage.Class), w.Storage.PinnedNodeID, dependsOn, string(w.DesiredState), string(w.Status), w.StatusReason, w.NodeID, w.ContainerID)
 	return err
 }
 
@@ -222,7 +226,7 @@ func (s *Store) UpdateStatus(ctx context.Context, key string, status model.Statu
 // GetWorkload returns one workload by key.
 func (s *Store) GetWorkload(ctx context.Context, key string) (*WorkloadRecord, error) {
 	row := s.pool.QueryRow(ctx, `
-		SELECT project, service, revision, image, env, cpu_millis, memory_bytes, architecture, host_ports, storage_class, storage_pinned_node, desired_state, status, status_reason, node_id, container_id
+		SELECT project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, storage_class, storage_pinned_node, depends_on, desired_state, status, status_reason, node_id, container_id
 		FROM workloads WHERE key = $1
 	`, key)
 	return scanWorkload(row)
@@ -233,7 +237,7 @@ func (s *Store) GetWorkload(ctx context.Context, key string) (*WorkloadRecord, e
 // — this is the agent's pull-based assignment feed (SRS 6.2).
 func (s *Store) AssignedWorkloads(ctx context.Context, nodeID string) ([]WorkloadRecord, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT project, service, revision, image, env, cpu_millis, memory_bytes, architecture, host_ports, storage_class, storage_pinned_node, desired_state, status, status_reason, node_id, container_id
+		SELECT project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, storage_class, storage_pinned_node, depends_on, desired_state, status, status_reason, node_id, container_id
 		FROM workloads WHERE node_id = $1 AND status NOT IN ('failed', 'stopped')
 	`, nodeID)
 	if err != nil {
@@ -252,6 +256,47 @@ func (s *Store) AssignedWorkloads(ctx context.Context, nodeID string) ([]Workloa
 	return out, rows.Err()
 }
 
+// ListServiceInstances returns every ready instance of a logical service,
+// derived live from workloads joined to their node's address (SRS 8.1-8.2:
+// "The registry maps service identity to one or more actual endpoints").
+// There is no separate registry table — a ready workload row plus its
+// node's address *is* the registry entry.
+func (s *Store) ListServiceInstances(ctx context.Context, project, service string) ([]model.ServiceInstance, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT w.node_id, n.address, w.host_ports, w.status
+		FROM workloads w
+		JOIN nodes n ON n.id = w.node_id
+		WHERE w.project = $1 AND w.service = $2 AND w.status IN ('running', 'ready')
+	`, project, service)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []model.ServiceInstance
+	for rows.Next() {
+		var nodeID, address, status string
+		var hostPortsJSON []byte
+		if err := rows.Scan(&nodeID, &address, &hostPortsJSON, &status); err != nil {
+			return nil, err
+		}
+		var ports []int
+		_ = json.Unmarshal(hostPortsJSON, &ports)
+		if len(ports) == 0 {
+			continue // no externally reachable port to hand to a dependent
+		}
+		out = append(out, model.ServiceInstance{
+			Project: project,
+			Service: service,
+			NodeID:  nodeID,
+			Address: address,
+			Port:    ports[0],
+			Status:  model.Status(status),
+		})
+	}
+	return out, rows.Err()
+}
+
 type scannable interface {
 	Scan(dest ...any) error
 }
@@ -262,15 +307,17 @@ func scanWorkload(row scannable) (*WorkloadRecord, error) {
 
 func scanWorkloadRow(row scannable) (*WorkloadRecord, error) {
 	var rec WorkloadRecord
-	var env, hostPorts []byte
+	var command, env, hostPorts, dependsOn []byte
 	var storageClass, status string
-	if err := row.Scan(&rec.Project, &rec.Service, &rec.Revision, &rec.Image, &env, &rec.Resources.CPUMillis, &rec.Resources.MemoryBytes, &rec.Constraints.Architecture, &hostPorts, &storageClass, &rec.Storage.PinnedNodeID, (*string)(&rec.DesiredState), &status, &rec.StatusReason, &rec.NodeID, &rec.ContainerID); err != nil {
+	if err := row.Scan(&rec.Project, &rec.Service, &rec.Revision, &rec.Image, &command, &env, &rec.Resources.CPUMillis, &rec.Resources.MemoryBytes, &rec.Constraints.Architecture, &hostPorts, &storageClass, &rec.Storage.PinnedNodeID, &dependsOn, (*string)(&rec.DesiredState), &status, &rec.StatusReason, &rec.NodeID, &rec.ContainerID); err != nil {
 		return nil, err
 	}
 	rec.Status = model.Status(status)
 	rec.Storage.Class = model.StorageClass(storageClass)
 	rec.Env = map[string]string{}
+	_ = json.Unmarshal(command, &rec.Command)
 	_ = json.Unmarshal(env, &rec.Env)
 	_ = json.Unmarshal(hostPorts, &rec.Constraints.HostPorts)
+	_ = json.Unmarshal(dependsOn, &rec.DependsOn)
 	return &rec, nil
 }

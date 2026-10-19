@@ -99,3 +99,9 @@ func (svc *Service) AssignedWorkloads(ctx context.Context, nodeID string) ([]sto
 func (svc *Service) ReportStatus(ctx context.Context, key string, status model.Status, reason, containerID string) error {
 	return svc.store.UpdateStatus(ctx, key, status, reason, containerID)
 }
+
+// ListServiceInstances resolves a logical service name to its current
+// ready endpoints, from any node (SRS 8.1-8.2, UC-06, FR-010, FR-011).
+func (svc *Service) ListServiceInstances(ctx context.Context, project, service string) ([]model.ServiceInstance, error) {
+	return svc.store.ListServiceInstances(ctx, project, service)
+}
