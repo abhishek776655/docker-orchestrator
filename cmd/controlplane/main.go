@@ -13,6 +13,7 @@ import (
 	"github.com/abhishek/hardware-aware-container-orchestrator/build"
 	"github.com/abhishek/hardware-aware-container-orchestrator/controlplane"
 	"github.com/abhishek/hardware-aware-container-orchestrator/discovery"
+	"github.com/abhishek/hardware-aware-container-orchestrator/netutil"
 	"github.com/abhishek/hardware-aware-container-orchestrator/store"
 	"github.com/docker/docker/client"
 )
@@ -20,7 +21,7 @@ import (
 func main() {
 	addr := envOr("HACO_LISTEN_ADDR", ":8080")
 	dsn := envOr("HACO_POSTGRES_DSN", "postgres://postgres:haco@localhost:55432/haco?sslmode=disable")
-	registry := envOr("HACO_REGISTRY_ADDR", "")
+	registry := resolveRegistryAddr()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -84,4 +85,25 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 		}
 	}
 	return fallback
+}
+
+// resolveRegistryAddr returns the registry address to advertise to agents
+// (used both to tag pushed images and to push them). An empty
+// HACO_REGISTRY_ADDR disables the build service entirely — that default
+// is unchanged. Setting it to "auto" auto-detects this host's own LAN IP
+// and appends HACO_REGISTRY_PORT (default 5050), so a two-machine
+// deployment needs no manual IP lookup on the control-plane side either.
+func resolveRegistryAddr() string {
+	addr := os.Getenv("HACO_REGISTRY_ADDR")
+	if addr != "auto" {
+		return addr
+	}
+	ip, err := netutil.DetectLocalIP()
+	if err != nil {
+		log.Fatalf("HACO_REGISTRY_ADDR=auto but IP auto-detection failed: %v; set it explicitly", err)
+	}
+	port := envOr("HACO_REGISTRY_PORT", "5050")
+	resolved := ip + ":" + port
+	log.Printf("HACO_REGISTRY_ADDR=auto resolved to %s", resolved)
+	return resolved
 }

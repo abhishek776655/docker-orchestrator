@@ -151,23 +151,27 @@ docker run -d --name haco-registry -p 5050:5000 registry:2
 go build -o bin/controlplane ./cmd/controlplane
 go build -o bin/agent ./cmd/agent
 
-A_IP=$(ip route get 1 | awk '{print $7; exit}')   # or just check manually
-
 HACO_LISTEN_ADDR=0.0.0.0:8099 \
-HACO_REGISTRY_ADDR=$A_IP:5050 \
+HACO_REGISTRY_ADDR=auto \
 HACO_DNS_LISTEN_ADDR=0.0.0.0:53 \
 ./bin/controlplane &
+# logs print "HACO_REGISTRY_ADDR=auto resolved to <A_IP>:5050" — that's
+# the one address you still need to hand to Machine B below, since by
+# definition nothing on Machine B can guess where Machine A is.
 
-HACO_CONTROLPLANE_URL=http://$A_IP:8099 HACO_NODE_ID=node-a ./bin/agent &
+HACO_CONTROLPLANE_URL=http://localhost:8099 HACO_NODE_ID=node-a ./bin/agent &
 ```
 
-`HACO_NODE_ADDRESS` is omitted — the agent auto-detects Machine A's own
-LAN IP. Port 53 needs root or `setcap cap_net_bind_service`; if something
-else already holds it (`ss -ulnp | grep :53`, often `systemd-resolved`),
-either free it or drop `HACO_DNS_LISTEN_ADDR` and accept the same
-DNS-unavailable fallback shown above.
+`HACO_NODE_ADDRESS` is omitted — node-a's agent auto-detects Machine A's
+own LAN IP, and since it's running right there it talks to the control
+plane over `localhost`. Port 53 needs root or `setcap
+cap_net_bind_service`; if something else already holds it (`ss -ulnp |
+grep :53`, often `systemd-resolved`), either free it or drop
+`HACO_DNS_LISTEN_ADDR` and accept the same DNS-unavailable fallback shown
+above.
 
-**On Machine B** (just the `agent` binary, no Postgres/registry needed):
+**On Machine B** (just the `agent` binary, no Postgres/registry needed —
+substitute the `<A_IP>` the control plane's log printed above):
 
 ```bash
 # Docker must trust Machine A's registry (not localhost == "insecure" by default):
@@ -180,7 +184,10 @@ HACO_DNS_ADDRESS=<A_IP>:53 \
 ./bin/agent &
 ```
 
-Again, no `HACO_NODE_ADDRESS` — it auto-detects Machine B's own IP.
+`HACO_NODE_ADDRESS` is again omitted — it auto-detects Machine B's own IP.
+`<A_IP>` is the only address either machine needs told to it manually,
+because it's the one thing auto-detection structurally can't solve: no
+process on Machine B can discover where Machine A lives on its own.
 
 **Back on Machine A**, everything else (`/v1/compose/plan`, `/v1/compose/deploy`,
 status checks) is identical to the single-machine steps above — the build

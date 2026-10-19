@@ -5,19 +5,19 @@ package main
 import (
 	"context"
 	"log"
-	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"syscall"
 
 	"github.com/abhishek/hardware-aware-container-orchestrator/agent"
+	"github.com/abhishek/hardware-aware-container-orchestrator/netutil"
 )
 
 func main() {
 	address := os.Getenv("HACO_NODE_ADDRESS")
 	if address == "" {
-		detected, err := detectLocalIP()
+		detected, err := netutil.DetectLocalIP()
 		if err != nil {
 			log.Fatalf("HACO_NODE_ADDRESS not set and auto-detection failed: %v; set it explicitly", err)
 		}
@@ -56,18 +56,4 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
-}
-
-// detectLocalIP finds this host's outbound-facing local IP — the address
-// other nodes on the same network would use to reach it — without
-// actually sending any traffic. This is the standard trick: opening a UDP
-// "connection" only resolves routing locally, it doesn't require the
-// remote end to be reachable.
-func detectLocalIP() (string, error) {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		return "", err
-	}
-	defer conn.Close()
-	return conn.LocalAddr().(*net.UDPAddr).IP.String(), nil
 }
