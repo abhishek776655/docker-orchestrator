@@ -307,3 +307,124 @@ func TestReproducibility(t *testing.T) {
 		}
 	}
 }
+
+// TestGPUWorkloadNeverPlacedOnNodeWithoutGPU covers the M7 acceptance
+// criterion verbatim: "a workload with a hard GPU requirement is never
+// placed on a node without a compatible GPU."
+func TestGPUWorkloadNeverPlacedOnNodeWithoutGPU(t *testing.T) {
+	cpuOnly := node("node-cpu", "amd64", 4000, 8_000_000_000)
+	withGPU := node("node-gpu", "amd64", 4000, 8_000_000_000)
+	withGPU.GPUs = []model.GPU{{Vendor: "nvidia", Model: "A100", VRAMTotalBytes: 40_000_000_000, VRAMFreeBytes: 40_000_000_000}}
+
+	s := scheduler.New([]model.Node{cpuOnly, withGPU})
+	w := testdata.SmallWorkload("p", "s")
+	w.Constraints.GPU = model.GPURequirement{Required: true, Vendor: "nvidia", VRAMBytes: 8_000_000_000}
+
+	decision, err := s.Schedule(w)
+	if err != nil {
+		t.Fatalf("schedule failed: %v", err)
+	}
+	if decision.Selected != "node-gpu" {
+		t.Fatalf("expected node-gpu, got %s", decision.Selected)
+	}
+	found := false
+	for _, r := range decision.Rejections {
+		if r.NodeID == "node-cpu" && strings.Contains(r.Reason, "no") && strings.Contains(r.Reason, "GPU") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected GPU rejection for node-cpu, got %+v", decision.Rejections)
+	}
+}
+
+// TestGPUWorkloadRejectsInsufficientVRAM checks the VRAM headroom check,
+// not just device presence.
+func TestGPUWorkloadRejectsInsufficientVRAM(t *testing.T) {
+	small := node("node-gpu", "amd64", 4000, 8_000_000_000)
+	small.GPUs = []model.GPU{{Vendor: "nvidia", Model: "T4", VRAMTotalBytes: 16_000_000_000, VRAMFreeBytes: 16_000_000_000}}
+
+	s := scheduler.New([]model.Node{small})
+	w := testdata.SmallWorkload("p", "s")
+	w.Constraints.GPU = model.GPURequirement{Required: true, Vendor: "nvidia", VRAMBytes: 40_000_000_000}
+
+	decision, err := s.Schedule(w)
+	if err == nil {
+		t.Fatalf("expected rejection, got selection %s", decision.Selected)
+	}
+	if len(decision.Rejections) != 1 || !strings.Contains(decision.Rejections[0].Reason, "VRAM") {
+		t.Fatalf("expected VRAM rejection, got %+v", decision.Rejections)
+	}
+}
+
+// TestThermalFitPrefersCoolerNode checks the M7 exit criterion: "Placement
+// decision explains hardware-based preferences" — a hot/throttling node
+// loses to an equal-capacity cool one, and the reason is visible in
+// ScoreFactors.
+func TestThermalFitPrefersCoolerNode(t *testing.T) {
+	hot := node("node-hot", "amd64", 4000, 8_000_000_000)
+	hot.Thermal = model.Thermal{Known: true, Throttling: true, TemperatureC: 95}
+	cool := node("node-cool", "amd64", 4000, 8_000_000_000)
+	cool.Thermal = model.Thermal{Known: true, TemperatureC: 40}
+
+	s := scheduler.New([]model.Node{hot, cool})
+	decision, err := s.Schedule(testdata.SmallWorkload("p", "s"))
+	if err != nil {
+		t.Fatalf("schedule failed: %v", err)
+	}
+	if decision.Selected != "node-cool" {
+		t.Fatalf("expected node-cool (thermally healthy), got %s", decision.Selected)
+	}
+	for _, sc := range decision.Scores {
+		if sc.NodeID == "node-hot" && sc.ThermalFit != 0 {
+			t.Fatalf("expected node-hot's ThermalFit to be 0 while throttling, got %v", sc.ThermalFit)
+		}
+		if sc.NodeID == "node-cool" && sc.ThermalFit != 1 {
+			t.Fatalf("expected node-cool's ThermalFit to be 1, got %v", sc.ThermalFit)
+		}
+	}
+}
+
+// TestUnknownThermalIsNeutralNotPenalized covers SRS §9.5: "not a universal
+// temperature threshold" — a node with no thermal telemetry must never
+// score worse than one that actively reports being fine.
+func TestUnknownThermalIsNeutralNotPenalized(t *testing.T) {
+	unknown := node("node-unknown", "amd64", 4000, 8_000_000_000) // Thermal zero value: Known=false
+	known := node("node-known", "amd64", 4000, 8_000_000_000)
+	known.Thermal = model.Thermal{Known: true, TemperatureC: 40}
+
+	s := scheduler.New([]model.Node{unknown, known})
+	decision, err := s.Schedule(testdata.SmallWorkload("p", "s"))
+	if err != nil {
+		t.Fatalf("schedule failed: %v", err)
+	}
+	for _, sc := range decision.Scores {
+		if sc.ThermalFit != 1 {
+			t.Fatalf("expected ThermalFit 1 for both unknown and known-healthy nodes, got %s=%v", sc.NodeID, sc.ThermalFit)
+		}
+	}
+	// Equal on every factor -> tie-break by node ID, same guarantee as M1.
+	if decision.Selected != "node-known" {
+		t.Fatalf("expected tie-break to select node-known, got %s", decision.Selected)
+	}
+}
+
+// TestCacheFitPrefersNodeWithImageAlready checks image-cache locality
+// scoring (SRS §9.3).
+func TestCacheFitPrefersNodeWithImageAlready(t *testing.T) {
+	cold := node("node-cold", "amd64", 4000, 8_000_000_000)
+	warm := node("node-warm", "amd64", 4000, 8_000_000_000)
+	warm.CachedImages = []string{"myapp:latest"}
+
+	s := scheduler.New([]model.Node{cold, warm})
+	w := testdata.SmallWorkload("p", "s")
+	w.Image = "myapp:latest"
+
+	decision, err := s.Schedule(w)
+	if err != nil {
+		t.Fatalf("schedule failed: %v", err)
+	}
+	if decision.Selected != "node-warm" {
+		t.Fatalf("expected node-warm (has the image cached), got %s", decision.Selected)
+	}
+}

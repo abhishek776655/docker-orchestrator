@@ -85,8 +85,8 @@ func (svc *Service) RegisterNode(ctx context.Context, n model.Node) error {
 }
 
 // Heartbeat refreshes a node's last-seen timestamp.
-func (svc *Service) Heartbeat(ctx context.Context, nodeID string) error {
-	return svc.store.Heartbeat(ctx, nodeID)
+func (svc *Service) Heartbeat(ctx context.Context, nodeID string, thermal model.Thermal, cachedImages []string) error {
+	return svc.store.Heartbeat(ctx, nodeID, thermal, cachedImages)
 }
 
 // ListNodes returns every known node.

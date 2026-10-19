@@ -160,6 +160,21 @@ func (d *Docker) Capacity(ctx context.Context) (model.Resources, error) {
 	}, nil
 }
 
+// CachedImages lists the image references already present on this node's
+// Docker daemon, used as a scheduling hint (image cache locality, SRS
+// §9.3) — never a hard requirement, since any node can still pull.
+func (d *Docker) CachedImages(ctx context.Context) ([]string, error) {
+	images, err := d.cli.ImageList(ctx, types.ImageListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list images: %w", err)
+	}
+	var tags []string
+	for _, img := range images {
+		tags = append(tags, img.RepoTags...)
+	}
+	return tags, nil
+}
+
 // PullImage pulls an image reference, draining the progress stream.
 func (d *Docker) PullImage(ctx context.Context, ref string) error {
 	rc, err := d.cli.ImagePull(ctx, ref, types.ImagePullOptions{})

@@ -85,20 +85,35 @@ func (a *Agent) register(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	cachedImages, err := a.docker.CachedImages(ctx)
+	if err != nil {
+		log.Printf("list cached images failed: %v", err)
+	}
 	body := map[string]any{
-		"id":           a.cfg.NodeID,
-		"address":      a.cfg.Address,
-		"architecture": "amd64",
-		"labels":       map[string]string{},
-		"capabilities": map[string]bool{},
-		"cpu_millis":   capacity.CPUMillis,
-		"memory_bytes": capacity.MemoryBytes,
+		"id":            a.cfg.NodeID,
+		"address":       a.cfg.Address,
+		"architecture":  "amd64",
+		"labels":        map[string]string{},
+		"capabilities":  map[string]bool{},
+		"cpu_millis":    capacity.CPUMillis,
+		"memory_bytes":  capacity.MemoryBytes,
+		"gpus":          collectGPUs(ctx),
+		"thermal":       collectThermal(),
+		"cached_images": cachedImages,
 	}
 	return a.post(ctx, "/v1/nodes", body, nil)
 }
 
 func (a *Agent) heartbeat(ctx context.Context) error {
-	return a.post(ctx, "/v1/nodes/"+a.cfg.NodeID+"/heartbeat", nil, nil)
+	cachedImages, err := a.docker.CachedImages(ctx)
+	if err != nil {
+		log.Printf("list cached images failed: %v", err)
+	}
+	body := map[string]any{
+		"thermal":       collectThermal(),
+		"cached_images": cachedImages,
+	}
+	return a.post(ctx, "/v1/nodes/"+a.cfg.NodeID+"/heartbeat", body, nil)
 }
 
 func (a *Agent) pollAndExecute(ctx context.Context) error {

@@ -61,6 +61,9 @@ type registerNodeRequest struct {
 	Capabilities map[string]bool   `json:"capabilities"`
 	CPUMillis    int64             `json:"cpu_millis"`
 	MemoryBytes  int64             `json:"memory_bytes"`
+	GPUs         []model.GPU       `json:"gpus"`
+	Thermal      model.Thermal     `json:"thermal"`
+	CachedImages []string          `json:"cached_images"`
 }
 
 func (svc *Service) handleRegisterNode(w http.ResponseWriter, r *http.Request) {
@@ -76,6 +79,9 @@ func (svc *Service) handleRegisterNode(w http.ResponseWriter, r *http.Request) {
 		Labels:       req.Labels,
 		Capabilities: req.Capabilities,
 		Allocatable:  model.Resources{CPUMillis: req.CPUMillis, MemoryBytes: req.MemoryBytes},
+		GPUs:         req.GPUs,
+		Thermal:      req.Thermal,
+		CachedImages: req.CachedImages,
 	}
 	if err := svc.RegisterNode(r.Context(), n); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -84,9 +90,17 @@ func (svc *Service) handleRegisterNode(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, n)
 }
 
+type heartbeatRequest struct {
+	Thermal      model.Thermal `json:"thermal"`
+	CachedImages []string      `json:"cached_images"`
+}
+
 func (svc *Service) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if err := svc.Heartbeat(r.Context(), id); err != nil {
+	var req heartbeatRequest
+	_ = json.NewDecoder(r.Body).Decode(&req) // telemetry is optional; a bare heartbeat still counts
+
+	if err := svc.Heartbeat(r.Context(), id, req.Thermal, req.CachedImages); err != nil {
 		writeError(w, http.StatusNotFound, err)
 		return
 	}
@@ -103,21 +117,22 @@ func (svc *Service) handleListNodes(w http.ResponseWriter, r *http.Request) {
 }
 
 type submitRequest struct {
-	Project             string              `json:"project"`
-	Service             string              `json:"service"`
-	Revision            string              `json:"revision"`
-	Image               string              `json:"image"`
-	Command             []string            `json:"command"`
-	Env                 map[string]string   `json:"env"`
-	CPUMillis           int64               `json:"cpu_millis"`
-	MemoryBytes         int64               `json:"memory_bytes"`
-	Architecture        string              `json:"architecture"`
-	HostPorts           []int               `json:"host_ports"`
-	ContainerPorts      []int               `json:"container_ports"`
-	StorageClass        string              `json:"storage_class"`
-	StoragePinnedNodeID string              `json:"storage_pinned_node_id"`
-	Volumes             []model.VolumeMount `json:"volumes"`
-	DependsOn           []string            `json:"depends_on"`
+	Project             string               `json:"project"`
+	Service             string               `json:"service"`
+	Revision            string               `json:"revision"`
+	Image               string               `json:"image"`
+	Command             []string             `json:"command"`
+	Env                 map[string]string    `json:"env"`
+	CPUMillis           int64                `json:"cpu_millis"`
+	MemoryBytes         int64                `json:"memory_bytes"`
+	Architecture        string               `json:"architecture"`
+	HostPorts           []int                `json:"host_ports"`
+	ContainerPorts      []int                `json:"container_ports"`
+	StorageClass        string               `json:"storage_class"`
+	StoragePinnedNodeID string               `json:"storage_pinned_node_id"`
+	Volumes             []model.VolumeMount  `json:"volumes"`
+	DependsOn           []string             `json:"depends_on"`
+	GPU                 model.GPURequirement `json:"gpu"`
 }
 
 func (svc *Service) handleSubmit(w http.ResponseWriter, r *http.Request) {
@@ -144,6 +159,7 @@ func (svc *Service) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		Constraints: model.Constraints{
 			Architecture: req.Architecture,
 			HostPorts:    req.HostPorts,
+			GPU:          req.GPU,
 		},
 		ContainerPorts: req.ContainerPorts,
 		Storage: model.StoragePolicy{

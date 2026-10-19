@@ -11,22 +11,28 @@ import (
 	"github.com/abhishek/hardware-aware-container-orchestrator/model"
 )
 
-// Weights controls deterministic scoring (SRS 9.3). CPU and memory fit
-// are the only signals in M1; GPU/thermal/network/cache fit are deferred
-// to M7.
+// Weights controls deterministic scoring (SRS 9.3). GPU fit is not
+// weighted: GPU is a hard filter only (SRS FR-022, §9.4) — once a node is
+// GPU-eligible, its score comes from the same CPU/memory/thermal/cache
+// signals as any other workload. Network locality (§9.3) has no real
+// signal to weight in this prototype and is left at zero.
 type Weights struct {
-	CPU    float64
-	Memory float64
+	CPU     float64
+	Memory  float64
+	Thermal float64
+	Cache   float64
 }
 
-// DefaultWeights weighs CPU and memory headroom equally.
-var DefaultWeights = Weights{CPU: 0.5, Memory: 0.5}
+// DefaultWeights favors CPU/memory headroom, with thermal and image-cache
+// locality as smaller tie-breaking signals (SRS §9.3, M7).
+var DefaultWeights = Weights{CPU: 0.4, Memory: 0.4, Thermal: 0.1, Cache: 0.1}
 
 type nodeState struct {
-	node        model.Node
-	reservedCPU int64
-	reservedMem int64
-	usedPorts   map[int]bool
+	node         model.Node
+	reservedCPU  int64
+	reservedMem  int64
+	reservedVRAM int64
+	usedPorts    map[int]bool
 }
 
 // Scheduler holds cluster state: the known nodes and the reservations
@@ -71,6 +77,14 @@ func (s *Scheduler) SeedReservation(nodeID string, res model.Resources, hostPort
 	ns.reservedMem += res.MemoryBytes
 	for _, p := range hostPorts {
 		ns.usedPorts[p] = true
+	}
+}
+
+// SeedVRAMReservation pre-loads VRAM already held on a node by a
+// previously scheduled GPU workload, the GPU analogue of SeedReservation.
+func (s *Scheduler) SeedVRAMReservation(nodeID string, vramBytes int64) {
+	if ns, ok := s.nodes[nodeID]; ok {
+		ns.reservedVRAM += vramBytes
 	}
 }
 
@@ -143,6 +157,12 @@ func (s *Scheduler) reject(ns *nodeState, w model.Workload) (string, bool) {
 		return fmt.Sprintf("storage affinity mismatch: data pinned to %s", w.Storage.PinnedNodeID), true
 	}
 
+	if w.Constraints.GPU.Required {
+		if reason, ok := rejectGPU(n, ns, w.Constraints.GPU); ok {
+			return reason, true
+		}
+	}
+
 	if n.Allocatable.CPUMillis-ns.reservedCPU < w.Resources.CPUMillis {
 		return "insufficient allocatable CPU", true
 	}
@@ -159,6 +179,31 @@ func (s *Scheduler) reject(ns *nodeState, w model.Workload) (string, bool) {
 	return "", false
 }
 
+// rejectGPU checks a workload's hard GPU requirement against a node's
+// discovered devices (SRS §9.2, §9.4): "a workload with a hard GPU
+// requirement is never placed on a node without a compatible GPU."
+func rejectGPU(n model.Node, ns *nodeState, req model.GPURequirement) (string, bool) {
+	var freeVRAM int64
+	found := false
+	for _, g := range n.GPUs {
+		if req.Vendor != "" && g.Vendor != req.Vendor {
+			continue
+		}
+		found = true
+		freeVRAM += g.VRAMFreeBytes
+	}
+	if !found {
+		if req.Vendor != "" {
+			return fmt.Sprintf("no %s GPU on node %s", req.Vendor, n.ID), true
+		}
+		return fmt.Sprintf("no GPU on node %s", n.ID), true
+	}
+	if freeVRAM-ns.reservedVRAM < req.VRAMBytes {
+		return fmt.Sprintf("insufficient free VRAM on node %s", n.ID), true
+	}
+	return "", false
+}
+
 // score computes CPU/memory headroom fit for one eligible node (SRS 9.3).
 // Fit is the fraction of allocatable capacity that would remain free
 // after placing the workload; higher is better.
@@ -167,13 +212,49 @@ func (s *Scheduler) score(ns *nodeState, w model.Workload) model.ScoreFactors {
 
 	cpuFit := headroomFit(n.Allocatable.CPUMillis, ns.reservedCPU, w.Resources.CPUMillis)
 	memFit := headroomFit(n.Allocatable.MemoryBytes, ns.reservedMem, w.Resources.MemoryBytes)
+	thermalFit := thermalFit(n.Thermal)
+	cacheFit := cacheFit(n.CachedImages, w.Image)
 
 	return model.ScoreFactors{
-		NodeID:    n.ID,
-		CPUFit:    cpuFit,
-		MemoryFit: memFit,
-		Total:     s.weights.CPU*cpuFit + s.weights.Memory*memFit,
+		NodeID:     n.ID,
+		CPUFit:     cpuFit,
+		MemoryFit:  memFit,
+		ThermalFit: thermalFit,
+		CacheFit:   cacheFit,
+		Total:      s.weights.CPU*cpuFit + s.weights.Memory*memFit + s.weights.Thermal*thermalFit + s.weights.Cache*cacheFit,
 	}
+}
+
+// thermalFit is neutral (1.0, "fine") whenever the node reports no thermal
+// telemetry — unknown must never be scored as bad (SRS §9.5: "not a
+// universal temperature threshold"). A node actively reporting throttling
+// scores 0; otherwise fit degrades linearly above 60°C, floored at 0.
+func thermalFit(t model.Thermal) float64 {
+	if !t.Known {
+		return 1.0
+	}
+	if t.Throttling {
+		return 0.0
+	}
+	const warn, critical = 60.0, 90.0
+	if t.TemperatureC <= warn {
+		return 1.0
+	}
+	if t.TemperatureC >= critical {
+		return 0.0
+	}
+	return 1.0 - (t.TemperatureC-warn)/(critical-warn)
+}
+
+// cacheFit rewards a node that already has the workload's image pulled,
+// saving pull time (SRS §9.3 "image cache locality").
+func cacheFit(cached []string, image string) float64 {
+	for _, c := range cached {
+		if c == image {
+			return 1.0
+		}
+	}
+	return 0.0
 }
 
 func headroomFit(allocatable, reserved, request int64) float64 {
@@ -189,6 +270,9 @@ func headroomFit(allocatable, reserved, request int64) float64 {
 func (s *Scheduler) reserve(ns *nodeState, w model.Workload) {
 	ns.reservedCPU += w.Resources.CPUMillis
 	ns.reservedMem += w.Resources.MemoryBytes
+	if w.Constraints.GPU.Required {
+		ns.reservedVRAM += w.Constraints.GPU.VRAMBytes
+	}
 	for _, p := range w.Constraints.HostPorts {
 		ns.usedPorts[p] = true
 	}

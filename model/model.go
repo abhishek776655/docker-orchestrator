@@ -42,6 +42,44 @@ type Node struct {
 	Allocatable  Resources
 	Availability Availability
 	HeartbeatAt  time.Time
+	// GPUs is empty on a node with no GPU, or where GPU telemetry isn't
+	// available — both look identical to the scheduler (SRS §9.2/§9.4).
+	GPUs []GPU
+	// Thermal is a best-effort signal, not a universal threshold (SRS
+	// §9.5): Known is false when the host exposes no thermal sensors the
+	// agent can read, and the scheduler must then treat it as neutral,
+	// never as a rejection.
+	Thermal Thermal
+	// CachedImages are image references already present on this node's
+	// Docker daemon, used only as a scoring signal (image cache locality,
+	// SRS §9.3) — never a hard filter, since any node can still pull.
+	CachedImages []string
+}
+
+// GPU is one discovered accelerator device (SRS §9.2, §9.4).
+type GPU struct {
+	Vendor         string
+	Model          string
+	VRAMTotalBytes int64
+	VRAMFreeBytes  int64
+}
+
+// Thermal is a best-effort hardware signal (SRS §9.5): "Thermal data
+// should be treated as a signal, not a universal temperature threshold."
+type Thermal struct {
+	Known        bool
+	TemperatureC float64
+	Throttling   bool
+}
+
+// GPURequirement is a workload's hard GPU constraint (SRS §9.2, UC
+// "a workload with a hard GPU requirement is never placed on a node
+// without a compatible GPU"). A workload with no requirement (the zero
+// value has Required == false) is scheduled by CPU/memory alone.
+type GPURequirement struct {
+	Required  bool
+	Vendor    string // empty matches any vendor
+	VRAMBytes int64
 }
 
 // StoragePolicy pins a workload to a node when it owns node-local
@@ -60,6 +98,7 @@ type Constraints struct {
 	RequiredLabels       map[string]string
 	RequiredCapabilities []string
 	HostPorts            []int
+	GPU                  GPURequirement
 }
 
 // Workload is a normalized placement request (SRS 12.1).
@@ -170,7 +209,13 @@ type ScoreFactors struct {
 	NodeID    string
 	CPUFit    float64
 	MemoryFit float64
-	Total     float64
+	// ThermalFit and CacheFit are hardware-aware signals (SRS §9.3, M7):
+	// 1.0 when the node runs cool / already has the image, degrading
+	// toward 0 otherwise. ThermalFit is neutral (1.0) when the node
+	// reports no thermal telemetry — unknown is never penalized (§9.5).
+	ThermalFit float64
+	CacheFit   float64
+	Total      float64
 }
 
 // Decision is the full, inspectable outcome of one scheduling attempt

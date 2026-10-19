@@ -26,7 +26,10 @@ CREATE TABLE IF NOT EXISTS nodes (
 	cpu_millis    bigint NOT NULL,
 	memory_bytes  bigint NOT NULL,
 	availability  text NOT NULL,
-	heartbeat_at  timestamptz NOT NULL
+	heartbeat_at  timestamptz NOT NULL,
+	gpus          jsonb NOT NULL DEFAULT '[]',
+	thermal       jsonb NOT NULL DEFAULT '{"Known": false}',
+	cached_images jsonb NOT NULL DEFAULT '[]'
 );
 
 CREATE TABLE IF NOT EXISTS workloads (
@@ -86,13 +89,17 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 // Close releases the connection pool.
 func (s *Store) Close() { s.pool.Close() }
 
-// UpsertNode registers a node or refreshes its heartbeat/capacity.
+// UpsertNode registers a node or refreshes its heartbeat/capacity,
+// including hardware telemetry (SRS §9.2, M7).
 func (s *Store) UpsertNode(ctx context.Context, n model.Node) error {
 	labels, _ := json.Marshal(n.Labels)
 	caps, _ := json.Marshal(n.Capabilities)
+	gpus, _ := json.Marshal(n.GPUs)
+	thermal, _ := json.Marshal(n.Thermal)
+	cachedImages, _ := json.Marshal(n.CachedImages)
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO nodes (id, address, architecture, labels, capabilities, cpu_millis, memory_bytes, availability, heartbeat_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+		INSERT INTO nodes (id, address, architecture, labels, capabilities, cpu_millis, memory_bytes, availability, heartbeat_at, gpus, thermal, cached_images)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
 		ON CONFLICT (id) DO UPDATE SET
 			address = EXCLUDED.address,
 			architecture = EXCLUDED.architecture,
@@ -101,14 +108,23 @@ func (s *Store) UpsertNode(ctx context.Context, n model.Node) error {
 			cpu_millis = EXCLUDED.cpu_millis,
 			memory_bytes = EXCLUDED.memory_bytes,
 			availability = EXCLUDED.availability,
-			heartbeat_at = EXCLUDED.heartbeat_at
-	`, n.ID, n.Address, n.Architecture, labels, caps, n.Allocatable.CPUMillis, n.Allocatable.MemoryBytes, string(n.Availability), n.HeartbeatAt)
+			heartbeat_at = EXCLUDED.heartbeat_at,
+			gpus = EXCLUDED.gpus,
+			thermal = EXCLUDED.thermal,
+			cached_images = EXCLUDED.cached_images
+	`, n.ID, n.Address, n.Architecture, labels, caps, n.Allocatable.CPUMillis, n.Allocatable.MemoryBytes, string(n.Availability), n.HeartbeatAt, gpus, thermal, cachedImages)
 	return err
 }
 
-// Heartbeat updates only a node's last-seen timestamp.
-func (s *Store) Heartbeat(ctx context.Context, nodeID string) error {
-	tag, err := s.pool.Exec(ctx, `UPDATE nodes SET heartbeat_at = now(), availability = 'available' WHERE id = $1`, nodeID)
+// Heartbeat updates a node's last-seen timestamp and refreshes its
+// telemetry snapshot (SRS 6.2 "send heartbeat/resource snapshot").
+func (s *Store) Heartbeat(ctx context.Context, nodeID string, thermal model.Thermal, cachedImages []string) error {
+	thermalJSON, _ := json.Marshal(thermal)
+	cachedJSON, _ := json.Marshal(cachedImages)
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE nodes SET heartbeat_at = now(), availability = 'available', thermal = $2, cached_images = $3
+		WHERE id = $1
+	`, nodeID, thermalJSON, cachedJSON)
 	if err != nil {
 		return err
 	}
@@ -246,7 +262,7 @@ func (s *Store) Metrics(ctx context.Context) (*Metrics, error) {
 
 // ListNodes returns every known node.
 func (s *Store) ListNodes(ctx context.Context) ([]model.Node, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id, address, architecture, labels, capabilities, cpu_millis, memory_bytes, availability, heartbeat_at FROM nodes`)
+	rows, err := s.pool.Query(ctx, `SELECT id, address, architecture, labels, capabilities, cpu_millis, memory_bytes, availability, heartbeat_at, gpus, thermal, cached_images FROM nodes`)
 	if err != nil {
 		return nil, err
 	}
@@ -255,9 +271,9 @@ func (s *Store) ListNodes(ctx context.Context) ([]model.Node, error) {
 	var nodes []model.Node
 	for rows.Next() {
 		var n model.Node
-		var labels, caps []byte
+		var labels, caps, gpus, thermal, cachedImages []byte
 		var availability string
-		if err := rows.Scan(&n.ID, &n.Address, &n.Architecture, &labels, &caps, &n.Allocatable.CPUMillis, &n.Allocatable.MemoryBytes, &availability, &n.HeartbeatAt); err != nil {
+		if err := rows.Scan(&n.ID, &n.Address, &n.Architecture, &labels, &caps, &n.Allocatable.CPUMillis, &n.Allocatable.MemoryBytes, &availability, &n.HeartbeatAt, &gpus, &thermal, &cachedImages); err != nil {
 			return nil, err
 		}
 		n.Availability = model.Availability(availability)
@@ -266,6 +282,9 @@ func (s *Store) ListNodes(ctx context.Context) ([]model.Node, error) {
 		capBools := map[string]bool{}
 		_ = json.Unmarshal(caps, &capBools)
 		n.Capabilities = capBools
+		_ = json.Unmarshal(gpus, &n.GPUs)
+		_ = json.Unmarshal(thermal, &n.Thermal)
+		_ = json.Unmarshal(cachedImages, &n.CachedImages)
 		nodes = append(nodes, n)
 	}
 	return nodes, rows.Err()
