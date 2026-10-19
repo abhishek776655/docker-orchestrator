@@ -30,6 +30,7 @@ import (
 const (
 	managedLabel = "haco.managed"
 	keyLabel     = "haco.workload.key"
+	nodeLabel    = "haco.node.id"
 )
 
 // Docker wraps the subset of the Docker Engine API the M2 agent needs:
@@ -38,24 +39,32 @@ const (
 // itself is never exposed to the LAN (SRS §11).
 type Docker struct {
 	cli       *client.Client
+	nodeID    string // scopes managed-container labels/filters (see ManagedContainers)
 	dataDir   string // root for node-local persistent volumes (SRS §10)
 	dnsIP     string // control plane's service-name resolver; "" disables it
 	dnsSuffix string // e.g. "haco"; search domain becomes "<project>.<suffix>"
 }
 
-// NewDocker builds a Docker client. dnsAddr is the control plane's
-// service-name resolver address (host:port, e.g. "10.0.0.1:53"); pass ""
-// to disable container DNS configuration. Docker's container-level DNS
-// setting (HostConfig.DNS) always queries port 53 — there is no way to
-// point it at a custom port — so a dnsAddr whose port isn't "53" is
-// accepted but has no effect on containers, only a logged warning: see
-// the M7 doc for why a local dev machine usually can't bind 53 itself.
-func NewDocker(dataDir, dnsAddr, dnsSuffix string) (*Docker, error) {
+// NewDocker builds a Docker client. nodeID scopes every container this
+// agent creates and every ManagedContainers/StopAndRemove call to this
+// node specifically — essential whenever multiple simulated nodes share
+// one Docker daemon (this project's local dev/test setup, documented in
+// the M3-M7 docs): without it, one node's orphan-cleanup pass can remove
+// another node's live container, since labels without a node scope look
+// identical regardless of which agent created them. dnsAddr is the
+// control plane's service-name resolver address (host:port, e.g.
+// "10.0.0.1:53"); pass "" to disable container DNS configuration.
+// Docker's container-level DNS setting (HostConfig.DNS) always queries
+// port 53 — there is no way to point it at a custom port — so a dnsAddr
+// whose port isn't "53" is accepted but has no effect on containers, only
+// a logged warning: see the M7 doc for why a local dev machine usually
+// can't bind 53 itself.
+func NewDocker(nodeID, dataDir, dnsAddr, dnsSuffix string) (*Docker, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return nil, fmt.Errorf("docker client: %w", err)
 	}
-	d := &Docker{cli: cli, dataDir: dataDir, dnsSuffix: dnsSuffix}
+	d := &Docker{cli: cli, nodeID: nodeID, dataDir: dataDir, dnsSuffix: dnsSuffix}
 	if dnsAddr != "" {
 		host, port, err := net.SplitHostPort(dnsAddr)
 		if err != nil {
@@ -245,6 +254,7 @@ func (d *Docker) EnsureRunning(ctx context.Context, w model.Workload) (container
 			Labels: map[string]string{
 				managedLabel: "true",
 				keyLabel:     w.Key(),
+				nodeLabel:    d.nodeID,
 			},
 		},
 		&container.HostConfig{
@@ -282,7 +292,10 @@ type ManagedContainer struct {
 // current assignment and remove any that no longer belong here (SRS §6.3,
 // UC-08).
 func (d *Docker) ManagedContainers(ctx context.Context) ([]ManagedContainer, error) {
-	f := filters.NewArgs(filters.Arg("label", managedLabel+"=true"))
+	f := filters.NewArgs(
+		filters.Arg("label", managedLabel+"=true"),
+		filters.Arg("label", nodeLabel+"="+d.nodeID),
+	)
 	containers, err := d.cli.ContainerList(ctx, types.ContainerListOptions{All: true, Filters: f})
 	if err != nil {
 		return nil, fmt.Errorf("list managed containers: %w", err)

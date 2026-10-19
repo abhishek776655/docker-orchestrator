@@ -25,7 +25,7 @@ func main() {
 	home, _ := os.UserHomeDir()
 	dataDir := envOr("HACO_DATA_DIR", filepath.Join(home, ".haco", "volumes", cfg.NodeID))
 
-	docker, err := agent.NewDocker(dataDir, cfg.DNSAddress, cfg.DNSSuffix)
+	docker, err := agent.NewDocker(cfg.NodeID, dataDir, cfg.DNSAddress, cfg.DNSSuffix)
 	if err != nil {
 		log.Fatalf("docker client: %v", err)
 	}

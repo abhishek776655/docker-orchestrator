@@ -1,0 +1,27 @@
+services:
+  cache:
+    image: redis:7-alpine
+    command: ["redis-server", "--port", "6380", "--protected-mode", "no"]
+    expose:
+      - "6380"
+    volumes:
+      - cache-data:/data
+    x-haco-pin-node: node-a
+    cpus: "0.25"
+    mem_limit: "134217728"
+
+  api:
+    build:
+      context: ./api
+    ports:
+      - "9090:9090"
+    environment:
+      CACHE_URL: cache:6380
+    depends_on:
+      cache:
+        condition: service_started
+    cpus: "0.25"
+    mem_limit: "67108864"
+
+volumes:
+  cache-data:
