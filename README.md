@@ -19,6 +19,32 @@ The first delivery is a deterministic scheduler simulator. It establishes placem
 - [Core contracts](docs/contracts/core-contracts.md)
 - [Compose compatibility matrix](docs/compose-compatibility-matrix.md)
 - [M1 scheduler backlog](docs/planning/m1-scheduler-simulator.md)
+- [M2 single-node execution](docs/planning/m2-single-node-execution.md)
+
+## Running the M2 prototype
+
+```bash
+# 1. Metadata store
+docker run -d --name haco-postgres -e POSTGRES_PASSWORD=haco -e POSTGRES_DB=haco -p 55432:5432 postgres:16-alpine
+
+# 2. Control plane
+go build -o bin/controlplane ./cmd/controlplane
+HACO_LISTEN_ADDR=:8099 ./bin/controlplane &
+
+# 3. Node agent (uses your local Docker daemon)
+go build -o bin/agent ./cmd/agent
+HACO_CONTROLPLANE_URL=http://localhost:8099 HACO_NODE_ID=node-local ./bin/agent &
+
+# 4. Submit a workload
+curl -X POST http://localhost:8099/v1/workloads -H 'Content-Type: application/json' -d '{
+  "project": "demo", "service": "web", "revision": "r1",
+  "image": "nginx:alpine", "cpu_millis": 250, "memory_bytes": 67108864,
+  "architecture": "amd64", "host_ports": [18080], "storage_class": "ephemeral"
+}'
+
+# 5. Check status
+curl http://localhost:8099/v1/workloads/demo/web/r1
+```
 
 ## Explicit non-goals for the first release
 

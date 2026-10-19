@@ -3,6 +3,8 @@
 // recorded outcome of a placement attempt.
 package model
 
+import "time"
+
 // Availability is the node's eligibility for new placements.
 type Availability string
 
@@ -33,11 +35,13 @@ type Resources struct {
 // that reservation itself.
 type Node struct {
 	ID           string
+	Address      string
 	Architecture string
 	Labels       map[string]string
 	Capabilities map[string]bool
 	Allocatable  Resources
 	Availability Availability
+	HeartbeatAt  time.Time
 }
 
 // StoragePolicy pins a workload to a node when it owns node-local
@@ -60,13 +64,41 @@ type Constraints struct {
 
 // Workload is a normalized placement request (SRS 12.1).
 type Workload struct {
-	Project     string
-	Service     string
-	Revision    string
-	Resources   Resources
-	Constraints Constraints
-	Storage     StoragePolicy
+	Project      string
+	Service      string
+	Revision     string
+	Image        string
+	Env          map[string]string
+	Resources    Resources
+	Constraints  Constraints
+	Storage      StoragePolicy
+	DesiredState DesiredState
 }
+
+// DesiredState is the controller's intent for a workload, independent of
+// its observed runtime status (SRS 12.1 "Runtime state").
+type DesiredState string
+
+const (
+	DesiredRunning DesiredState = "running"
+	DesiredStopped DesiredState = "stopped"
+)
+
+// Status is the agent-observed lifecycle state of a workload (SRS 12.1:
+// "pending -> assigned -> pulling -> starting -> running -> ready").
+// Failure states carry a machine-readable reason alongside Status.
+type Status string
+
+const (
+	StatusPending  Status = "pending"
+	StatusAssigned Status = "assigned"
+	StatusPulling  Status = "pulling"
+	StatusStarting Status = "starting"
+	StatusRunning  Status = "running"
+	StatusReady    Status = "ready"
+	StatusFailed   Status = "failed"
+	StatusStopped  Status = "stopped"
+)
 
 // Key returns the stable identity used to key reservations and decisions.
 func (w Workload) Key() string {

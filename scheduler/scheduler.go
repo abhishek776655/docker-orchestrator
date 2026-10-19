@@ -58,6 +58,22 @@ func NewWithWeights(nodes []model.Node, weights Weights) *Scheduler {
 	return s
 }
 
+// SeedReservation pre-loads capacity and ports already held on a node by
+// workloads scheduled in a previous process (e.g. recovered from
+// persistent storage at startup, SRS NFR-001). It must be called before
+// any Schedule call on this instance.
+func (s *Scheduler) SeedReservation(nodeID string, res model.Resources, hostPorts []int) {
+	ns, ok := s.nodes[nodeID]
+	if !ok {
+		return
+	}
+	ns.reservedCPU += res.CPUMillis
+	ns.reservedMem += res.MemoryBytes
+	for _, p := range hostPorts {
+		ns.usedPorts[p] = true
+	}
+}
+
 // Schedule evaluates a workload against every known node: hard filters
 // first, then deterministic scoring, then reservation of the winning
 // node's capacity. It returns a full decision trail even on rejection so
