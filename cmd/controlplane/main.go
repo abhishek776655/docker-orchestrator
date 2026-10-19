@@ -10,13 +10,16 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/abhishek/hardware-aware-container-orchestrator/build"
 	"github.com/abhishek/hardware-aware-container-orchestrator/controlplane"
 	"github.com/abhishek/hardware-aware-container-orchestrator/store"
+	"github.com/docker/docker/client"
 )
 
 func main() {
 	addr := envOr("HACO_LISTEN_ADDR", ":8080")
 	dsn := envOr("HACO_POSTGRES_DSN", "postgres://postgres:haco@localhost:55432/haco?sslmode=disable")
+	registry := envOr("HACO_REGISTRY_ADDR", "")
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -28,6 +31,14 @@ func main() {
 	defer s.Close()
 
 	svc := controlplane.New(s)
+	if registry != "" {
+		dockerCli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+		if err != nil {
+			log.Fatalf("docker client for build service: %v", err)
+		}
+		svc = svc.WithBuilder(build.New(dockerCli, registry))
+		log.Printf("compose build service enabled, pushing to %s", registry)
+	}
 	server := &http.Server{Addr: addr, Handler: controlplane.NewHandler(svc)}
 
 	go func() {

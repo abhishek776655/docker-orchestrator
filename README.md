@@ -21,6 +21,7 @@ The first delivery is a deterministic scheduler simulator. It establishes placem
 - [M1 scheduler backlog](docs/planning/m1-scheduler-simulator.md)
 - [M2 single-node execution](docs/planning/m2-single-node-execution.md)
 - [M3 two-node connectivity](docs/planning/m3-two-node-connectivity.md)
+- [M4 Compose importer and builds](docs/planning/m4-compose-importer-and-builds.md)
 
 ## Running the M2 prototype
 

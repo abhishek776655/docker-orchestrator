@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/abhishek/hardware-aware-container-orchestrator/build"
+	"github.com/abhishek/hardware-aware-container-orchestrator/compose"
 	"github.com/abhishek/hardware-aware-container-orchestrator/model"
 	"github.com/abhishek/hardware-aware-container-orchestrator/scheduler"
 	"github.com/abhishek/hardware-aware-container-orchestrator/store"
@@ -17,10 +19,63 @@ import (
 // state (M2). Every call rebuilds a fresh Scheduler from the database so
 // there is exactly one source of truth (SRS NFR-001).
 type Service struct {
-	store *store.Store
+	store   *store.Store
+	builder *build.Service // nil disables build-based deploys (image-only workloads still work)
 }
 
 func New(s *store.Store) *Service { return &Service{store: s} }
+
+// WithBuilder enables POST /v1/compose/deploy to build services that
+// declare a `build:` block (SRS 5.1 "Build Service").
+func (svc *Service) WithBuilder(b *build.Service) *Service {
+	svc.builder = b
+	return svc
+}
+
+// ComposePlan parses and validates a Compose file without applying
+// anything (SRS UC-02, FR-023).
+func (svc *Service) ComposePlan(ctx context.Context, project, workingDir string, yaml []byte) (*compose.Plan, error) {
+	return compose.Load(ctx, project, workingDir, yaml)
+}
+
+// ComposeDeploy plans a Compose file, builds any services that need it,
+// and submits every workload through the normal scheduler path. It stops
+// at the first rejection — nothing is applied for an invalid plan
+// (FR-003).
+func (svc *Service) ComposeDeploy(ctx context.Context, project, workingDir string, yaml []byte) (*compose.Plan, []*SubmitResult, error) {
+	plan, err := compose.Load(ctx, project, workingDir, yaml)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !plan.Valid() {
+		return plan, nil, fmt.Errorf("compose plan for %s has %d rejection(s)", project, len(plan.Rejections))
+	}
+
+	builtImages := map[string]string{}
+	for _, b := range plan.Builds {
+		if svc.builder == nil {
+			return plan, nil, fmt.Errorf("service %s requires a build but no builder is configured", b.Service)
+		}
+		ref, err := svc.builder.Build(ctx, project, "latest", b)
+		if err != nil {
+			return plan, nil, fmt.Errorf("build %s: %w", b.Service, err)
+		}
+		builtImages[b.Service] = ref
+	}
+
+	var results []*SubmitResult
+	for _, wl := range plan.Workloads {
+		if ref, ok := builtImages[wl.Service]; ok {
+			wl.Image = ref
+		}
+		result, err := svc.Submit(ctx, wl)
+		results = append(results, result)
+		if err != nil {
+			return plan, results, fmt.Errorf("schedule %s: %w", wl.Service, err)
+		}
+	}
+	return plan, results, nil
+}
 
 // RegisterNode upserts a node's identity and capacity.
 func (svc *Service) RegisterNode(ctx context.Context, n model.Node) error {

@@ -26,6 +26,9 @@ func NewHandler(svc *Service) http.Handler {
 
 	mux.HandleFunc("GET /v1/services/{project}/{service}", svc.handleListServiceInstances)
 
+	mux.HandleFunc("POST /v1/compose/plan", svc.handleComposePlan)
+	mux.HandleFunc("POST /v1/compose/deploy", svc.handleComposeDeploy)
+
 	return logRequests(mux)
 }
 
@@ -189,6 +192,48 @@ func (svc *Service) handleListServiceInstances(w http.ResponseWriter, r *http.Re
 		return
 	}
 	writeJSON(w, http.StatusOK, instances)
+}
+
+type composeRequest struct {
+	Project    string `json:"project"`
+	WorkingDir string `json:"working_dir"`
+	Yaml       string `json:"yaml"`
+}
+
+func (svc *Service) handleComposePlan(w http.ResponseWriter, r *http.Request) {
+	var req composeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	plan, err := svc.ComposePlan(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	status := http.StatusOK
+	if !plan.Valid() {
+		status = http.StatusUnprocessableEntity
+	}
+	writeJSON(w, status, plan)
+}
+
+func (svc *Service) handleComposeDeploy(w http.ResponseWriter, r *http.Request) {
+	var req composeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	plan, results, err := svc.ComposeDeploy(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml))
+	if err != nil {
+		status := http.StatusInternalServerError
+		if plan != nil && !plan.Valid() {
+			status = http.StatusUnprocessableEntity
+		}
+		writeJSON(w, status, map[string]any{"error": err.Error(), "plan": plan, "results": results})
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"plan": plan, "results": results})
 }
 
 func (svc *Service) handleReportStatus(w http.ResponseWriter, r *http.Request) {
