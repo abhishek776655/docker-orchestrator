@@ -37,12 +37,14 @@ Compose file used below.
 
 > **One machine, two simulated nodes.** There's no second physical/VM host
 > here, so "two nodes" are two agent processes against the same Docker
-> daemon, told apart by `HACO_NODE_ID`/`HACO_NODE_ADDRESS`. On real
-> hardware, point each agent at its own host's Docker socket and use that
-> host's real IP for `HACO_NODE_ADDRESS` — nothing else changes. Known
-> limitations of this single-daemon simulation (and the few others, like
-> the 1:1 host/container port binding and service-name DNS needing a free
-> port 53) are documented in the `docs/planning/m2`...`m7` files.
+> daemon, told apart by `HACO_NODE_ID`/`HACO_NODE_ADDRESS` (both agents
+> would otherwise auto-detect the *same* machine IP, so on one box you
+> must set `HACO_NODE_ADDRESS` explicitly per agent, as below). On two
+> real machines, skip `HACO_NODE_ADDRESS` entirely — the agent
+> auto-detects its own outbound LAN IP — see "Two real machines" below.
+> Known limitations of this single-daemon simulation (and the few others,
+> like the 1:1 host/container port binding and service-name DNS needing a
+> free port 53) are documented in the `docs/planning/m2`...`m7` files.
 
 ### 1. Dependencies
 
@@ -136,6 +138,56 @@ duplicated — while any ephemeral workload on it gets rescheduled to
 pkill -f bin/controlplane; pkill -f bin/agent
 docker rm -f haco-mvpdemo-cache-latest haco-mvpdemo-api-latest haco-postgres haco-registry
 ```
+
+### Two real machines
+
+Call them Machine A (control plane + node-a) and Machine B (node-b only).
+
+**On Machine A:**
+
+```bash
+docker run -d --name haco-postgres -e POSTGRES_PASSWORD=haco -e POSTGRES_DB=haco -p 55432:5432 postgres:16-alpine
+docker run -d --name haco-registry -p 5050:5000 registry:2
+go build -o bin/controlplane ./cmd/controlplane
+go build -o bin/agent ./cmd/agent
+
+A_IP=$(ip route get 1 | awk '{print $7; exit}')   # or just check manually
+
+HACO_LISTEN_ADDR=0.0.0.0:8099 \
+HACO_REGISTRY_ADDR=$A_IP:5050 \
+HACO_DNS_LISTEN_ADDR=0.0.0.0:53 \
+./bin/controlplane &
+
+HACO_CONTROLPLANE_URL=http://$A_IP:8099 HACO_NODE_ID=node-a ./bin/agent &
+```
+
+`HACO_NODE_ADDRESS` is omitted — the agent auto-detects Machine A's own
+LAN IP. Port 53 needs root or `setcap cap_net_bind_service`; if something
+else already holds it (`ss -ulnp | grep :53`, often `systemd-resolved`),
+either free it or drop `HACO_DNS_LISTEN_ADDR` and accept the same
+DNS-unavailable fallback shown above.
+
+**On Machine B** (just the `agent` binary, no Postgres/registry needed):
+
+```bash
+# Docker must trust Machine A's registry (not localhost == "insecure" by default):
+# add {"insecure-registries": ["<A_IP>:5050"]} to /etc/docker/daemon.json, then
+# sudo systemctl restart docker
+
+HACO_CONTROLPLANE_URL=http://<A_IP>:8099 \
+HACO_NODE_ID=node-b \
+HACO_DNS_ADDRESS=<A_IP>:53 \
+./bin/agent &
+```
+
+Again, no `HACO_NODE_ADDRESS` — it auto-detects Machine B's own IP.
+
+**Back on Machine A**, everything else (`/v1/compose/plan`, `/v1/compose/deploy`,
+status checks) is identical to the single-machine steps above — the build
+context just needs to exist on Machine A, since that's where the build
+service runs. Open firewall ports `8099` (control plane), `53/udp` (DNS),
+`5050` (registry), and any `host_ports` your workloads publish, between
+the two machines.
 
 ### A smaller single-call example
 
