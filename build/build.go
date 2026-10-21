@@ -8,10 +8,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/client"
@@ -59,8 +61,16 @@ func (s *Service) Build(ctx context.Context, project, revision string, spec comp
 		return "", fmt.Errorf("build %s: %w", spec.Service, err)
 	}
 	defer resp.Body.Close()
-	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
-		return "", fmt.Errorf("read build output for %s: %w", spec.Service, err)
+	if err := consumeDockerStream(resp.Body, "build "+spec.Service); err != nil {
+		return "", err
+	}
+
+	built, _, err := s.cli.ImageInspectWithRaw(ctx, ref)
+	if err != nil {
+		return "", fmt.Errorf("inspect built image %s: %w", ref, err)
+	}
+	if err := validateImagePlatform(built, spec.Platform); err != nil {
+		return "", fmt.Errorf("build %s: %w", spec.Service, err)
 	}
 
 	pushRC, err := s.cli.ImagePush(ctx, ref, types.ImagePushOptions{
@@ -70,11 +80,51 @@ func (s *Service) Build(ctx context.Context, project, revision string, spec comp
 		return "", fmt.Errorf("push %s: %w", ref, err)
 	}
 	defer pushRC.Close()
-	if _, err := io.Copy(io.Discard, pushRC); err != nil {
-		return "", fmt.Errorf("read push output for %s: %w", spec.Service, err)
+	if err := consumeDockerStream(pushRC, "push "+spec.Service); err != nil {
+		return "", err
 	}
 
 	return ref, nil
+}
+
+func consumeDockerStream(r io.Reader, operation string) error {
+	decoder := json.NewDecoder(r)
+	for {
+		var message struct {
+			Error       string `json:"error"`
+			ErrorDetail struct {
+				Message string `json:"message"`
+			} `json:"errorDetail"`
+		}
+		if err := decoder.Decode(&message); err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return fmt.Errorf("read %s output: %w", operation, err)
+		}
+		if message.ErrorDetail.Message != "" {
+			return fmt.Errorf("%s: %s", operation, message.ErrorDetail.Message)
+		}
+		if message.Error != "" {
+			return fmt.Errorf("%s: %s", operation, message.Error)
+		}
+	}
+}
+
+func validateImagePlatform(image types.ImageInspect, requested string) error {
+	if requested == "" {
+		return nil
+	}
+	parts := strings.Split(requested, "/")
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		return fmt.Errorf("invalid requested platform %q", requested)
+	}
+	actual := strings.ToLower(image.Os + "/" + image.Architecture)
+	expected := strings.ToLower(parts[0] + "/" + parts[1])
+	if actual != expected {
+		return fmt.Errorf("built image platform is %s, requested %s", actual, expected)
+	}
+	return nil
 }
 
 // tarContext packages a build context directory as the tar stream the
