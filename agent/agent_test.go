@@ -74,6 +74,15 @@ func TestSplitAssignmentsKeepsFailedWorkloadOwnedButDoesNotRetry(t *testing.T) {
 	}
 }
 
+func TestContainerImageMatchesDetectsUpdatedImageBehindSameTag(t *testing.T) {
+	if containerImageMatches("sha256:old-image", "sha256:new-image") {
+		t.Fatal("container with old image ID must not be reused after redeploy")
+	}
+	if !containerImageMatches("sha256:same-image", "sha256:same-image") {
+		t.Fatal("container with the desired image ID should be reusable")
+	}
+}
+
 func workloadKeys(records []store.WorkloadRecord) []string {
 	keys := make([]string, 0, len(records))
 	for _, rec := range records {

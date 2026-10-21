@@ -229,14 +229,28 @@ func (d *Docker) EnsureRunning(ctx context.Context, w model.Workload) (container
 
 	existing, err := d.cli.ContainerInspect(ctx, name)
 	if err == nil {
-		if !existing.State.Running {
-			if err := d.cli.ContainerStart(ctx, existing.ID, types.ContainerStartOptions{}); err != nil {
-				return "", warnings, fmt.Errorf("restart existing container: %w", err)
-			}
+		image, _, err := d.cli.ImageInspectWithRaw(ctx, w.Image)
+		if err != nil {
+			return "", warnings, fmt.Errorf("inspect workload image %s: %w", w.Image, err)
 		}
-		return existing.ID, warnings, nil
+		if !containerImageMatches(existing.Image, image.ID) {
+			// The workload key (and therefore its container name) stays the
+			// same across redeploys. A mutable tag such as :latest can now
+			// point at a different image, so remove the old container before
+			// creating one from the image the agent just pulled.
+			if err := d.cli.ContainerRemove(ctx, existing.ID, types.ContainerRemoveOptions{Force: true}); err != nil {
+				return "", warnings, fmt.Errorf("remove container using stale image: %w", err)
+			}
+		} else {
+			if !existing.State.Running {
+				if err := d.cli.ContainerStart(ctx, existing.ID, types.ContainerStartOptions{}); err != nil {
+					return "", warnings, fmt.Errorf("restart existing container: %w", err)
+				}
+			}
+			return existing.ID, warnings, nil
+		}
 	}
-	if !client.IsErrNotFound(err) {
+	if err != nil && !client.IsErrNotFound(err) {
 		return "", warnings, fmt.Errorf("inspect %s: %w", name, err)
 	}
 
@@ -289,6 +303,10 @@ func (d *Docker) EnsureRunning(ctx context.Context, w model.Workload) (container
 		return "", warnings, fmt.Errorf("start container: %w", err)
 	}
 	return resp.ID, warnings, nil
+}
+
+func containerImageMatches(containerImageID, desiredImageID string) bool {
+	return containerImageID != "" && containerImageID == desiredImageID
 }
 
 // ManagedContainer is one container this agent created, identified by the
