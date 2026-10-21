@@ -127,6 +127,45 @@ func TestListReadyServiceInstancesExcludesNonReady(t *testing.T) {
 	}
 }
 
+func TestAssignedWorkloadsIncludesFailedWorkloadForLogInspection(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+
+	node := testNode("node-failed-assignment")
+	if err := s.UpsertNode(ctx, node); err != nil {
+		t.Fatalf("upsert node: %v", err)
+	}
+	revision := time.Now().Format("20060102150405.000000000")
+	wl := store.WorkloadRecord{
+		Workload: model.Workload{
+			Project:      "demo",
+			Service:      "failed-client",
+			Revision:     revision,
+			Image:        "client:latest",
+			Storage:      model.StoragePolicy{Class: model.Ephemeral},
+			DesiredState: model.DesiredRunning,
+		},
+		Status:       model.StatusFailed,
+		StatusReason: "container exited",
+		NodeID:       node.ID,
+		ContainerID:  "failed-container-id",
+	}
+	if err := s.CreateWorkload(ctx, wl); err != nil {
+		t.Fatalf("create failed workload: %v", err)
+	}
+
+	assignments, err := s.AssignedWorkloads(ctx, node.ID)
+	if err != nil {
+		t.Fatalf("list assignments: %v", err)
+	}
+	if len(assignments) != 1 {
+		t.Fatalf("assignment count = %d, want 1 so failed container is retained", len(assignments))
+	}
+	if assignments[0].Status != model.StatusFailed || assignments[0].ContainerID != "failed-container-id" {
+		t.Fatalf("failed assignment = %#v; want failed status and preserved container ID", assignments[0])
+	}
+}
+
 func TestAgentJoinTokenIsOneTimeAndCredentialCanBeRevoked(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

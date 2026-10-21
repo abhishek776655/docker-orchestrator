@@ -467,13 +467,14 @@ func (s *Store) GetWorkload(ctx context.Context, key string) (*WorkloadRecord, e
 	return scanWorkload(row)
 }
 
-// AssignedWorkloads returns workloads assigned to a node that the agent
-// has not yet finished bringing to a terminal running/ready/failed state
-// — this is the agent's pull-based assignment feed (SRS 6.2).
+// AssignedWorkloads returns workloads assigned to a node, including failed
+// workloads so the agent can retain their containers for log inspection.
+// Stopped workloads are excluded because their containers should be cleaned
+// up. This is the agent's pull-based assignment feed (SRS 6.2).
 func (s *Store) AssignedWorkloads(ctx context.Context, nodeID string) ([]WorkloadRecord, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, storage_class, storage_pinned_node, volumes, depends_on, desired_state, status, status_reason, node_id, container_id
-		FROM workloads WHERE node_id = $1 AND status NOT IN ('failed', 'stopped')
+		FROM workloads WHERE node_id = $1 AND status <> 'stopped'
 	`, nodeID)
 	if err != nil {
 		return nil, err

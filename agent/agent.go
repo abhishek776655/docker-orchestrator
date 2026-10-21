@@ -160,9 +160,8 @@ func (a *Agent) pollAndExecute(ctx context.Context) error {
 		return err
 	}
 
-	assignedHere := make(map[string]bool, len(assignments))
-	for _, rec := range assignments {
-		assignedHere[rec.Key()] = true
+	assignedHere, executable := splitAssignments(assignments)
+	for _, rec := range executable {
 		if rec.Status == model.StatusRunning || rec.Status == model.StatusReady {
 			alive, err := a.docker.IsRunning(ctx, rec.Key())
 			if err != nil {
@@ -179,6 +178,23 @@ func (a *Agent) pollAndExecute(ctx context.Context) error {
 
 	a.cleanupOrphans(ctx, assignedHere)
 	return nil
+}
+
+// splitAssignments keeps failed workloads in the ownership set so cleanup
+// does not delete their exited containers (and diagnostic logs), while
+// preventing terminal failures from being retried on every poll. Stopped
+// workloads are excluded by the control-plane assignment query.
+func splitAssignments(records []store.WorkloadRecord) (map[string]bool, []store.WorkloadRecord) {
+	owned := make(map[string]bool, len(records))
+	executable := make([]store.WorkloadRecord, 0, len(records))
+	for _, rec := range records {
+		owned[rec.Key()] = true
+		if rec.Status == model.StatusFailed {
+			continue
+		}
+		executable = append(executable, rec)
+	}
+	return owned, executable
 }
 
 // cleanupOrphans removes any locally running container whose workload is

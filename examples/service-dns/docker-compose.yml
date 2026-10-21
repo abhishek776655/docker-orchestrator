@@ -4,7 +4,7 @@ services:
     build:
       context: ./metaapi
     ports:
-      - "5000:5000"
+      - "5001:5001"
     cpus: "0.25"
     mem_limit: "67108864"
 
@@ -13,7 +13,7 @@ services:
     build:
       context: ./client
     environment:
-      META_API_URL: http://metaapi:5000/
+      META_API_URL: http://metaapi:5001/
     depends_on:
       metaapi:
         condition: service_started

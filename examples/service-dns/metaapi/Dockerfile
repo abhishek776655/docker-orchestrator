@@ -5,5 +5,5 @@ RUN go build -o /metaapi server.go
 
 FROM alpine:3.20
 COPY --from=build /metaapi /metaapi
-EXPOSE 5000
+EXPOSE 5001
 ENTRYPOINT ["/metaapi"]

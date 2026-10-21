@@ -13,6 +13,6 @@ func main() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "metaapi-ok")
 	})
-	log.Println("metaapi listening on :5000")
-	log.Fatal(http.ListenAndServe(":5000", nil))
+	log.Println("metaapi listening on :5001")
+	log.Fatal(http.ListenAndServe(":5001", nil))
 }

@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/abhishek/hardware-aware-container-orchestrator/model"
+	"github.com/abhishek/hardware-aware-container-orchestrator/store"
 	"github.com/docker/docker/client"
 )
 
@@ -49,4 +51,33 @@ func TestRegisterReportsDockerDaemonArchitecture(t *testing.T) {
 	if got := registered["architecture"]; got != "arm64" {
 		t.Fatalf("registered architecture = %v, want arm64", got)
 	}
+}
+
+func TestSplitAssignmentsKeepsFailedWorkloadOwnedButDoesNotRetry(t *testing.T) {
+	failed := store.WorkloadRecord{
+		Workload: model.Workload{Project: "service-dns", Service: "client", Revision: "latest"},
+		Status:   model.StatusFailed,
+		NodeID:   "node-b",
+	}
+	running := store.WorkloadRecord{
+		Workload: model.Workload{Project: "service-dns", Service: "metaapi", Revision: "latest"},
+		Status:   model.StatusRunning,
+		NodeID:   "node-b",
+	}
+
+	owned, executable := splitAssignments([]store.WorkloadRecord{failed, running})
+	if !owned[failed.Key()] {
+		t.Fatalf("failed workload %q is not retained as owned", failed.Key())
+	}
+	if len(executable) != 1 || executable[0].Key() != running.Key() {
+		t.Fatalf("executable assignments = %v, want only %q", workloadKeys(executable), running.Key())
+	}
+}
+
+func workloadKeys(records []store.WorkloadRecord) []string {
+	keys := make([]string, 0, len(records))
+	for _, rec := range records {
+		keys = append(keys, rec.Key())
+	}
+	return keys
 }
