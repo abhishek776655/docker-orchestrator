@@ -1,12 +1,13 @@
 # Testing: Service-Name DNS
 
 Fixture: [`examples/service-dns/`](../../examples/service-dns). Two services:
-`metaapi` (internal-only, `expose: 5000`, no published host port) and
+`metaapi` (`5000:5000`, so LAN DNS can return the node IP while the URL keeps
+port 5000) and
 `client`, whose only configuration is `META_API_URL=http://metaapi:5000/` —
 no `*_HOST`/`*_PORT` variables, no node address, exactly the requirement
 this plan exists for.
 
-## What was run
+## Earlier single-host trial
 
 ```bash
 # Control plane with the DNS resolver and build service enabled
@@ -19,11 +20,13 @@ curl -X POST http://localhost:8099/v1/compose/plan   -d @svcdns_deploy.json   # 
 curl -X POST http://localhost:8099/v1/compose/deploy -d @svcdns_deploy.json  # both built, scheduled
 ```
 
-**Result:** `metaapi` and `client` both reached `status: ready`. The Compose
-plan confirmed `metaapi.ContainerPorts == [5000]` with **no** `HostPorts`
-entry (internal-only, no host binding created — the review-focus
-requirement). `client.Env` retained exactly
-`META_API_URL: http://metaapi:5000/`, untouched by dependency resolution.
+That earlier trial used `expose: 5000`, before the Compose networking
+recommendation was added. The current fixture uses `5000:5000`, which should
+recommend `networking.mode: lan`; the current fixture still needs to be run
+against the updated analyzer on two hosts.
+
+The application's environment remains
+`META_API_URL: http://metaapi:5000/`; endpoint variables are not injected.
 
 `docker logs` on the `client` container: `curl: (6) Could not resolve host:
 metaapi` — confirming container-native resolution was **not** wired up in
@@ -51,7 +54,7 @@ here rather than left as an unexplained failure:
    real hosts"). A real multi-node deployment doesn't have this problem:
    every node has one real, universally-routable IP.
 
-## What was actually verified end-to-end
+## What was verified end-to-end in the earlier trial
 
 Both limitations are specific to this single-Mac setup, not the resolver
 logic, so the resolver itself was verified directly:
@@ -83,9 +86,9 @@ genuinely can't be resolved.
 
 ## Running this for real
 
-On two actual Linux/Docker hosts: run the control plane and its DNS
-resolver on `:53` (or point DHCP/each host's resolver at it per standard
-DNS deployment practice), register each node with its real IP, and
-`client` will resolve `metaapi` with zero extra configuration beyond the
-agent's `HACO_DNS_ADDRESS`/`HACO_DNS_SUFFIX` already being wired through to
-`HostConfig.DNS`/`DNSSearch` in `agent/docker.go`.
+For the current HTTPS/token-based onboarding and two-machine acceptance
+steps, follow [`agent-join.md`](agent-join.md). The fixture publishes
+`5000:5000`, allowing the client to retain `http://metaapi:5000/` over the
+direct-LAN path. If Compose host and container ports differ, the analyzer
+recommends Swarm overlay networking, which this prototype does not yet
+provision.

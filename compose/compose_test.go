@@ -2,10 +2,87 @@ package compose_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/abhishek/hardware-aware-container-orchestrator/compose"
 )
+
+func TestNetworkRecommendationUsesLANWhenPublishedPortMatchesTarget(t *testing.T) {
+	plan, err := compose.Load(context.Background(), "demo", "/tmp", []byte(`
+services:
+  metaapi:
+    image: metaapi:latest
+    ports:
+      - "5000:5000"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := string(plan.Networking.Mode); got != "lan" {
+		t.Fatalf("network mode = %q, want lan", got)
+	}
+	if !plan.Networking.Supported {
+		t.Fatalf("LAN networking should be supported: %+v", plan.Networking)
+	}
+}
+
+func TestNetworkRecommendationSuggestsSwarmForDifferentPublishedPort(t *testing.T) {
+	plan, err := compose.Load(context.Background(), "demo", "/tmp", []byte(`
+services:
+  metaapi:
+    image: metaapi:latest
+    ports:
+      - "5600:5000"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := string(plan.Networking.Mode); got != "swarm_overlay" {
+		t.Fatalf("network mode = %q, want swarm_overlay", got)
+	}
+	if plan.Networking.Supported {
+		t.Fatalf("Swarm recommendation must be marked unavailable until provisioned")
+	}
+	if !strings.Contains(strings.Join(plan.Networking.Reasons, " "), "5600:5000") {
+		t.Fatalf("recommendation should explain the mismatched mapping: %+v", plan.Networking)
+	}
+}
+
+func TestNetworkRecommendationSuggestsSwarmForUnpublishedServicePort(t *testing.T) {
+	plan, err := compose.Load(context.Background(), "demo", "/tmp", []byte(`
+services:
+  metaapi:
+    image: metaapi:latest
+    expose:
+      - "5000"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if got := string(plan.Networking.Mode); got != "swarm_overlay" {
+		t.Fatalf("network mode = %q, want swarm_overlay", got)
+	}
+	if !strings.Contains(strings.Join(plan.Networking.Reasons, " "), "not published") {
+		t.Fatalf("recommendation should explain the missing host port: %+v", plan.Networking)
+	}
+}
+
+func TestCanDeployBlocksPlanThatNeedsSwarmOverlay(t *testing.T) {
+	plan, err := compose.Load(context.Background(), "demo", "/tmp", []byte(`
+services:
+  metaapi:
+    image: metaapi:latest
+    ports:
+      - "5600:5000"
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if plan.CanDeploy() {
+		t.Fatalf("plan requiring an unprovisioned overlay network must not be deployable")
+	}
+}
 
 // TestPublishedPortIndependentOfContainerPort covers the exact scenario
 // named in the plan: a published host port and an internal container port

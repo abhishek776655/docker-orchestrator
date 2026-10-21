@@ -7,10 +7,12 @@ package store
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/abhishek/hardware-aware-container-orchestrator/model"
@@ -66,6 +68,19 @@ CREATE TABLE IF NOT EXISTS events (
 	message      text NOT NULL,
 	created_at   timestamptz NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS agent_join_tokens (
+	secret_hash text PRIMARY KEY,
+	expires_at   timestamptz NOT NULL,
+	consumed_at  timestamptz
+);
+
+CREATE TABLE IF NOT EXISTS agent_credentials (
+	node_id     text PRIMARY KEY,
+	secret_hash text NOT NULL,
+	revoked_at  timestamptz
+);
+
 `
 
 // Store wraps a PostgreSQL connection pool.
@@ -88,6 +103,58 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 
 // Close releases the connection pool.
 func (s *Store) Close() { s.pool.Close() }
+
+func (s *Store) CreateJoinToken(ctx context.Context, secretHash string, expiresAt time.Time) error {
+	_, err := s.pool.Exec(ctx, `INSERT INTO agent_join_tokens (secret_hash, expires_at) VALUES ($1, $2)`, secretHash, expiresAt)
+	return err
+}
+
+// ConsumeJoinToken atomically accepts a live token at most once.
+func (s *Store) ConsumeJoinToken(ctx context.Context, secretHash string, now time.Time) (bool, error) {
+	var consumed string
+	err := s.pool.QueryRow(ctx, `UPDATE agent_join_tokens SET consumed_at = $2 WHERE secret_hash = $1 AND consumed_at IS NULL AND expires_at > $2 RETURNING secret_hash`, secretHash, now).Scan(&consumed)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Store) CreateAgentCredential(ctx context.Context, nodeID, secretHash string) error {
+	tag, err := s.pool.Exec(ctx, `INSERT INTO agent_credentials (node_id, secret_hash, revoked_at) VALUES ($1, $2, NULL) ON CONFLICT (node_id) DO UPDATE SET secret_hash = EXCLUDED.secret_hash, revoked_at = NULL WHERE agent_credentials.revoked_at IS NOT NULL`, nodeID, secretHash)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("node %q already has an active agent credential; revoke it before joining again", nodeID)
+	}
+	return nil
+}
+
+func (s *Store) VerifyAgentCredential(ctx context.Context, nodeID, secretHash string) (bool, error) {
+	var found string
+	err := s.pool.QueryRow(ctx, `SELECT secret_hash FROM agent_credentials WHERE node_id = $1 AND revoked_at IS NULL`, nodeID).Scan(&found)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return false, nil
+		}
+		return false, err
+	}
+	return subtle.ConstantTimeCompare([]byte(found), []byte(secretHash)) == 1, nil
+}
+
+func (s *Store) RevokeAgentCredential(ctx context.Context, nodeID string) error {
+	tag, err := s.pool.Exec(ctx, `UPDATE agent_credentials SET revoked_at = now() WHERE node_id = $1`, nodeID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("no agent credential for node %q", nodeID)
+	}
+	return nil
+}
 
 // UpsertNode registers a node or refreshes its heartbeat/capacity,
 // including hardware telemetry (SRS §9.2, M7).

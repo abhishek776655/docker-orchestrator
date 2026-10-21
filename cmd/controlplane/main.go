@@ -3,13 +3,18 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
+	"github.com/abhishek/hardware-aware-container-orchestrator/agentjoin"
 	"github.com/abhishek/hardware-aware-container-orchestrator/build"
 	"github.com/abhishek/hardware-aware-container-orchestrator/controlplane"
 	"github.com/abhishek/hardware-aware-container-orchestrator/discovery"
@@ -19,7 +24,8 @@ import (
 )
 
 func main() {
-	addr := envOr("HACO_LISTEN_ADDR", ":8080")
+	addr := envOr("HACO_LISTEN_ADDR", "127.0.0.1:8099")
+	agentAddr := envOr("HACO_AGENT_LISTEN_ADDR", ":8443")
 	dsn := envOr("HACO_POSTGRES_DSN", "postgres://postgres:haco@localhost:55432/haco?sslmode=disable")
 	registry := resolveRegistryAddr()
 
@@ -33,6 +39,28 @@ func main() {
 	defer s.Close()
 
 	svc := controlplane.New(s)
+	dataDir := envOr("HACO_DATA_DIR", defaultDataDir())
+	advertiseHost := os.Getenv("HACO_AGENT_ADVERTISE_HOST")
+	if advertiseHost == "" {
+		var err error
+		advertiseHost, err = netutil.DetectLocalIP()
+		if err != nil {
+			log.Fatalf("detect control-plane LAN address: %v (set HACO_AGENT_ADVERTISE_HOST)", err)
+		}
+	}
+	port := 8443
+	if _, p, err := net.SplitHostPort(agentAddr); err == nil {
+		if _, scanErr := fmt.Sscanf(p, "%d", &port); scanErr != nil {
+			log.Fatalf("invalid HACO_AGENT_LISTEN_ADDR port: %s", p)
+		}
+	}
+	dnsSuffix := envOr("HACO_DNS_SUFFIX", "haco")
+	tlsCert, fingerprint, err := controlplane.LoadOrCreateTLSIdentity(filepath.Join(dataDir, "tls"), advertiseHost)
+	if err != nil {
+		log.Fatalf("load agent TLS identity: %v", err)
+	}
+	joinManager := controlplane.NewJoinManager(s, fmt.Sprintf("https://%s", net.JoinHostPort(advertiseHost, fmt.Sprint(port))), fingerprint, dnsSuffix)
+	svc = svc.WithJoinManager(joinManager)
 	if registry != "" {
 		dockerCli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 		if err != nil {
@@ -46,8 +74,7 @@ func main() {
 	go svc.RunReconciler(ctx, reconcileInterval, heartbeatTimeout)
 	log.Printf("reconciler running every %s, heartbeat timeout %s", reconcileInterval, heartbeatTimeout)
 
-	dnsAddr := envOr("HACO_DNS_LISTEN_ADDR", ":8053")
-	dnsSuffix := envOr("HACO_DNS_SUFFIX", "haco")
+	dnsAddr := envOr("HACO_DNS_LISTEN_ADDR", ":53")
 	dnsServer := discovery.NewServer(svc, dnsSuffix)
 	go func() {
 		if err := dnsServer.ListenAndServe(ctx, dnsAddr); err != nil {
@@ -56,7 +83,12 @@ func main() {
 	}()
 	log.Printf("service-name DNS listening on %s, suffix .%s", dnsAddr, dnsSuffix)
 
-	server := &http.Server{Addr: addr, Handler: controlplane.NewHandler(svc)}
+	server := &http.Server{Addr: addr, Handler: controlplane.LocalOnly(controlplane.NewHandler(svc))}
+	agentServer := &http.Server{Addr: agentAddr, Handler: controlplane.NewAgentHandler(svc), TLSConfig: &tls.Config{Certificates: []tls.Certificate{tlsCert}, MinVersion: tls.VersionTLS12}}
+	agentListener, err := net.Listen("tcp", agentAddr)
+	if err != nil {
+		log.Fatalf("listen for agent HTTPS on %s: %v", agentAddr, err)
+	}
 
 	go func() {
 		<-ctx.Done()
@@ -64,11 +96,40 @@ func main() {
 		defer cancel()
 		_ = server.Shutdown(shutdownCtx)
 	}()
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = agentServer.Shutdown(shutdownCtx)
+	}()
 
 	log.Printf("control plane listening on %s", addr)
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("serve: %v", err)
+	go func() {
+		if err := agentServer.ServeTLS(agentListener, "", ""); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("agent TLS server: %v", err)
+		}
+	}()
+	joinBundle, err := joinManager.Issue(ctx)
+	if err != nil {
+		log.Fatalf("issue initial agent join token: %v", err)
 	}
+	encoded, err := agentjoin.Encode(joinBundle)
+	if err != nil {
+		log.Fatalf("encode agent join token: %v", err)
+	}
+	log.Printf("agent API listening on https://%s (certificate pin %s)", net.JoinHostPort(advertiseHost, fmt.Sprint(port)), fingerprint)
+	fmt.Printf("One-time agent join command (expires in 10 minutes): ./bin/agent join '%s'\n", encoded)
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("serve operator API: %v", err)
+	}
+}
+
+func defaultDataDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ".haco"
+	}
+	return filepath.Join(home, ".haco")
 }
 
 func envOr(key, fallback string) string {

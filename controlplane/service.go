@@ -6,6 +6,7 @@ package controlplane
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/abhishek/hardware-aware-container-orchestrator/build"
@@ -19,8 +20,9 @@ import (
 // state (M2). Every call rebuilds a fresh Scheduler from the database so
 // there is exactly one source of truth (SRS NFR-001).
 type Service struct {
-	store   *store.Store
-	builder *build.Service // nil disables build-based deploys (image-only workloads still work)
+	store       *store.Store
+	builder     *build.Service // nil disables build-based deploys (image-only workloads still work)
+	joinManager *JoinManager
 }
 
 func New(s *store.Store) *Service { return &Service{store: s} }
@@ -29,6 +31,11 @@ func New(s *store.Store) *Service { return &Service{store: s} }
 // declare a `build:` block (SRS 5.1 "Build Service").
 func (svc *Service) WithBuilder(b *build.Service) *Service {
 	svc.builder = b
+	return svc
+}
+
+func (svc *Service) WithJoinManager(m *JoinManager) *Service {
+	svc.joinManager = m
 	return svc
 }
 
@@ -49,6 +56,9 @@ func (svc *Service) ComposeDeploy(ctx context.Context, project, workingDir strin
 	}
 	if !plan.Valid() {
 		return plan, nil, fmt.Errorf("compose plan for %s has %d rejection(s)", project, len(plan.Rejections))
+	}
+	if !plan.Networking.Supported {
+		return plan, nil, fmt.Errorf("compose plan recommends %s networking, which is not provisioned yet: %s", plan.Networking.Mode, strings.Join(plan.Networking.Reasons, "; "))
 	}
 
 	builtImages := map[string]string{}

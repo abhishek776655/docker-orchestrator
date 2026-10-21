@@ -126,3 +126,51 @@ func TestListReadyServiceInstancesExcludesNonReady(t *testing.T) {
 		t.Fatalf("expected no instances for a non-ready workload, got %d", len(instances))
 	}
 }
+
+func TestAgentJoinTokenIsOneTimeAndCredentialCanBeRevoked(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := s.CreateJoinToken(ctx, "hash-join", now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.ConsumeJoinToken(ctx, "hash-join", now); err != nil || !ok {
+		t.Fatalf("first consume = %v, %v; want true, nil", ok, err)
+	}
+	if ok, err := s.ConsumeJoinToken(ctx, "hash-join", now); err != nil || ok {
+		t.Fatalf("replay consume = %v, %v; want false, nil", ok, err)
+	}
+	if err := s.CreateJoinToken(ctx, "hash-expired", now.Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.ConsumeJoinToken(ctx, "hash-expired", now); err != nil || ok {
+		t.Fatalf("expired consume = %v, %v; want false, nil", ok, err)
+	}
+	if err := s.CreateAgentCredential(ctx, "node-a", "hash-agent"); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.VerifyAgentCredential(ctx, "node-a", "hash-agent"); err != nil || !ok {
+		t.Fatalf("credential verification = %v, %v; want true, nil", ok, err)
+	}
+	if ok, err := s.VerifyAgentCredential(ctx, "node-b", "hash-agent"); err != nil || ok {
+		t.Fatalf("cross-node verification = %v, %v; want false, nil", ok, err)
+	}
+	if err := s.CreateAgentCredential(ctx, "node-a", "replacement-hash"); err == nil {
+		t.Fatal("replacing an active credential unexpectedly succeeded")
+	}
+	if ok, err := s.VerifyAgentCredential(ctx, "node-a", "hash-agent"); err != nil || !ok {
+		t.Fatalf("active credential after rejected replacement = %v, %v; want true, nil", ok, err)
+	}
+	if err := s.RevokeAgentCredential(ctx, "node-a"); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.VerifyAgentCredential(ctx, "node-a", "hash-agent"); err != nil || ok {
+		t.Fatalf("revoked verification = %v, %v; want false, nil", ok, err)
+	}
+	if err := s.CreateAgentCredential(ctx, "node-a", "replacement-hash"); err != nil {
+		t.Fatalf("rejoin after revocation: %v", err)
+	}
+	if ok, err := s.VerifyAgentCredential(ctx, "node-a", "replacement-hash"); err != nil || !ok {
+		t.Fatalf("replacement after revocation = %v, %v; want true, nil", ok, err)
+	}
+}

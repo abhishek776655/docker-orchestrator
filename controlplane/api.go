@@ -2,6 +2,7 @@ package controlplane
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
@@ -32,8 +33,65 @@ func NewHandler(svc *Service) http.Handler {
 
 	mux.HandleFunc("GET /v1/events", svc.handleListEvents)
 	mux.HandleFunc("GET /v1/metrics", svc.handleMetrics)
+	mux.HandleFunc("POST /v1/admin/join-token", svc.handleIssueJoinToken)
+	mux.HandleFunc("POST /v1/admin/nodes/{id}/revoke", svc.handleRevokeAgent)
 
 	return logRequests(mux)
+}
+
+// NewAgentHandler exposes only bootstrap and authenticated agent endpoints
+// on the LAN-facing TLS listener.
+func NewAgentHandler(svc *Service) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/agent/join", svc.handleAgentJoin)
+	mux.Handle("POST /v1/nodes", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleRegisterNode)))
+	mux.Handle("POST /v1/nodes/{id}/heartbeat", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleHeartbeat)))
+	mux.Handle("GET /v1/agent/{node}/assignments", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleAssignments)))
+	mux.Handle("POST /v1/agent/status", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleReportStatus)))
+	mux.Handle("GET /v1/services/{project}/{service}", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleListServiceInstances)))
+	return logRequests(mux)
+}
+
+func (svc *Service) handleAgentJoin(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Token  string `json:"token"`
+		NodeID string `json:"node_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	credential, err := svc.joinManager.Redeem(r.Context(), req.Token, req.NodeID)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]string{"node_id": req.NodeID, "credential": credential})
+}
+
+func (svc *Service) handleIssueJoinToken(w http.ResponseWriter, r *http.Request) {
+	if svc.joinManager == nil {
+		writeError(w, http.StatusServiceUnavailable, fmt.Errorf("agent join is not configured"))
+		return
+	}
+	bundle, err := svc.joinManager.Issue(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, bundle)
+}
+
+func (svc *Service) handleRevokeAgent(w http.ResponseWriter, r *http.Request) {
+	if svc.joinManager == nil {
+		writeError(w, http.StatusServiceUnavailable, fmt.Errorf("agent join is not configured"))
+		return
+	}
+	if err := svc.joinManager.Revoke(r.Context(), r.PathValue("id")); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
 }
 
 func logRequests(next http.Handler) http.Handler {
@@ -70,6 +128,10 @@ func (svc *Service) handleRegisterNode(w http.ResponseWriter, r *http.Request) {
 	var req registerNodeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if nodeID := authenticatedNode(r); nodeID != "" && nodeID != req.ID {
+		writeError(w, http.StatusForbidden, fmt.Errorf("credential is not authorized for node %q", req.ID))
 		return
 	}
 	n := model.Node{
@@ -194,6 +256,10 @@ func (svc *Service) handleGetWorkload(w http.ResponseWriter, r *http.Request) {
 
 func (svc *Service) handleAssignments(w http.ResponseWriter, r *http.Request) {
 	nodeID := r.PathValue("node")
+	if authenticated := authenticatedNode(r); authenticated != "" && authenticated != nodeID {
+		writeError(w, http.StatusForbidden, fmt.Errorf("credential is not authorized for node %q", nodeID))
+		return
+	}
 	recs, err := svc.AssignedWorkloads(r.Context(), nodeID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
@@ -251,7 +317,7 @@ func (svc *Service) handleComposeDeploy(w http.ResponseWriter, r *http.Request) 
 	plan, results, err := svc.ComposeDeploy(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml))
 	if err != nil {
 		status := http.StatusInternalServerError
-		if plan != nil && !plan.Valid() {
+		if plan != nil && !plan.CanDeploy() {
 			status = http.StatusUnprocessableEntity
 		}
 		writeJSON(w, status, map[string]any{"error": err.Error(), "plan": plan, "results": results})
@@ -289,6 +355,13 @@ func (svc *Service) handleReportStatus(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
+	}
+	if nodeID := authenticatedNode(r); nodeID != "" {
+		rec, err := svc.GetWorkload(r.Context(), req.Key)
+		if err != nil || rec.NodeID != nodeID {
+			writeError(w, http.StatusForbidden, fmt.Errorf("credential is not authorized for workload %q", req.Key))
+			return
+		}
 	}
 	if err := svc.ReportStatus(r.Context(), req.Key, req.Status, req.Reason, req.ContainerID); err != nil {
 		writeError(w, http.StatusInternalServerError, err)

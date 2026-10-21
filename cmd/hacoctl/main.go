@@ -9,8 +9,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"path/filepath"
+
+	"github.com/abhishek/hardware-aware-container-orchestrator/agentjoin"
 )
 
 func main() {
@@ -35,6 +38,14 @@ func main() {
 		err = get(url, "/v1/events")
 	case "metrics":
 		err = get(url, "/v1/metrics")
+	case "join-token":
+		err = printJoinCommand(url)
+	case "revoke-node":
+		if len(os.Args) != 3 {
+			err = fmt.Errorf("usage: hacoctl revoke-node <node-id>")
+		} else {
+			err = post(url, "/v1/admin/nodes/"+neturl.PathEscape(os.Args[2])+"/revoke", []byte(`{}`))
+		}
 	default:
 		usage()
 		os.Exit(1)
@@ -54,7 +65,30 @@ Usage:
   hacoctl status <project> <service> <revision>   one workload's current status
   hacoctl nodes                                   list registered nodes
   hacoctl events                                  recent audit events
-  hacoctl metrics                                 node/workload counts`)
+  hacoctl metrics                                 node/workload counts
+  hacoctl join-token                              print a fresh one-time agent join command
+  hacoctl revoke-node <node-id>                   revoke that agent credential`)
+}
+
+func printJoinCommand(baseURL string) error {
+	resp, err := http.Post(baseURL+"/v1/admin/join-token", "application/json", bytes.NewReader([]byte(`{}`)))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("control plane returned %s", resp.Status)
+	}
+	var bundle agentjoin.Bundle
+	if err := json.NewDecoder(resp.Body).Decode(&bundle); err != nil {
+		return err
+	}
+	encoded, err := agentjoin.Encode(bundle)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("./bin/agent join '%s'\n", encoded)
+	return nil
 }
 
 func runCompose(baseURL, path string, args []string) error {

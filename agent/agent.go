@@ -9,6 +9,9 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -30,8 +33,10 @@ type Config struct {
 	// service-name resolver (SRS 8.3) instead of injecting endpoint
 	// variables: a workload's own environment is never mutated by
 	// dependency resolution (M7).
-	DNSAddress string
-	DNSSuffix  string
+	DNSAddress     string
+	DNSSuffix      string
+	Credential     string
+	TLSFingerprint string
 }
 
 // Agent is one running node agent instance.
@@ -48,12 +53,45 @@ func New(cfg Config, docker *Docker) *Agent {
 	if cfg.PollPeriod == 0 {
 		cfg.PollPeriod = 2 * time.Second
 	}
-	return &Agent{cfg: cfg, docker: docker, http: &http.Client{Timeout: 10 * time.Second}}
+	return &Agent{cfg: cfg, docker: docker, http: pinnedHTTPClient(cfg.TLSFingerprint, 10*time.Second)}
+}
+
+func pinnedHTTPClient(fingerprint string, timeout time.Duration) *http.Client {
+	if fingerprint == "" {
+		return &http.Client{Timeout: timeout}
+	}
+	return &http.Client{Timeout: timeout, Transport: &http.Transport{TLSClientConfig: &tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: true, // VerifyConnection below pins the complete leaf certificate.
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			if err := verifyPinnedCertificate(cs, fingerprint); err != nil {
+				return err
+			}
+			if !time.Now().Before(cs.PeerCertificates[0].NotAfter) || time.Now().Before(cs.PeerCertificates[0].NotBefore) {
+				return fmt.Errorf("control-plane TLS certificate is outside its validity period")
+			}
+			return nil
+		},
+	}}}
+}
+
+func verifyPinnedCertificate(cs tls.ConnectionState, fingerprint string) error {
+	if len(cs.PeerCertificates) == 0 {
+		return fmt.Errorf("server supplied no TLS certificate")
+	}
+	sum := sha256.Sum256(cs.PeerCertificates[0].Raw)
+	if !strings.EqualFold(hex.EncodeToString(sum[:]), fingerprint) {
+		return fmt.Errorf("control-plane TLS certificate fingerprint mismatch")
+	}
+	return nil
 }
 
 // Run registers the node and then loops heartbeat + assignment polling
 // until ctx is cancelled.
 func (a *Agent) Run(ctx context.Context) error {
+	if a.cfg.Credential == "" || a.cfg.TLSFingerprint == "" || !strings.HasPrefix(a.cfg.ControlPlaneURL, "https://") {
+		return fmt.Errorf("agent must be joined with a credential-pinned HTTPS connection")
+	}
 	if err := a.register(ctx); err != nil {
 		return fmt.Errorf("register: %w", err)
 	}
@@ -264,6 +302,10 @@ func (a *Agent) post(ctx context.Context, path string, body any, out any) error 
 }
 
 func (a *Agent) do(req *http.Request, out any) error {
+	if a.cfg.Credential != "" {
+		req.Header.Set("Authorization", "Bearer "+a.cfg.Credential)
+		req.Header.Set("X-HACO-Node-ID", a.cfg.NodeID)
+	}
 	resp, err := a.http.Do(req)
 	if err != nil {
 		return err

@@ -27,3 +27,19 @@
 - Host-port conflicts on the planned node.
 - Missing stateful-storage policy.
 - Architecture and resource incompatibilities.
+
+## Cross-host network recommendation
+
+`POST /v1/compose/plan` also returns `networking.mode`:
+
+- `lan`: every declared service port is published on the same host port as
+  its container port. The LAN DNS method can preserve URLs such as
+  `http://metaapi:5000/`; host ports must be unique on each selected node.
+- `swarm_overlay`: a port is unpublished or maps to a different host port
+  than its container port. A cross-host LAN lookup cannot preserve the
+  service URL's port, so the plan recommends an attachable Swarm overlay.
+  The current prototype does not provision Swarm; Compose deployment is
+  blocked with the recommendation and reasons rather than misdeploying it.
+
+This analysis checks declared `ports` and `expose` entries. Services with no
+declared ports cannot be validated for cross-host reachability by this rule.

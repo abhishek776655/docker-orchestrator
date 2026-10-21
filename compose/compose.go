@@ -35,14 +35,38 @@ type BuildSpec struct {
 // FR-023) that can be inspected before anything is built or scheduled.
 // A non-empty Rejections means the plan must not be applied (FR-003).
 type Plan struct {
-	Project    string
-	Workloads  []model.Workload
-	Builds     []BuildSpec
-	Warnings   []string
-	Rejections []string
+	Project    string                `json:"project"`
+	Workloads  []model.Workload      `json:"workloads"`
+	Builds     []BuildSpec           `json:"builds"`
+	Networking NetworkRecommendation `json:"networking"`
+	Warnings   []string              `json:"warnings"`
+	Rejections []string              `json:"rejections"`
+}
+
+type NetworkMode string
+
+const (
+	NetworkModeLAN          NetworkMode = "lan"
+	NetworkModeSwarmOverlay NetworkMode = "swarm_overlay"
+)
+
+// NetworkRecommendation explains which data path can preserve the
+// service URLs in a Compose project. LAN mode relies on equal published
+// and container ports; Swarm overlay mode is recommended when host routing
+// cannot preserve those URLs, but is not provisioned by this prototype.
+type NetworkRecommendation struct {
+	Mode      NetworkMode `json:"mode"`
+	Supported bool        `json:"supported"`
+	Reasons   []string    `json:"reasons,omitempty"`
 }
 
 func (p *Plan) Valid() bool { return len(p.Rejections) == 0 }
+
+// CanDeploy reports whether the plan is valid and the prototype has the
+// network mode required to preserve its service URLs.
+func (p *Plan) CanDeploy() bool {
+	return p.Valid() && p.Networking.Supported
+}
 
 // Load parses and validates a Compose file's bytes into a Plan. workingDir
 // is used to resolve relative build contexts and env_file paths.
@@ -59,7 +83,13 @@ func Load(ctx context.Context, project, workingDir string, yaml []byte) (*Plan, 
 	}
 	proj.Name = project
 
-	plan := &Plan{Project: project}
+	plan := &Plan{
+		Project: project,
+		Networking: NetworkRecommendation{
+			Mode:      NetworkModeLAN,
+			Supported: true,
+		},
+	}
 
 	if len(proj.Configs) > 0 || len(proj.Secrets) > 0 {
 		plan.Warnings = append(plan.Warnings, "top-level configs/secrets are declared but not yet delivered to containers; pass equivalent values via environment for now")
@@ -73,6 +103,7 @@ func Load(ctx context.Context, project, workingDir string, yaml []byte) (*Plan, 
 
 	for _, name := range names {
 		svc := proj.Services[name]
+		analyzeServicePorts(&plan.Networking, name, svc)
 		wl, build, warnings, rejections := convertService(project, workingDir, name, svc)
 		plan.Warnings = append(plan.Warnings, warnings...)
 		plan.Rejections = append(plan.Rejections, rejections...)
@@ -84,6 +115,48 @@ func Load(ctx context.Context, project, workingDir string, yaml []byte) (*Plan, 
 
 	plan.Rejections = append(plan.Rejections, validateGraph(plan.Workloads)...)
 	return plan, nil
+}
+
+func analyzeServicePorts(networking *NetworkRecommendation, service string, svc types.ServiceConfig) {
+	publishedTargets := map[uint32]bool{}
+	for _, p := range svc.Ports {
+		target := int(p.Target)
+		if target == 0 {
+			continue
+		}
+		if p.Published == "" {
+			recommendOverlay(networking, fmt.Sprintf("%s: container port %d is not published; LAN routing needs host port %d", service, target, target))
+			continue
+		}
+		published, err := strconv.Atoi(p.Published)
+		if err != nil {
+			recommendOverlay(networking, fmt.Sprintf("%s: published port %q cannot be used for direct LAN routing", service, p.Published))
+			continue
+		}
+		if published != target {
+			recommendOverlay(networking, fmt.Sprintf("%s: port mapping %d:%d changes the port in the service URL; use a Swarm overlay to preserve the container port", service, published, target))
+			continue
+		}
+		publishedTargets[p.Target] = true
+	}
+	for _, exposed := range svc.Expose {
+		target, err := strconv.ParseUint(exposed, 10, 32)
+		if err != nil || target == 0 || publishedTargets[uint32(target)] {
+			continue
+		}
+		recommendOverlay(networking, fmt.Sprintf("%s: exposed container port %d is not published; LAN routing needs host port %d", service, target, target))
+	}
+}
+
+func recommendOverlay(networking *NetworkRecommendation, reason string) {
+	networking.Mode = NetworkModeSwarmOverlay
+	networking.Supported = false
+	for _, existing := range networking.Reasons {
+		if existing == reason {
+			return
+		}
+	}
+	networking.Reasons = append(networking.Reasons, reason)
 }
 
 func convertService(project, workingDir, name string, svc types.ServiceConfig) (model.Workload, *BuildSpec, []string, []string) {
@@ -168,7 +241,7 @@ func convertService(project, workingDir, name string, svc types.ServiceConfig) (
 			continue
 		}
 		if pub, err := strconv.Atoi(p.Published); err == nil && pub != target {
-			warnings = append(warnings, fmt.Sprintf("%s: published port %d will be bound to the host as container port %d; independent host/container port remapping is not implemented yet (see M2/M7 simplifications)", name, pub, target))
+			warnings = append(warnings, fmt.Sprintf("%s: published port %d differs from container port %d; Compose plan recommends Swarm overlay networking", name, pub, target))
 		}
 		hostPorts = append(hostPorts, target)
 	}
