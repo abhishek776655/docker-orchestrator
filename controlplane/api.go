@@ -2,12 +2,16 @@ package controlplane
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/abhishek/hardware-aware-container-orchestrator/model"
+	"github.com/jackc/pgx/v5"
 )
 
 // NewHandler builds the control-plane HTTP API (SRS 5.1 "Control Plane
@@ -22,6 +26,7 @@ func NewHandler(svc *Service) http.Handler {
 
 	mux.HandleFunc("POST /v1/workloads", svc.handleSubmit)
 	mux.HandleFunc("GET /v1/workloads/{key...}", svc.handleGetWorkload)
+	mux.HandleFunc("GET /v1/workloads/{project}/{service}/{revision}/logs", svc.handleGetWorkloadLogs)
 
 	mux.HandleFunc("GET /v1/agent/{node}/assignments", svc.handleAssignments)
 	mux.HandleFunc("POST /v1/agent/status", svc.handleReportStatus)
@@ -273,6 +278,7 @@ type reportStatusRequest struct {
 	Status      model.Status `json:"status"`
 	Reason      string       `json:"reason"`
 	ContainerID string       `json:"container_id"`
+	Logs        string       `json:"logs,omitempty"`
 }
 
 func (svc *Service) handleListServiceInstances(w http.ResponseWriter, r *http.Request) {
@@ -351,9 +357,18 @@ func (svc *Service) handleMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (svc *Service) handleReportStatus(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 512*1024)
 	var req reportStatusRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if len(req.Logs) > 72*1024 {
+		writeError(w, http.StatusRequestEntityTooLarge, fmt.Errorf("container logs exceed the 72 KiB limit"))
+		return
+	}
+	if req.Logs != "" && req.Status != model.StatusFailed {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("container logs may only accompany failed status reports"))
 		return
 	}
 	if nodeID := authenticatedNode(r); nodeID != "" {
@@ -367,5 +382,26 @@ func (svc *Service) handleReportStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	if req.Logs != "" {
+		if err := svc.ReportWorkloadLogs(r.Context(), req.Key, req.Logs); err != nil {
+			writeError(w, http.StatusInternalServerError, err)
+			return
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (svc *Service) handleGetWorkloadLogs(w http.ResponseWriter, r *http.Request) {
+	key := strings.Join([]string{r.PathValue("project"), r.PathValue("service"), r.PathValue("revision")}, "/")
+	logs, err := svc.GetWorkloadLogs(r.Context(), key)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, fmt.Errorf("no container logs found for workload %q", key))
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = io.WriteString(w, logs)
 }

@@ -34,6 +34,8 @@ func main() {
 		err = get(url, "/v1/nodes")
 	case "status":
 		err = status(url, os.Args[2:])
+	case "logs":
+		err = logs(url, os.Args[2:])
 	case "events":
 		err = get(url, "/v1/events")
 	case "metrics":
@@ -63,6 +65,7 @@ Usage:
   hacoctl deploy <project> <docker-compose.yml>   build, schedule, and run a Compose project
   hacoctl plan   <project> <docker-compose.yml>   dry-run the same, no side effects
   hacoctl status <project> <service> <revision>   one workload's current status
+  hacoctl logs   <project> <service> <revision>   latest captured container log tail
   hacoctl nodes                                   list registered nodes
   hacoctl events                                  recent audit events
   hacoctl metrics                                 node/workload counts
@@ -120,6 +123,29 @@ func status(baseURL string, args []string) error {
 		return fmt.Errorf("usage: hacoctl status <project> <service> <revision>")
 	}
 	return get(baseURL, "/v1/workloads/"+args[0]+"/"+args[1]+"/"+args[2])
+}
+
+func logs(baseURL string, args []string) error {
+	return fetchLogs(http.DefaultClient, baseURL, args, os.Stdout)
+}
+
+func fetchLogs(client *http.Client, baseURL string, args []string, output io.Writer) error {
+	if len(args) != 3 {
+		return fmt.Errorf("usage: hacoctl logs <project> <service> <revision>")
+	}
+	path := fmt.Sprintf("/v1/workloads/%s/%s/%s/logs",
+		neturl.PathEscape(args[0]), neturl.PathEscape(args[1]), neturl.PathEscape(args[2]))
+	resp, err := client.Get(baseURL + path)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("control plane returned %s: %s", resp.Status, string(data))
+	}
+	_, err = io.Copy(output, resp.Body)
+	return err
 }
 
 func get(baseURL, path string) error {

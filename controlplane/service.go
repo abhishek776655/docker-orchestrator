@@ -165,6 +165,16 @@ func (svc *Service) ReportStatus(ctx context.Context, key string, status model.S
 	return svc.store.UpdateStatus(ctx, key, status, reason, containerID)
 }
 
+// ReportWorkloadLogs stores a node agent's bounded container log tail.
+func (svc *Service) ReportWorkloadLogs(ctx context.Context, key, logs string) error {
+	return svc.store.AppendWorkloadLogs(ctx, key, logs)
+}
+
+// GetWorkloadLogs returns the latest captured log tail for a workload.
+func (svc *Service) GetWorkloadLogs(ctx context.Context, key string) (string, error) {
+	return svc.store.GetWorkloadLogs(ctx, key)
+}
+
 // ListEvents returns the most recent audit/history records (SRS FR-024).
 func (svc *Service) ListEvents(ctx context.Context, limit int) ([]store.Event, error) {
 	return svc.store.ListEvents(ctx, limit)

@@ -284,6 +284,25 @@ func (s *Store) ListEvents(ctx context.Context, limit int) ([]Event, error) {
 	return out, rows.Err()
 }
 
+// AppendWorkloadLogs persists a bounded container log tail as a workload event.
+func (s *Store) AppendWorkloadLogs(ctx context.Context, key, logs string) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO events (workload_key, type, message) VALUES ($1, 'container_logs', $2)
+	`, key, logs)
+	return err
+}
+
+// GetWorkloadLogs returns the most recently captured container log tail.
+func (s *Store) GetWorkloadLogs(ctx context.Context, key string) (string, error) {
+	var logs string
+	err := s.pool.QueryRow(ctx, `
+		SELECT message FROM events
+		WHERE workload_key = $1 AND type = 'container_logs'
+		ORDER BY id DESC LIMIT 1
+	`, key).Scan(&logs)
+	return logs, err
+}
+
 // Metrics is a minimal operational summary (SRS §13 "required visibility"),
 // a JSON endpoint rather than a Prometheus exporter — see M6 doc for why.
 type Metrics struct {

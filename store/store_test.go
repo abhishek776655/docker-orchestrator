@@ -166,6 +166,45 @@ func TestAssignedWorkloadsIncludesFailedWorkloadForLogInspection(t *testing.T) {
 	}
 }
 
+func TestWorkloadLogsReturnsMostRecentlyCapturedTail(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	node := testNode("node-log-tail")
+	if err := s.UpsertNode(ctx, node); err != nil {
+		t.Fatalf("upsert node: %v", err)
+	}
+	revision := time.Now().Format("20060102150405.000000000")
+	wl := store.WorkloadRecord{
+		Workload: model.Workload{
+			Project:      "demo",
+			Service:      "logged-client",
+			Revision:     revision,
+			Image:        "client:latest",
+			Storage:      model.StoragePolicy{Class: model.Ephemeral},
+			DesiredState: model.DesiredRunning,
+		},
+		Status: model.StatusFailed,
+		NodeID: node.ID,
+	}
+	if err := s.CreateWorkload(ctx, wl); err != nil {
+		t.Fatalf("create workload: %v", err)
+	}
+	if err := s.AppendWorkloadLogs(ctx, wl.Key(), "first attempt logs"); err != nil {
+		t.Fatalf("append first logs: %v", err)
+	}
+	if err := s.AppendWorkloadLogs(ctx, wl.Key(), "latest attempt logs"); err != nil {
+		t.Fatalf("append latest logs: %v", err)
+	}
+
+	got, err := s.GetWorkloadLogs(ctx, wl.Key())
+	if err != nil {
+		t.Fatalf("get workload logs: %v", err)
+	}
+	if got != "latest attempt logs" {
+		t.Fatalf("workload logs = %q, want latest attempt logs", got)
+	}
+}
+
 func TestAgentJoinTokenIsOneTimeAndCredentialCanBeRevoked(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

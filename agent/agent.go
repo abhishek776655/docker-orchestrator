@@ -259,7 +259,11 @@ func (a *Agent) execute(ctx context.Context, rec store.WorkloadRecord) {
 	}
 
 	if err := a.docker.WaitRunning(ctx, containerID, 30*time.Second); err != nil {
-		a.report(ctx, key, model.StatusFailed, "did not reach running: "+err.Error(), containerID)
+		logs, logErr := a.docker.ContainerLogs(ctx, containerID)
+		if logErr != nil {
+			log.Printf("collect logs for %s failed: %v", key, logErr)
+		}
+		a.reportWithLogs(ctx, key, model.StatusFailed, "did not reach running: "+err.Error(), containerID, logs)
 		return
 	}
 
@@ -288,7 +292,11 @@ func (a *Agent) dependenciesReady(ctx context.Context, project string, deps []st
 }
 
 func (a *Agent) report(ctx context.Context, key string, status model.Status, reason, containerID string) {
-	body := map[string]any{"key": key, "status": status, "reason": reason, "container_id": containerID}
+	a.reportWithLogs(ctx, key, status, reason, containerID, "")
+}
+
+func (a *Agent) reportWithLogs(ctx context.Context, key string, status model.Status, reason, containerID, logs string) {
+	body := map[string]any{"key": key, "status": status, "reason": reason, "container_id": containerID, "logs": logs}
 	if err := a.post(ctx, "/v1/agent/status", body, nil); err != nil {
 		log.Printf("report status %s=%s failed: %v", key, status, err)
 	}
