@@ -55,6 +55,7 @@ func (s *Service) Build(ctx context.Context, project, revision string, spec comp
 		BuildArgs:  buildArgs,
 		Tags:       []string{ref},
 		Remove:     true,
+		PullParent: true,
 		Platform:   spec.Platform,
 	})
 	if err != nil {
