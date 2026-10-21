@@ -119,7 +119,7 @@ func (a *Agent) Run(ctx context.Context) error {
 }
 
 func (a *Agent) register(ctx context.Context) error {
-	capacity, err := a.docker.Capacity(ctx)
+	capacity, architecture, err := a.docker.CapacityAndArchitecture(ctx)
 	if err != nil {
 		return err
 	}
@@ -130,7 +130,7 @@ func (a *Agent) register(ctx context.Context) error {
 	body := map[string]any{
 		"id":            a.cfg.NodeID,
 		"address":       a.cfg.Address,
-		"architecture":  "amd64",
+		"architecture":  architecture,
 		"labels":        map[string]string{},
 		"capabilities":  map[string]bool{},
 		"cpu_millis":    capacity.CPUMillis,

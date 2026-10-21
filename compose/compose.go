@@ -23,12 +23,13 @@ import (
 
 // BuildSpec is the build work one service needs before it can be
 // scheduled, when it has a `build:` block instead of a pre-built `image:`
-// (SRS 7.1 build.context/dockerfile/args).
+// (SRS 7.1 build.context/dockerfile/args/platform).
 type BuildSpec struct {
 	Service    string
 	Context    string
 	Dockerfile string
 	Args       map[string]string
+	Platform   string
 }
 
 // Plan is the importer's output: a dry-run deployment plan (SRS UC-02,
@@ -161,6 +162,10 @@ func recommendOverlay(networking *NetworkRecommendation, reason string) {
 
 func convertService(project, workingDir, name string, svc types.ServiceConfig) (model.Workload, *BuildSpec, []string, []string) {
 	var warnings, rejections []string
+	buildPlatform := "linux/amd64"
+	if _, ok := platformArch(svc.Platform); ok {
+		buildPlatform = svc.Platform
+	}
 
 	wl := model.Workload{
 		Project:      project,
@@ -183,6 +188,7 @@ func convertService(project, workingDir, name string, svc types.ServiceConfig) (
 			Context:    svc.Build.Context,
 			Dockerfile: dockerfile,
 			Args:       map[string]string{},
+			Platform:   buildPlatform,
 		}
 		for k, v := range svc.Build.Args {
 			if v != nil {

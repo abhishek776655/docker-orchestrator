@@ -99,6 +99,9 @@ Deploy `examples/service-dns/docker-compose.yml` from Machine A with the
 existing Compose plan/deploy commands. Confirm the plan reports
 `networking.mode: "lan"`, and confirm `metaapi` and `client` are running on
 different hosts; otherwise the test does not exercise a cross-host path.
+The example targets `metaapi` to `linux/arm64` and `client` to
+`linux/amd64` for an Apple Silicon Machine A and an AMD64 Linux Machine B;
+adjust those `platform` values if your machines have different architectures.
 Then check the client logs for `metaapi-ok`. If needed, inspect from inside
 the client container:
 

@@ -2,6 +2,7 @@ package compose_test
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -81,6 +82,54 @@ services:
 	}
 	if plan.CanDeploy() {
 		t.Fatalf("plan requiring an unprovisioned overlay network must not be deployable")
+	}
+}
+
+func TestComposeBuildDefaultsPlatformToScheduledArchitecture(t *testing.T) {
+	plan, err := compose.Load(context.Background(), "demo", "/tmp", []byte(`
+services:
+  app:
+    build: .
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	assertBuildPlatform(t, plan, "linux/amd64", "amd64")
+}
+
+func TestComposeBuildUsesExplicitPlatform(t *testing.T) {
+	plan, err := compose.Load(context.Background(), "demo", "/tmp", []byte(`
+services:
+  app:
+    platform: linux/arm64
+    build: .
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	assertBuildPlatform(t, plan, "linux/arm64", "arm64")
+}
+
+func assertBuildPlatform(t *testing.T, plan *compose.Plan, wantPlatform, wantArchitecture string) {
+	t.Helper()
+	if len(plan.Builds) != 1 {
+		t.Fatalf("builds = %d, want 1", len(plan.Builds))
+	}
+	if got := plan.Workloads[0].Constraints.Architecture; got != wantArchitecture {
+		t.Fatalf("scheduled architecture = %q, want %q", got, wantArchitecture)
+	}
+	data, err := json.Marshal(plan.Builds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var builds []struct {
+		Platform string
+	}
+	if err := json.Unmarshal(data, &builds); err != nil {
+		t.Fatal(err)
+	}
+	if got := builds[0].Platform; got != wantPlatform {
+		t.Fatalf("build platform = %q, want %q", got, wantPlatform)
 	}
 }
 

@@ -53,6 +53,7 @@ func (s *Service) Build(ctx context.Context, project, revision string, spec comp
 		BuildArgs:  buildArgs,
 		Tags:       []string{ref},
 		Remove:     true,
+		Platform:   spec.Platform,
 	})
 	if err != nil {
 		return "", fmt.Errorf("build %s: %w", spec.Service, err)

@@ -158,15 +158,26 @@ func diskUsedPercent(path string) (float64, error) {
 // Capacity reports host CPU/memory as seen by the Docker daemon, used as
 // the node's allocatable resources until real hardware telemetry (M7)
 // exists.
-func (d *Docker) Capacity(ctx context.Context) (model.Resources, error) {
+func (d *Docker) CapacityAndArchitecture(ctx context.Context) (model.Resources, string, error) {
 	info, err := d.cli.Info(ctx)
 	if err != nil {
-		return model.Resources{}, fmt.Errorf("docker info: %w", err)
+		return model.Resources{}, "", fmt.Errorf("docker info: %w", err)
 	}
 	return model.Resources{
 		CPUMillis:   int64(info.NCPU) * 1000,
 		MemoryBytes: info.MemTotal,
-	}, nil
+	}, normalizeDockerArchitecture(info.Architecture), nil
+}
+
+func normalizeDockerArchitecture(architecture string) string {
+	switch strings.ToLower(architecture) {
+	case "amd64", "x86_64", "x86-64":
+		return "amd64"
+	case "arm64", "aarch64":
+		return "arm64"
+	default:
+		return strings.ToLower(architecture)
+	}
 }
 
 // CachedImages lists the image references already present on this node's
