@@ -170,6 +170,10 @@ func (s *Scheduler) reject(ns *nodeState, w model.Workload) (string, bool) {
 		return fmt.Sprintf("storage affinity mismatch: data pinned to %s", w.Storage.PinnedNodeID), true
 	}
 
+	if w.Constraints.PinnedNodeID != "" && w.Constraints.PinnedNodeID != n.ID {
+		return fmt.Sprintf("node affinity mismatch: pinned to %s", w.Constraints.PinnedNodeID), true
+	}
+
 	if w.Constraints.GPU.Required {
 		if reason, ok := rejectGPU(n, ns, w.Constraints.GPU); ok {
 			return reason, true

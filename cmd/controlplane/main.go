@@ -68,19 +68,27 @@ func main() {
 	}
 	joinManager := controlplane.NewJoinManager(s, fmt.Sprintf("https://%s", net.JoinHostPort(advertiseHost, fmt.Sprint(port))), fingerprint, dnsSuffix)
 	svc = svc.WithJoinManager(joinManager)
-	if registry != "" {
-		dockerCli, err := dockerutil.NewClient()
-		if err != nil {
-			log.Fatalf("docker client for build service: %v", err)
-		}
-		if host, port, splitErr := net.SplitHostPort(registry); splitErr == nil && isLocalRegistryHost(host, advertiseHost) {
-			if err := ensureLocalRegistry(ctx, dockerCli, port); err != nil {
-				log.Fatalf("auto-start local registry: %v", err)
+	// A builder is always wired up, registry or not: with no registry
+	// configured, `build:` services build locally and are never pushed
+	// (build.Service.Build — registry-optional builds, single-machine
+	// case) — only a genuinely unavailable Docker daemon disables it, and
+	// that's soft (logged, not fatal), since a control plane with no local
+	// Docker is an explicitly supported mode (see runHostAgent).
+	if dockerCli, err := dockerutil.NewClient(); err != nil {
+		log.Printf("compose build service disabled: docker client: %v", err)
+	} else {
+		if registry != "" {
+			if host, port, splitErr := net.SplitHostPort(registry); splitErr == nil && isLocalRegistryHost(host, advertiseHost) {
+				if err := ensureLocalRegistry(ctx, dockerCli, port); err != nil {
+					log.Fatalf("auto-start local registry: %v", err)
+				}
+				log.Printf("local registry container %s running on port %s", localRegistryContainerName, port)
 			}
-			log.Printf("local registry container %s running on port %s", localRegistryContainerName, port)
+			log.Printf("compose build service enabled, pushing to %s", registry)
+		} else {
+			log.Printf("compose build service enabled, local-only (no registry configured; built images stay on this host)")
 		}
 		svc = svc.WithBuilder(build.New(dockerCli, registry))
-		log.Printf("compose build service enabled, pushing to %s", registry)
 	}
 	heartbeatTimeout := envDuration("HACO_HEARTBEAT_TIMEOUT", 15*time.Second)
 	reconcileInterval := envDuration("HACO_RECONCILE_INTERVAL", 5*time.Second)
@@ -140,7 +148,7 @@ func main() {
 // an explicitly supported mode (HACO_AUTO_JOIN_HOST=false opts out, or a
 // missing Docker daemon here just skips it).
 func runHostAgent(ctx context.Context, jm *controlplane.JoinManager, advertiseHost, dataDir string) {
-	nodeID := envOr("HACO_HOST_NODE_ID", agent.DefaultHostNodeID())
+	nodeID := agent.HostNodeID()
 	credentialPath := filepath.Join(dataDir, "agent-credentials", nodeID+".json")
 
 	cfg, err := agent.LoadCredential(credentialPath)

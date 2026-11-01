@@ -54,39 +54,36 @@ along the way).
 - **`hacoctl deploy <compose.yml>`** is already a single command — covered,
   done.
 
-## 3. `hacoctl` command surface
+## 3. `hacoctl` command surface — ✅ done
 
-Already built: `deploy`, `plan`, `status`, `nodes`, `events`, `metrics`.
+Built: `deploy`, `plan`, `status`, `nodes`, `node <id>`, `workloads`,
+`containers`, `services`, `stop`, `stop-containers`, `logs`, `events`,
+`metrics`, `teardown`, `start`/`stop-all` (control-plane lifecycle),
+`revoke-node`/`remove-node`.
 
-Still needed:
-- `hacoctl workloads [project]` — list endpoint doesn't exist yet
-  (`store` only supports single-key lookup); needs `ListWorkloads`.
-- `hacoctl containers` — a join view: node, project/service, container ID,
-  status, in one table. Derivable entirely from existing workload rows +
-  node list, no new storage needed.
-- `hacoctl node <id>` — single-node detail.
-- `hacoctl node cordon <id>` / `hacoctl node uncordon <id>` — see §5.
-- `hacoctl stop <project> <service> <revision>` — sets `desired_state:
-  stopped`; needs the agent to actually honor `DesiredState` by stopping
-  the container, which it doesn't check today (it only ever drives
-  *toward* running).
-- `hacoctl logs <project> <service> <revision>` — needs a new agent-side
-  endpoint to stream/return `docker logs` for a workload's container, and
-  a way for the control plane to proxy/route to the right node's agent
-  (agents currently only push state *out*, nothing calls back into them).
-- `hacoctl services <project> <service>` — registry lookup; endpoint
-  already exists (`GET /v1/services/...`), just needs the CLI wrapper.
+Also now built (§5): `hacoctl node cordon <id>` / `uncordon <id>`.
 
 ## 4. Registry-optional builds
 
 Two genuinely different cases, not one flag:
 
-- **Single-machine / shared-daemon case** (covers all current local
-  testing): build centrally as today, skip push entirely, agent uses the
-  already-built local image tag directly since it's the same Docker
-  daemon. Cheap — mostly just making "no registry configured" skip the
-  push step instead of erroring.
-- **Real multi-machine, no registry**: the build has to happen *on the
+- **Single-machine / shared-daemon case — ✅ done.** `build.Service`
+  always exists now (cmd/controlplane wires it up with or without a
+  registry); with none configured it tags
+  `<project>-<service>:<revision>` locally and skips the push. The
+  agent skips `PullImage` for such a workload (`model.Workload.SkipPull`,
+  set by `ComposeDeploy`) since the image was never pushed anywhere and a
+  pull would always fail. Because the image only exists on *this*
+  Docker daemon, `hacoctl plan`/`deploy` reject a build service up front
+  unless it's guaranteed to land on this control-plane host — via the
+  stateful-service default host pin (§ above), an explicit
+  `x-haco-pin-node: <host-id>`, or the new `x-haco-pin-host: true`.
+  `hacoctl start` defaults the registry *on* (`HACO_REGISTRY_ADDR=auto`)
+  so this mode is opt-in via `--no-registry`, not the default.
+  Also added as part of this: a missing/invalid `build.context` or
+  `Dockerfile` is now a plan-time rejection, not a deploy-time build
+  failure.
+- **Real multi-machine, no registry** (still open): the build has to happen *on the
   target node*, because that's the only Docker daemon that will ever see
   the result. Needs:
   - The **agent**, not the control plane, invokes the build.
@@ -99,29 +96,25 @@ Two genuinely different cases, not one flag:
     image and would need to rebuild from scratch — no cross-node image
     cache without a registry, by definition.
 
-## 5. Node active/passive (cordon/drain)
+## 5. Node active/passive (cordon) — ✅ done
 
-Mostly already modeled — `model.Node.Availability` has `disabled`, and the
-scheduler's hard filter already excludes anything not `available`. What's
-missing:
-- `POST /v1/nodes/{id}/cordon` / `/uncordon` — a manual admin action,
-  which doesn't exist; availability today only ever comes from heartbeats.
-- A separate `disabled_by_admin` flag, independent of heartbeat-driven
-  availability — otherwise the very next heartbeat would silently
-  un-cordon the node, since `Heartbeat()` unconditionally sets
-  `availability = 'available'` today.
-- Scheduler and reconciler both need to treat "cordoned" as a hard
-  exclude regardless of heartbeat freshness.
-- This is exactly the "cordon/drain — later operational enhancement"
-  already named as deferred in `docs/contracts/core-contracts.md`.
+Built as cordon only, not drain: `POST /v1/admin/nodes/{id}/cordon` /
+`/uncordon` (`hacoctl node cordon|uncordon <id>`) flip `Availability` to
+`disabled`, which the scheduler's existing "!= available" hard filter
+already excludes from every new placement — no scheduler change needed.
+A new `nodes.disabled_by_admin` column survives `Heartbeat` and
+re-registration (both now `CASE WHEN disabled_by_admin THEN ... ELSE
+...`), so a cordoned node can't silently un-cordon itself. Existing
+workloads on a cordoned node are left running untouched (pure cordon,
+k8s-style) — forcibly moving them is a separate, explicit act (`hacoctl
+stop` / redeploy), not automatic.
 
-## 6. Deploy preview (plan with placement, not just validation)
+## 6. Deploy preview (plan with placement, not just validation) — ✅ done (core)
 
-- `POST /v1/compose/plan` currently validates and builds the workload
-  list but never runs the scheduler, so it can't show *where* things
-  would land. Extend it to also run a dry-run scheduling pass per service
-  (same scheduler as deploy, nothing persisted) and return each one's
-  full `Decision` — candidates, scores, selected node, rejection reasons.
+`POST /v1/compose/plan` now runs a real dry-run scheduling pass per
+service and returns each one's full `Decision` (candidates, scores,
+selected node, rejection reasons); `hacoctl plan` renders it as a table.
+Still open:
 - **Manual override ("freeze")**: a per-service forced-node option the UI
   sends back before confirming deploy. This needs a new constraint,
   distinct from today's storage-pinning (`StoragePolicy.PinnedNodeID`,

@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -38,6 +39,7 @@ CREATE TABLE IF NOT EXISTS nodes (
 	cpu_millis    integer NOT NULL,
 	memory_bytes  integer NOT NULL,
 	availability  text NOT NULL,
+	disabled_by_admin integer NOT NULL DEFAULT 0,
 	heartbeat_at  text NOT NULL,
 	gpus          text NOT NULL DEFAULT '[]',
 	thermal       text NOT NULL DEFAULT '{"Known": false}',
@@ -60,6 +62,8 @@ CREATE TABLE IF NOT EXISTS workloads (
 	storage_class        text NOT NULL,
 	storage_pinned_node  text NOT NULL DEFAULT '',
 	storage_allow_fresh_volume integer NOT NULL DEFAULT 0,
+	constraint_pinned_node text NOT NULL DEFAULT '',
+	skip_pull            integer NOT NULL DEFAULT 0,
 	volumes              text NOT NULL DEFAULT '[]',
 	depends_on           text NOT NULL DEFAULT '[]',
 	desired_state        text NOT NULL,
@@ -123,6 +127,9 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	// SQLite has no "ADD COLUMN IF NOT EXISTS", so the error from a column
 	// that's already there is expected and ignored.
 	_, _ = db.ExecContext(ctx, `ALTER TABLE workloads ADD COLUMN storage_allow_fresh_volume integer NOT NULL DEFAULT 0`)
+	_, _ = db.ExecContext(ctx, `ALTER TABLE workloads ADD COLUMN constraint_pinned_node text NOT NULL DEFAULT ''`)
+	_, _ = db.ExecContext(ctx, `ALTER TABLE workloads ADD COLUMN skip_pull integer NOT NULL DEFAULT 0`)
+	_, _ = db.ExecContext(ctx, `ALTER TABLE nodes ADD COLUMN disabled_by_admin integer NOT NULL DEFAULT 0`)
 	return &Store{db: db}, nil
 }
 
@@ -197,6 +204,27 @@ func (s *Store) RevokeAgentCredential(ctx context.Context, nodeID string) error 
 	return nil
 }
 
+// DeleteNode hard-removes a node and its agent credential, unlike
+// RevokeAgentCredential which only blocks future auth and leaves the row
+// (so `hacoctl nodes` keeps showing it). No table references node_id as a
+// foreign key, so this is safe without touching workload/event history —
+// those rows just keep whatever node_id they already recorded.
+func (s *Store) DeleteNode(ctx context.Context, nodeID string) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM nodes WHERE id = ?`, nodeID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("no node %q", nodeID)
+	}
+	_, _ = s.db.ExecContext(ctx, `DELETE FROM agent_credentials WHERE node_id = ?`, nodeID)
+	return nil
+}
+
 // UpsertNode registers a node or refreshes its heartbeat/capacity,
 // including hardware telemetry (SRS §9.2, M7).
 func (s *Store) UpsertNode(ctx context.Context, n model.Node) error {
@@ -215,7 +243,10 @@ func (s *Store) UpsertNode(ctx context.Context, n model.Node) error {
 			capabilities = excluded.capabilities,
 			cpu_millis = excluded.cpu_millis,
 			memory_bytes = excluded.memory_bytes,
-			availability = excluded.availability,
+			-- A re-registering agent (e.g. restarted) always proposes
+			-- Available; a cordoned node must stay cordoned until an
+			-- explicit uncordon, not silently un-cordon on re-join.
+			availability = CASE WHEN disabled_by_admin = 1 THEN availability ELSE excluded.availability END,
 			heartbeat_at = excluded.heartbeat_at,
 			gpus = excluded.gpus,
 			thermal = excluded.thermal,
@@ -230,9 +261,50 @@ func (s *Store) Heartbeat(ctx context.Context, nodeID string, thermal model.Ther
 	thermalJSON, _ := json.Marshal(thermal)
 	cachedJSON, _ := json.Marshal(cachedImages)
 	res, err := s.db.ExecContext(ctx, `
-		UPDATE nodes SET heartbeat_at = ?, availability = 'available', thermal = ?, cached_images = ?
+		UPDATE nodes SET heartbeat_at = ?, thermal = ?, cached_images = ?,
+			availability = CASE WHEN disabled_by_admin = 1 THEN availability ELSE 'available' END
 		WHERE id = ?
 	`, formatTime(time.Now()), thermalJSON, cachedJSON, nodeID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("unknown node %q", nodeID)
+	}
+	return nil
+}
+
+// CordonNode marks a node disabled-by-admin: Availability flips to
+// Disabled (the scheduler's existing "!= Available" filter already
+// excludes it from every new placement) and disabled_by_admin=1 so
+// neither Heartbeat nor a re-registering agent can silently undo it.
+// Existing workloads already running there are left alone — cordon blocks
+// new scheduling, it does not evict (drain is a separate, explicit act:
+// stop or redeploy those workloads elsewhere yourself).
+func (s *Store) CordonNode(ctx context.Context, nodeID string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE nodes SET availability = 'disabled', disabled_by_admin = 1 WHERE id = ?`, nodeID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("unknown node %q", nodeID)
+	}
+	return nil
+}
+
+// UncordonNode clears disabled_by_admin and optimistically marks the node
+// Available again; if its heartbeat is actually stale, the next reconcile
+// tick's MarkStaleNodesUnavailable corrects that within one interval.
+func (s *Store) UncordonNode(ctx context.Context, nodeID string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE nodes SET availability = 'available', disabled_by_admin = 0 WHERE id = ?`, nodeID)
 	if err != nil {
 		return err
 	}
@@ -263,7 +335,7 @@ func (s *Store) MarkStaleNodesUnavailable(ctx context.Context, timeout time.Dura
 // FR-015).
 func (s *Store) WorkloadsOnUnavailableNodes(ctx context.Context) ([]WorkloadRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT w.project, w.service, w.revision, w.image, w.command, w.env, w.cpu_millis, w.memory_bytes, w.architecture, w.host_ports, w.container_ports, w.storage_class, w.storage_pinned_node, w.storage_allow_fresh_volume, w.volumes, w.depends_on, w.desired_state, w.status, w.status_reason, w.node_id, w.container_id
+		SELECT w.project, w.service, w.revision, w.image, w.command, w.env, w.cpu_millis, w.memory_bytes, w.architecture, w.host_ports, w.container_ports, w.storage_class, w.storage_pinned_node, w.storage_allow_fresh_volume, w.constraint_pinned_node, w.skip_pull, w.volumes, w.depends_on, w.desired_state, w.status, w.status_reason, w.node_id, w.container_id
 		FROM workloads w
 		JOIN nodes n ON n.id = w.node_id
 		WHERE n.availability = 'unavailable' AND w.status NOT IN ('failed', 'stopped')
@@ -419,7 +491,7 @@ func (s *Store) Metrics(ctx context.Context) (*Metrics, error) {
 
 // ListNodes returns every known node.
 func (s *Store) ListNodes(ctx context.Context) ([]model.Node, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, address, architecture, labels, capabilities, cpu_millis, memory_bytes, availability, heartbeat_at, gpus, thermal, cached_images FROM nodes`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, address, architecture, labels, capabilities, cpu_millis, memory_bytes, availability, disabled_by_admin, heartbeat_at, gpus, thermal, cached_images FROM nodes`)
 	if err != nil {
 		return nil, err
 	}
@@ -430,7 +502,7 @@ func (s *Store) ListNodes(ctx context.Context) ([]model.Node, error) {
 		var n model.Node
 		var labels, caps, gpus, thermal, cachedImages []byte
 		var availability, heartbeatAt string
-		if err := rows.Scan(&n.ID, &n.Address, &n.Architecture, &labels, &caps, &n.Allocatable.CPUMillis, &n.Allocatable.MemoryBytes, &availability, &heartbeatAt, &gpus, &thermal, &cachedImages); err != nil {
+		if err := rows.Scan(&n.ID, &n.Address, &n.Architecture, &labels, &caps, &n.Allocatable.CPUMillis, &n.Allocatable.MemoryBytes, &availability, &n.DisabledByAdmin, &heartbeatAt, &gpus, &thermal, &cachedImages); err != nil {
 			return nil, err
 		}
 		n.Availability = model.Availability(availability)
@@ -459,10 +531,23 @@ func (s *Store) ListNodes(ctx context.Context) ([]model.Node, error) {
 // since that attempt is about to be replaced, not added to (see
 // CreateWorkload's ON CONFLICT). Pass "" to exclude nothing.
 func (s *Store) ActiveReservations(ctx context.Context, excludeKey string) (map[string]model.Resources, map[string][]int, error) {
+	return s.ActiveReservationsExcluding(ctx, []string{excludeKey})
+}
+
+// ActiveReservationsExcluding is ActiveReservations generalized to a whole
+// batch of keys at once — used when dry-run planning several workloads
+// together, so each one's own existing (pre-replan) reservation doesn't
+// double-count against the very placement being recomputed for it.
+func (s *Store) ActiveReservationsExcluding(ctx context.Context, excludeKeys []string) (map[string]model.Resources, map[string][]int, error) {
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(excludeKeys)), ",")
+	args := make([]any, len(excludeKeys))
+	for i, k := range excludeKeys {
+		args[i] = k
+	}
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT node_id, cpu_millis, memory_bytes, host_ports FROM workloads
-		WHERE node_id != '' AND status NOT IN ('failed', 'stopped') AND key != ?
-	`, excludeKey)
+		WHERE node_id != '' AND status NOT IN ('failed', 'stopped') AND key NOT IN (`+placeholders+`)
+	`, args...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -515,8 +600,8 @@ func (s *Store) CreateWorkload(ctx context.Context, w WorkloadRecord) error {
 	// stale fields behind. container_id is reset so the agent doesn't
 	// mistake a new spec for an already-running old container.
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO workloads (key, project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, storage_class, storage_pinned_node, storage_allow_fresh_volume, volumes, depends_on, desired_state, status, status_reason, node_id, container_id, created_at, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		INSERT INTO workloads (key, project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, storage_class, storage_pinned_node, storage_allow_fresh_volume, constraint_pinned_node, skip_pull, volumes, depends_on, desired_state, status, status_reason, node_id, container_id, created_at, updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT (key) DO UPDATE SET
 			image = excluded.image,
 			command = excluded.command,
@@ -529,6 +614,8 @@ func (s *Store) CreateWorkload(ctx context.Context, w WorkloadRecord) error {
 			storage_class = excluded.storage_class,
 			storage_pinned_node = excluded.storage_pinned_node,
 			storage_allow_fresh_volume = excluded.storage_allow_fresh_volume,
+			constraint_pinned_node = excluded.constraint_pinned_node,
+			skip_pull = excluded.skip_pull,
 			volumes = excluded.volumes,
 			depends_on = excluded.depends_on,
 			desired_state = excluded.desired_state,
@@ -537,7 +624,7 @@ func (s *Store) CreateWorkload(ctx context.Context, w WorkloadRecord) error {
 			node_id = excluded.node_id,
 			container_id = '',
 			updated_at = excluded.updated_at
-	`, w.Key(), w.Project, w.Service, w.Revision, w.Image, command, env, w.Resources.CPUMillis, w.Resources.MemoryBytes, w.Constraints.Architecture, hostPorts, containerPorts, string(w.Storage.Class), w.Storage.PinnedNodeID, w.Storage.AllowFreshVolumeOnReschedule, volumes, dependsOn, string(w.DesiredState), string(w.Status), w.StatusReason, w.NodeID, w.ContainerID, now, now)
+	`, w.Key(), w.Project, w.Service, w.Revision, w.Image, command, env, w.Resources.CPUMillis, w.Resources.MemoryBytes, w.Constraints.Architecture, hostPorts, containerPorts, string(w.Storage.Class), w.Storage.PinnedNodeID, w.Storage.AllowFreshVolumeOnReschedule, w.Constraints.PinnedNodeID, w.SkipPull, volumes, dependsOn, string(w.DesiredState), string(w.Status), w.StatusReason, w.NodeID, w.ContainerID, now, now)
 	return err
 }
 
@@ -582,7 +669,7 @@ func (s *Store) UpdateStatus(ctx context.Context, key string, status model.Statu
 // GetWorkload returns one workload by key.
 func (s *Store) GetWorkload(ctx context.Context, key string) (*WorkloadRecord, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, storage_class, storage_pinned_node, storage_allow_fresh_volume, volumes, depends_on, desired_state, status, status_reason, node_id, container_id
+		SELECT project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, storage_class, storage_pinned_node, storage_allow_fresh_volume, constraint_pinned_node, skip_pull, volumes, depends_on, desired_state, status, status_reason, node_id, container_id
 		FROM workloads WHERE key = ?
 	`, key)
 	rec, err := scanWorkload(row)
@@ -596,7 +683,7 @@ func (s *Store) GetWorkload(ctx context.Context, key string) (*WorkloadRecord, e
 // project (empty string means all projects), ordered for stable display.
 func (s *Store) ListWorkloads(ctx context.Context, project string) ([]WorkloadRecord, error) {
 	query := `
-		SELECT project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, storage_class, storage_pinned_node, storage_allow_fresh_volume, volumes, depends_on, desired_state, status, status_reason, node_id, container_id
+		SELECT project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, storage_class, storage_pinned_node, storage_allow_fresh_volume, constraint_pinned_node, skip_pull, volumes, depends_on, desired_state, status, status_reason, node_id, container_id
 		FROM workloads
 	`
 	var args []any
@@ -629,7 +716,7 @@ func (s *Store) ListWorkloads(ctx context.Context, project string) ([]WorkloadRe
 // up. This is the agent's pull-based assignment feed (SRS 6.2).
 func (s *Store) AssignedWorkloads(ctx context.Context, nodeID string) ([]WorkloadRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, storage_class, storage_pinned_node, storage_allow_fresh_volume, volumes, depends_on, desired_state, status, status_reason, node_id, container_id
+		SELECT project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, storage_class, storage_pinned_node, storage_allow_fresh_volume, constraint_pinned_node, skip_pull, volumes, depends_on, desired_state, status, status_reason, node_id, container_id
 		FROM workloads WHERE node_id = ? AND status <> 'stopped'
 	`, nodeID)
 	if err != nil {
@@ -743,7 +830,7 @@ func scanWorkloadRow(row scannable) (*WorkloadRecord, error) {
 	var rec WorkloadRecord
 	var command, env, hostPorts, containerPorts, volumes, dependsOn []byte
 	var storageClass, status string
-	if err := row.Scan(&rec.Project, &rec.Service, &rec.Revision, &rec.Image, &command, &env, &rec.Resources.CPUMillis, &rec.Resources.MemoryBytes, &rec.Constraints.Architecture, &hostPorts, &containerPorts, &storageClass, &rec.Storage.PinnedNodeID, &rec.Storage.AllowFreshVolumeOnReschedule, &volumes, &dependsOn, (*string)(&rec.DesiredState), &status, &rec.StatusReason, &rec.NodeID, &rec.ContainerID); err != nil {
+	if err := row.Scan(&rec.Project, &rec.Service, &rec.Revision, &rec.Image, &command, &env, &rec.Resources.CPUMillis, &rec.Resources.MemoryBytes, &rec.Constraints.Architecture, &hostPorts, &containerPorts, &storageClass, &rec.Storage.PinnedNodeID, &rec.Storage.AllowFreshVolumeOnReschedule, &rec.Constraints.PinnedNodeID, &rec.SkipPull, &volumes, &dependsOn, (*string)(&rec.DesiredState), &status, &rec.StatusReason, &rec.NodeID, &rec.ContainerID); err != nil {
 		return nil, err
 	}
 	rec.Status = model.Status(status)

@@ -11,11 +11,19 @@ path (SRS milestone M5, §10).
 SRS §7.3 explicitly allows deferring development-mode source synchronization
 ("It may be deferred from the earliest MVP, but bind-mounted services must
 be flagged until supported" — and FR-020 is a SHOULD, not a MUST). M5
-spends its effort on the safety-critical half (persistent storage) instead:
-bind mounts are already rejected with an actionable message by the M4
-Compose importer, which satisfies "bind-mounted services must be flagged."
-File-watching source-sync itself is **not implemented** and is left for a
-later milestone — this is a recorded decision, not a silent gap.
+spends its effort on the safety-critical half (persistent storage) instead.
+
+Update (post-roadmap item 4/5 era): a bind mount is no longer rejected
+outright. The M4 Compose importer now treats a bind mount's host path as
+ignored and manages it exactly like a named volume (node-local, pinned) —
+correct for a data directory meant to start empty, which satisfies "flagged
+until supported" for that case by making it behave safely rather than by
+refusing it. A *source-code* bind mount (live-reloading code from the
+literal host path) still isn't honored — that needs the literal path
+preserved (a `model.VolumeMount.HostPath` field and a real bind branch in
+`agent.Docker.prepareVolumes`), which is real file-watching source-sync and
+remains **not implemented**, left for a later milestone — a recorded
+decision, not a silent gap.
 
 ## Implemented
 

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/abhishek/hardware-aware-container-orchestrator/agent"
 	"github.com/abhishek/hardware-aware-container-orchestrator/build"
 	"github.com/abhishek/hardware-aware-container-orchestrator/compose"
 	"github.com/abhishek/hardware-aware-container-orchestrator/model"
@@ -43,17 +44,101 @@ func (svc *Service) WithJoinManager(m *JoinManager) *Service {
 // anything (SRS UC-02, FR-023), and dry-run schedules every workload
 // against current node/reservation state so the plan shows where each
 // service would land without persisting or starting anything.
-func (svc *Service) ComposePlan(ctx context.Context, project, workingDir string, yaml []byte) (*compose.Plan, []*model.Decision, error) {
+func (svc *Service) ComposePlan(ctx context.Context, project, workingDir string, yaml []byte, onlyService string) (*compose.Plan, []*model.Decision, error) {
 	plan, err := compose.Load(ctx, project, workingDir, yaml)
 	if err != nil {
 		return nil, nil, err
 	}
+	plan.Rejections = append(plan.Rejections, svc.localBuildPlacementProblems(plan)...)
 	if !plan.Valid() {
 		return plan, nil, nil
+	}
+	if onlyService != "" {
+		plan, err = filterToClosure(plan, onlyService)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 
 	decisions, err := svc.dryRunSchedule(ctx, plan.Workloads)
 	return plan, decisions, err
+}
+
+// filterToClosure narrows plan to onlyService plus every service it
+// transitively depends on (walking DependsOn), so `hacoctl deploy
+// --service X` (or `plan --service X`) runs only what X actually needs —
+// not the whole Compose file — while still respecting its real dependency
+// graph rather than just that one container in isolation.
+func filterToClosure(plan *compose.Plan, onlyService string) (*compose.Plan, error) {
+	byService := make(map[string]model.Workload, len(plan.Workloads))
+	for _, wl := range plan.Workloads {
+		byService[wl.Service] = wl
+	}
+	if _, ok := byService[onlyService]; !ok {
+		return nil, fmt.Errorf("service %q not found in compose file", onlyService)
+	}
+
+	keep := map[string]bool{}
+	var visit func(string)
+	visit = func(name string) {
+		if keep[name] {
+			return
+		}
+		keep[name] = true
+		for _, dep := range byService[name].DependsOn {
+			visit(dep)
+		}
+	}
+	visit(onlyService)
+
+	filtered := *plan
+	filtered.Workloads = nil
+	for _, wl := range plan.Workloads {
+		if keep[wl.Service] {
+			filtered.Workloads = append(filtered.Workloads, wl)
+		}
+	}
+	filtered.Builds = nil
+	for _, b := range plan.Builds {
+		if keep[b.Service] {
+			filtered.Builds = append(filtered.Builds, b)
+		}
+	}
+	return &filtered, nil
+}
+
+// localBuildPlacementProblems catches, at plan time (before any build is
+// attempted), a `build:` service that can't actually run: with no registry
+// configured (svc.builder.Registry() == ""), a built image only exists on
+// this control plane's own Docker daemon, so the service must be
+// guaranteed to land there — pinned via x-haco-pin-host, x-haco-pin-node
+// to this host, or (for a stateful service) the new default host pin.
+// Anything else would build successfully and then fail scheduling, or
+// worse, schedule onto a node whose agent can never pull the image.
+func (svc *Service) localBuildPlacementProblems(plan *compose.Plan) []string {
+	if plan == nil || len(plan.Builds) == 0 || svc.builder == nil || svc.builder.Registry() != "" {
+		return nil
+	}
+	host := agent.HostNodeID()
+	workloadByService := make(map[string]model.Workload, len(plan.Workloads))
+	for _, wl := range plan.Workloads {
+		workloadByService[wl.Service] = wl
+	}
+	var problems []string
+	for _, b := range plan.Builds {
+		wl, ok := workloadByService[b.Service]
+		if !ok {
+			continue
+		}
+		pinned := wl.Storage.PinnedNodeID
+		if pinned == "" {
+			pinned = wl.Constraints.PinnedNodeID
+		}
+		if pinned != host {
+			problems = append(problems, fmt.Sprintf("%s: no registry configured, so this build only runs on this control-plane host (%s); add x-haco-pin-host: true to this service (or configure HACO_REGISTRY_ADDR)", b.Service, host))
+		}
+	}
+	return problems
 }
 
 // dryRunSchedule schedules every workload in order against a single
@@ -66,10 +151,16 @@ func (svc *Service) dryRunSchedule(ctx context.Context, workloads []model.Worklo
 		return nil, fmt.Errorf("list nodes: %w", err)
 	}
 
-	// Seed once: Schedule() itself reserves into the shared scheduler as
-	// it goes, so re-seeding per workload here would double-count
-	// already-active reservations.
-	cpuMem, ports, err := svc.store.ActiveReservations(ctx, "")
+	// Seed once, excluding every workload in this batch's own existing
+	// reservation (so replanning an already-deployed service doesn't
+	// double-count its current CPU/memory/ports against itself): Schedule()
+	// itself reserves into the shared scheduler as it goes, so re-seeding
+	// per workload here would double-count already-active reservations.
+	keys := make([]string, len(workloads))
+	for i, w := range workloads {
+		keys[i] = w.Key()
+	}
+	cpuMem, ports, err := svc.store.ActiveReservationsExcluding(ctx, keys)
 	if err != nil {
 		return nil, fmt.Errorf("load reservations: %w", err)
 	}
@@ -80,6 +171,14 @@ func (svc *Service) dryRunSchedule(ctx context.Context, workloads []model.Worklo
 
 	var decisions []*model.Decision
 	for _, w := range workloads {
+		if w.Storage.Class == model.NodeLocalPersistent && w.Storage.PinnedNodeID == "" {
+			// Mirror Submit()'s existing-pin reuse so planning a redeploy of
+			// an x-haco-place-anywhere service shows where it would actually
+			// land (its existing volume's node), not a fresh pick.
+			if existing, err := svc.store.GetWorkload(ctx, w.Key()); err == nil {
+				w.Storage.PinnedNodeID = existing.Storage.PinnedNodeID
+			}
+		}
 		decision, err := sched.Schedule(w)
 		decisions = append(decisions, decision)
 		if err != nil {
@@ -89,11 +188,23 @@ func (svc *Service) dryRunSchedule(ctx context.Context, workloads []model.Worklo
 	return decisions, nil
 }
 
+// DeployOptions carries hacoctl deploy's optional flags through the API.
+type DeployOptions struct {
+	// NoCache forces every build in this deploy to bypass Docker's build
+	// cache, for when a service's tag already exists locally but its
+	// source changed in a way the cache wouldn't detect.
+	NoCache bool
+	// OnlyService, when set, deploys just that service plus everything it
+	// transitively depends on (see filterToClosure) instead of the whole
+	// Compose file.
+	OnlyService string
+}
+
 // ComposeDeploy plans a Compose file, builds any services that need it,
 // and submits every workload through the normal scheduler path. It stops
 // at the first rejection — nothing is applied for an invalid plan
 // (FR-003).
-func (svc *Service) ComposeDeploy(ctx context.Context, project, workingDir string, yaml []byte) (*compose.Plan, []*SubmitResult, error) {
+func (svc *Service) ComposeDeploy(ctx context.Context, project, workingDir string, yaml []byte, opts DeployOptions) (*compose.Plan, []*SubmitResult, error) {
 	plan, err := compose.Load(ctx, project, workingDir, yaml)
 	if err != nil {
 		return nil, nil, err
@@ -104,23 +215,27 @@ func (svc *Service) ComposeDeploy(ctx context.Context, project, workingDir strin
 	if !plan.Networking.Supported {
 		return plan, nil, fmt.Errorf("compose plan recommends %s networking, which is not provisioned yet: %s", plan.Networking.Mode, strings.Join(plan.Networking.Reasons, "; "))
 	}
-
-	builtImages := map[string]string{}
-	for _, b := range plan.Builds {
-		if svc.builder == nil {
-			return plan, nil, fmt.Errorf("service %s requires a build but no builder is configured", b.Service)
-		}
-		ref, err := svc.builder.Build(ctx, project, "latest", b)
+	if problems := svc.localBuildPlacementProblems(plan); len(problems) > 0 {
+		return plan, nil, fmt.Errorf("%s", strings.Join(problems, "; "))
+	}
+	if opts.OnlyService != "" {
+		plan, err = filterToClosure(plan, opts.OnlyService)
 		if err != nil {
-			return plan, nil, fmt.Errorf("build %s: %w", b.Service, err)
+			return nil, nil, err
 		}
-		builtImages[b.Service] = ref
 	}
 
+	builtImages, err := svc.buildImages(ctx, project, plan, opts.NoCache)
+	if err != nil {
+		return plan, nil, err
+	}
+
+	localOnly := svc.builder != nil && svc.builder.Registry() == ""
 	var results []*SubmitResult
 	for _, wl := range plan.Workloads {
 		if ref, ok := builtImages[wl.Service]; ok {
 			wl.Image = ref
+			wl.SkipPull = localOnly
 		}
 		result, err := svc.Submit(ctx, wl)
 		results = append(results, result)
@@ -129,6 +244,85 @@ func (svc *Service) ComposeDeploy(ctx context.Context, project, workingDir strin
 		}
 	}
 	return plan, results, nil
+}
+
+// buildImages builds every build: service in plan (e.g. the one surfaced
+// by a prior filterToClosure) and returns each one's resulting image ref,
+// keyed by service name. Shared by ComposeDeploy (build then schedule) and
+// ComposeBuild (build only).
+func (svc *Service) buildImages(ctx context.Context, project string, plan *compose.Plan, noCache bool) (map[string]string, error) {
+	built := map[string]string{}
+	for _, b := range plan.Builds {
+		if svc.builder == nil {
+			return built, fmt.Errorf("service %s requires a build but no builder is configured", b.Service)
+		}
+		ref, err := svc.builder.Build(ctx, project, "latest", b, noCache)
+		if err != nil {
+			return built, fmt.Errorf("build %s: %w", b.Service, err)
+		}
+		built[b.Service] = ref
+	}
+	return built, nil
+}
+
+// BuildResult is one service's outcome from ComposeBuild.
+type BuildResult struct {
+	Service string `json:"service"`
+	Image   string `json:"image"`
+}
+
+// ComposeBuild builds every build: service in a Compose file — optionally
+// scoped to one service's dependency closure via opts.OnlyService, and
+// forcing a cache-bypassing rebuild via opts.NoCache — without scheduling
+// or starting anything. Useful for pre-warming images, or just checking a
+// build succeeds, independent of whether you're ready to deploy.
+func (svc *Service) ComposeBuild(ctx context.Context, project, workingDir string, yaml []byte, opts DeployOptions) (*compose.Plan, []BuildResult, error) {
+	plan, err := compose.Load(ctx, project, workingDir, yaml)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !plan.Valid() {
+		return plan, nil, fmt.Errorf("compose plan for %s has %d rejection(s)", project, len(plan.Rejections))
+	}
+	if problems := svc.localBuildPlacementProblems(plan); len(problems) > 0 {
+		return plan, nil, fmt.Errorf("%s", strings.Join(problems, "; "))
+	}
+	if opts.OnlyService != "" {
+		plan, err = filterToClosure(plan, opts.OnlyService)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	builtImages, err := svc.buildImages(ctx, project, plan, opts.NoCache)
+	if err != nil {
+		return plan, nil, err
+	}
+	results := make([]BuildResult, 0, len(builtImages))
+	for _, b := range plan.Builds {
+		if ref, ok := builtImages[b.Service]; ok {
+			results = append(results, BuildResult{Service: b.Service, Image: ref})
+		}
+	}
+	return plan, results, nil
+}
+
+// DeleteNode hard-removes a node record (and its credential), unlike
+// revoke which only blocks future auth and leaves the row behind.
+func (svc *Service) DeleteNode(ctx context.Context, nodeID string) error {
+	return svc.store.DeleteNode(ctx, nodeID)
+}
+
+// CordonNode blocks a node from receiving any new workload placement
+// without touching what's already running there (see store.CordonNode).
+func (svc *Service) CordonNode(ctx context.Context, nodeID string) error {
+	return svc.store.CordonNode(ctx, nodeID)
+}
+
+// UncordonNode reverses CordonNode, making the node eligible for new
+// placements again.
+func (svc *Service) UncordonNode(ctx context.Context, nodeID string) error {
+	return svc.store.UncordonNode(ctx, nodeID)
 }
 
 // RegisterNode upserts a node's identity and capacity.
@@ -168,6 +362,16 @@ func (svc *Service) Submit(ctx context.Context, w model.Workload) (*SubmitResult
 		return nil, fmt.Errorf("load reservations: %w", err)
 	}
 
+	if w.Storage.Class == model.NodeLocalPersistent && w.Storage.PinnedNodeID == "" {
+		// x-haco-place-anywhere: the compose file itself carries no pin, so
+		// on a redeploy, reuse wherever this workload is already pinned
+		// (its data lives there) instead of letting the scheduler pick a
+		// fresh node and strand the existing volume.
+		if existing, err := svc.store.GetWorkload(ctx, w.Key()); err == nil {
+			w.Storage.PinnedNodeID = existing.Storage.PinnedNodeID
+		}
+	}
+
 	sched := scheduler.New(nodes)
 	for nodeID, res := range cpuMem {
 		sched.SeedReservation(nodeID, res, ports[nodeID])
@@ -181,6 +385,13 @@ func (svc *Service) Submit(ctx context.Context, w model.Workload) (*SubmitResult
 
 	if w.DesiredState == "" {
 		w.DesiredState = model.DesiredRunning
+	}
+	if w.Storage.Class == model.NodeLocalPersistent && w.Storage.PinnedNodeID == "" {
+		// First-ever placement of an unpinned persistent-volume workload:
+		// lock it to wherever it actually landed, the same way a storage
+		// pin normally works, so its volume has a stable, discoverable home
+		// from here on rather than being re-picked on every redeploy.
+		w.Storage.PinnedNodeID = decision.Selected
 	}
 	if w.Storage.Class == model.NodeLocalPersistent && w.Storage.AllowFreshVolumeOnReschedule && w.Storage.PinnedNodeID != decision.Selected {
 		// Schedule() relaxed affinity because the pinned node was down;

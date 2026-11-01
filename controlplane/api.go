@@ -37,12 +37,16 @@ func NewHandler(svc *Service) http.Handler {
 	mux.HandleFunc("GET /v1/services/{project}", svc.handleListProjectServices)
 
 	mux.HandleFunc("POST /v1/compose/plan", svc.handleComposePlan)
+	mux.HandleFunc("POST /v1/compose/build", svc.handleComposeBuild)
 	mux.HandleFunc("POST /v1/compose/deploy", svc.handleComposeDeploy)
 
 	mux.HandleFunc("GET /v1/events", svc.handleListEvents)
 	mux.HandleFunc("GET /v1/metrics", svc.handleMetrics)
 	mux.HandleFunc("POST /v1/admin/join-token", svc.handleIssueJoinToken)
 	mux.HandleFunc("POST /v1/admin/nodes/{id}/revoke", svc.handleRevokeAgent)
+	mux.HandleFunc("DELETE /v1/admin/nodes/{id}", svc.handleDeleteNode)
+	mux.HandleFunc("POST /v1/admin/nodes/{id}/cordon", svc.handleCordonNode)
+	mux.HandleFunc("POST /v1/admin/nodes/{id}/uncordon", svc.handleUncordonNode)
 
 	return logRequests(mux)
 }
@@ -101,6 +105,30 @@ func (svc *Service) handleRevokeAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
+}
+
+func (svc *Service) handleDeleteNode(w http.ResponseWriter, r *http.Request) {
+	if err := svc.DeleteNode(r.Context(), r.PathValue("id")); err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+func (svc *Service) handleCordonNode(w http.ResponseWriter, r *http.Request) {
+	if err := svc.CordonNode(r.Context(), r.PathValue("id")); err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "cordoned"})
+}
+
+func (svc *Service) handleUncordonNode(w http.ResponseWriter, r *http.Request) {
+	if err := svc.UncordonNode(r.Context(), r.PathValue("id")); err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "uncordoned"})
 }
 
 func logRequests(next http.Handler) http.Handler {
@@ -313,9 +341,11 @@ func (svc *Service) handleListProjectServices(w http.ResponseWriter, r *http.Req
 }
 
 type composeRequest struct {
-	Project    string `json:"project"`
-	WorkingDir string `json:"working_dir"`
-	Yaml       string `json:"yaml"`
+	Project     string `json:"project"`
+	WorkingDir  string `json:"working_dir"`
+	Yaml        string `json:"yaml"`
+	NoCache     bool   `json:"no_cache"`
+	OnlyService string `json:"only_service"`
 }
 
 func (svc *Service) handleComposePlan(w http.ResponseWriter, r *http.Request) {
@@ -324,7 +354,7 @@ func (svc *Service) handleComposePlan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	plan, decisions, err := svc.ComposePlan(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml))
+	plan, decisions, err := svc.ComposePlan(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), req.OnlyService)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -336,13 +366,31 @@ func (svc *Service) handleComposePlan(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, map[string]any{"plan": plan, "decisions": decisions})
 }
 
+func (svc *Service) handleComposeBuild(w http.ResponseWriter, r *http.Request) {
+	var req composeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	plan, results, err := svc.ComposeBuild(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), DeployOptions{NoCache: req.NoCache, OnlyService: req.OnlyService})
+	if err != nil {
+		status := http.StatusInternalServerError
+		if plan != nil && !plan.Valid() {
+			status = http.StatusUnprocessableEntity
+		}
+		writeJSON(w, status, map[string]any{"error": err.Error(), "plan": plan, "results": results})
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"plan": plan, "results": results})
+}
+
 func (svc *Service) handleComposeDeploy(w http.ResponseWriter, r *http.Request) {
 	var req composeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	plan, results, err := svc.ComposeDeploy(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml))
+	plan, results, err := svc.ComposeDeploy(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), DeployOptions{NoCache: req.NoCache, OnlyService: req.OnlyService})
 	if err != nil {
 		status := http.StatusInternalServerError
 		if plan != nil && !plan.CanDeploy() {

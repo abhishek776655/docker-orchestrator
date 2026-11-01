@@ -233,10 +233,12 @@ func (a *Agent) execute(ctx context.Context, rec store.WorkloadRecord) {
 		return
 	}
 
-	a.report(ctx, key, model.StatusPulling, "", "")
-	if err := a.docker.PullImage(ctx, rec.Image); err != nil {
-		a.report(ctx, key, model.StatusFailed, "pull failed: "+err.Error(), "")
-		return
+	if !rec.SkipPull {
+		a.report(ctx, key, model.StatusPulling, "", "")
+		if err := a.docker.PullImage(ctx, rec.Image); err != nil {
+			a.report(ctx, key, model.StatusFailed, "pull failed: "+err.Error(), "")
+			return
+		}
 	}
 
 	a.report(ctx, key, model.StatusStarting, "", "")

@@ -10,7 +10,8 @@
 | `depends_on` conditions | Supported | Validate graph and gate readiness |
 | `healthcheck` | Supported | Warn for obvious placeholder checks |
 | named volumes | Supported with policy | Node-local by default; creates affinity |
-| bind mounts | Warning/block initially | Require explicit node-path or source-sync policy |
+| bind mounts (data dirs) | Supported with policy | Host path is ignored and treated as a managed node-local volume, same as a named volume — correct for a data directory meant to start empty, since it's never read back |
+| bind mounts (source-code live-mount) | Not implemented | Honoring the literal host path (for live code reload) needs a dedicated feature, not yet built |
 | `networks` | Supported as logical membership | Maps to discovery/connectivity policy |
 | `secrets` | Supported | Deliver through protected secret handling |
 | CPU/memory limits | Supported | Translate according to approved semantics |

@@ -73,7 +73,7 @@ func TestBuildPullsBaseForRequestedPlatform(t *testing.T) {
 		Context:    contextDir,
 		Dockerfile: "Dockerfile",
 		Platform:   "linux/amd64",
-	})
+	}, false)
 	if err != nil {
 		t.Fatalf("Build() error = %v", err)
 	}

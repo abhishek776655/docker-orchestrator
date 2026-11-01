@@ -18,6 +18,7 @@ import (
 	"github.com/compose-spec/compose-go/v2/loader"
 	"github.com/compose-spec/compose-go/v2/types"
 
+	"github.com/abhishek/hardware-aware-container-orchestrator/agent"
 	"github.com/abhishek/hardware-aware-container-orchestrator/model"
 )
 
@@ -198,6 +199,18 @@ func convertService(project, workingDir, name string, svc types.ServiceConfig) (
 		if len(svc.Build.SSH) > 0 || len(svc.Build.Secrets) > 0 {
 			warnings = append(warnings, fmt.Sprintf("%s: build.ssh/build.secrets are declared but BuildKit secret/SSH mounts are not implemented yet; the build will fail for anything requiring private access (SRS §11, §18.1)", name))
 		}
+		// Caught here rather than left to surface mid-deploy: a missing
+		// build context (typo'd path, directory never committed, wrong
+		// working dir) is knowable with no Docker call at all, so `hacoctl
+		// plan` should reject it up front instead of `deploy` failing after
+		// everything else already scheduled.
+		if info, err := os.Stat(build.Context); err != nil {
+			rejections = append(rejections, fmt.Sprintf("%s: build context %q does not exist", name, build.Context))
+		} else if !info.IsDir() {
+			rejections = append(rejections, fmt.Sprintf("%s: build context %q is not a directory", name, build.Context))
+		} else if _, err := os.Stat(filepath.Join(build.Context, build.Dockerfile)); err != nil {
+			rejections = append(rejections, fmt.Sprintf("%s: Dockerfile %q not found in build context %q", name, build.Dockerfile, build.Context))
+		}
 	default:
 		rejections = append(rejections, fmt.Sprintf("%s: service has neither image nor build", name))
 	}
@@ -268,16 +281,37 @@ func convertService(project, workingDir, name string, svc types.ServiceConfig) (
 		warnings = append(warnings, fmt.Sprintf("%s: healthcheck %v looks like a placeholder and does not validate real readiness", name, []string(svc.HealthCheck.Test)))
 	}
 
+	pinHost, _ := svc.Extensions["x-haco-pin-host"].(bool)
+	placeAnywhere, _ := svc.Extensions["x-haco-place-anywhere"].(bool)
+
 	wl.Storage.Class = model.Ephemeral
 	for _, v := range svc.Volumes {
 		switch v.Type {
-		case "bind":
-			rejections = append(rejections, fmt.Sprintf("%s: bind mount %s:%s requires an explicit node-path or source-sync policy, which M4 does not implement yet; remove it or pin the service with x-haco-pin-node and accept node-local semantics", name, v.Source, v.Target))
-		case "volume":
-			pinned, ok := svc.Extensions["x-haco-pin-node"].(string)
-			if !ok || pinned == "" {
-				rejections = append(rejections, fmt.Sprintf("%s: named volume %s needs node affinity; set x-haco-pin-node: <node-id> on this service", name, v.Target))
-				continue
+		case "bind", "volume":
+			// A bind mount's host path (v.Source) is intentionally ignored
+			// here and treated exactly like a named volume: only v.Target
+			// (the container path) matters, and prepareVolumes creates and
+			// manages its own directory per (workload key, container path)
+			// regardless of how that path was declared in compose. That's
+			// correct for a data directory (mysql/postgres/redis/etc. are
+			// meant to start empty), but wrong for a source-code live-mount
+			// that needs the literal host path honored — that's a separate,
+			// larger feature (model.VolumeMount.HostPath + a real bind
+			// branch in agent/docker.go's prepareVolumes), not handled yet.
+			//
+			// Node affinity, in priority order:
+			//   1. x-haco-pin-node: <id>      — explicit node, as before.
+			//   2. x-haco-place-anywhere: true — opt out of any default; the
+			//      scheduler picks freely on first deploy, then the control
+			//      plane locks the pin to wherever it landed (service.go
+			//      Submit), so later redeploys stay on that same data.
+			//   3. default (nothing set, or x-haco-pin-host: true) — pin to
+			//      this control plane's own host machine. A stateful
+			//      service's volume living on a predictable, always-on node
+			//      is a safer default than an arbitrary worker.
+			pinned, _ := svc.Extensions["x-haco-pin-node"].(string)
+			if pinned == "" && !placeAnywhere {
+				pinned = agent.HostNodeID()
 			}
 			allowFresh, _ := svc.Extensions["x-haco-allow-fresh-volume"].(bool)
 			wl.Storage = model.StoragePolicy{Class: model.NodeLocalPersistent, PinnedNodeID: pinned, AllowFreshVolumeOnReschedule: allowFresh}
@@ -285,6 +319,14 @@ func convertService(project, workingDir, name string, svc types.ServiceConfig) (
 		default:
 			warnings = append(warnings, fmt.Sprintf("%s: volume type %q is not evaluated for storage affinity", name, v.Type))
 		}
+	}
+
+	// x-haco-pin-host also works standalone, for a service with no volume
+	// at all that should still always run on the control-plane host (e.g.
+	// something that needs to reach a host-local resource) — a general
+	// node-affinity constraint, independent of storage.
+	if pinHost && wl.Storage.Class == model.Ephemeral {
+		wl.Constraints.PinnedNodeID = agent.HostNodeID()
 	}
 
 	wl.Resources.CPUMillis = 250

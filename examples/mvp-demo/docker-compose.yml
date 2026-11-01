@@ -7,7 +7,7 @@ services:
       - "6380:6380"
     volumes:
       - cache-data:/data
-    x-haco-pin-node: node-a
+    x-haco-pin-node: 192-168-1-5
     cpus: "0.25"
     mem_limit: "134217728"
 
@@ -15,6 +15,7 @@ services:
     platform: linux/arm64
     build:
       context: ./api
+    x-haco-pin-host: true
     ports:
       - "9090:9090"
     environment:
@@ -35,6 +36,32 @@ services:
     volumes:
       - worker-data:/data
     x-haco-pin-node: 192-168-1-15
+    cpus: "0.1"
+    mem_limit: "67108864"
+
+  queue:
+    image: redis:7-alpine
+    platform: linux/arm64
+    command: ["redis-server", "--port", "6391", "--protected-mode", "no"]
+    ports:
+      - "6391:6391"
+    cpus: "0.1"
+    mem_limit: "67108864"
+
+  web:
+    platform: linux/arm64
+    build:
+      context: ./web
+    x-haco-pin-host: true
+    ports:
+      - "8080:8080"
+    environment:
+      API_URL: http://api:9090
+      WORKER_URL: worker:7001
+      QUEUE_URL: queue:6391
+    depends_on:
+      api:
+        condition: service_started
     cpus: "0.1"
     mem_limit: "67108864"
 

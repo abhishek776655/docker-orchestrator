@@ -40,6 +40,19 @@ func DefaultHostNodeID() string {
 	return id
 }
 
+// HostNodeID is DefaultHostNodeID with the HACO_HOST_NODE_ID override
+// applied — the single source of truth every caller uses for "this
+// machine's node ID": cmd/controlplane's auto-join, compose's default
+// stateful-service pin and x-haco-pin-host, and the build-locality check
+// in controlplane.ComposeDeploy all call this instead of each re-deriving
+// it (and each potentially disagreeing after an override).
+func HostNodeID() string {
+	if v := os.Getenv("HACO_HOST_NODE_ID"); v != "" {
+		return v
+	}
+	return DefaultHostNodeID()
+}
+
 type credentialFile struct {
 	NodeID      string `json:"node_id"`
 	Credential  string `json:"credential"`

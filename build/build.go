@@ -34,15 +34,32 @@ func New(cli *client.Client, registry string) *Service {
 	return &Service{cli: cli, registry: registry}
 }
 
-// Build builds spec's context, tags the result <registry>/<project>-<service>:<revision>,
-// pushes it, and returns the pushed reference.
-func (s *Service) Build(ctx context.Context, project, revision string, spec compose.BuildSpec) (string, error) {
+// Registry is the configured push target, or "" when this Service builds
+// local-only (no registry configured): Build then skips the push step
+// entirely and tags without a registry prefix, since the only Docker
+// daemon that will ever run the image is this one.
+func (s *Service) Registry() string { return s.registry }
+
+// Build builds spec's context and tags the result. With a registry
+// configured, that's <registry>/<project>-<service>:<revision>, pushed so
+// any node's agent can pull it. With no registry, it's a local-only
+// <project>-<service>:<revision> tag that's never pushed — correct only
+// for a workload that stays on this same Docker daemon (the control
+// plane's own host); ComposeDeploy enforces that placement constraint.
+// noCache forces a full rebuild (Docker's build-layer cache is bypassed),
+// for when a service's image needs to be rebuilt even though its tag
+// already exists locally (e.g. source changed but the Dockerfile/context
+// hash alone wouldn't tell Docker that).
+func (s *Service) Build(ctx context.Context, project, revision string, spec compose.BuildSpec, noCache bool) (string, error) {
 	tarball, err := tarContext(spec.Context)
 	if err != nil {
 		return "", fmt.Errorf("package build context: %w", err)
 	}
 
-	ref := fmt.Sprintf("%s/%s-%s:%s", s.registry, project, spec.Service, revision)
+	ref := fmt.Sprintf("%s-%s:%s", project, spec.Service, revision)
+	if s.registry != "" {
+		ref = fmt.Sprintf("%s/%s", s.registry, ref)
+	}
 
 	buildArgs := map[string]*string{}
 	for k, v := range spec.Args {
@@ -57,6 +74,7 @@ func (s *Service) Build(ctx context.Context, project, revision string, spec comp
 		Remove:     true,
 		PullParent: true,
 		Platform:   spec.Platform,
+		NoCache:    noCache,
 	})
 	if err != nil {
 		return "", fmt.Errorf("build %s: %w", spec.Service, err)
@@ -72,6 +90,10 @@ func (s *Service) Build(ctx context.Context, project, revision string, spec comp
 	}
 	if err := validateImagePlatform(built, spec.Platform); err != nil {
 		return "", fmt.Errorf("build %s: %w", spec.Service, err)
+	}
+
+	if s.registry == "" {
+		return ref, nil
 	}
 
 	pushRC, err := s.cli.ImagePush(ctx, ref, types.ImagePushOptions{

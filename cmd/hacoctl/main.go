@@ -11,10 +11,12 @@ import (
 	"net/http"
 	neturl "net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -36,10 +38,12 @@ func main() {
 		err = deploy(url, os.Args[2:])
 	case "plan":
 		err = plan(url, os.Args[2:])
+	case "build":
+		err = buildCmd(url, os.Args[2:])
 	case "nodes":
 		err = nodes(url)
 	case "node":
-		err = nodeDetail(url, os.Args[2:])
+		err = node(url, os.Args[2:])
 	case "workloads":
 		err = workloads(url, os.Args[2:])
 	case "containers":
@@ -64,8 +68,20 @@ func main() {
 		} else {
 			err = post(url, "/v1/admin/nodes/"+neturl.PathEscape(os.Args[2])+"/revoke", []byte(`{}`))
 		}
+	case "stop-containers":
+		err = stopContainers(url, os.Args[2:])
 	case "teardown":
 		err = teardown(url, os.Args[2:])
+	case "start":
+		err = start(url, os.Args[2:])
+	case "stop-all":
+		err = stopAll(os.Args[2:])
+	case "remove-node":
+		if len(os.Args) != 3 {
+			err = fmt.Errorf("usage: hacoctl remove-node <node-id>")
+		} else {
+			err = del(url, "/v1/admin/nodes/"+neturl.PathEscape(os.Args[2]))
+		}
 	default:
 		usage()
 		os.Exit(1)
@@ -80,21 +96,28 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `hacoctl: a thin CLI over the control-plane API (HACO_CONTROLPLANE_URL, default http://localhost:8099)
 
 Usage:
-  hacoctl deploy <project> <docker-compose.yml>   build, schedule, and run a Compose project (prompts if a pinned service needs a fresh volume; --yes skips it)
-  hacoctl plan   <project> <docker-compose.yml>   dry-run the same, no side effects (table; add --json for raw)
+  hacoctl build  <project> <docker-compose.yml>   just build the build: service images, no scheduling or containers (--no-cache forces a full rebuild; --service <name> scopes to that service's dependencies)
+  hacoctl deploy <project> <docker-compose.yml>   build, schedule, and run a Compose project (prompts if a pinned service needs a fresh volume; --yes skips it; --no-cache forces a full rebuild; --service <name> deploys only that service and its dependencies)
+  hacoctl plan   <project> <docker-compose.yml>   dry-run the same, no side effects (table; add --json for raw; --service <name> to scope the same way)
   hacoctl status <project> <service> <revision>   one workload's current status
   hacoctl logs   <project> <service> <revision>   latest captured container log tail
   hacoctl stop   <project> <service> <revision>   stop the workload and remove its container
   hacoctl nodes                                   list registered nodes
   hacoctl node <id>                               one node's full detail
+  hacoctl node cordon <id>                        block new workloads from scheduling onto this node (existing ones keep running)
+  hacoctl node uncordon <id>                      make this node eligible for new workloads again
   hacoctl workloads [project]                     table of every workload, optionally filtered to one project
   hacoctl containers                              node/workload/container join view
   hacoctl services <project> [service]            resolve a logical service name to its current endpoints
   hacoctl events                                  recent audit events
   hacoctl metrics                                 node/workload counts
   hacoctl join-token                              print a fresh one-time agent join command
-  hacoctl revoke-node <node-id>                   revoke that agent credential
-  hacoctl teardown                                stop every workload and revoke every node credential (--yes skips confirmation)`)
+  hacoctl revoke-node <node-id>                   revoke that agent credential (node stays listed, permanently unavailable)
+  hacoctl remove-node <node-id>                   hard-delete that node record and its credential
+  hacoctl stop-containers                         stop every workload's container, nodes stay joined (--yes skips confirmation)
+  hacoctl teardown                                stop every workload and revoke every node credential (--yes skips confirmation)
+  hacoctl start                                   start the control plane in the background, with the local build registry on by default (--foreground to run attached, --no-registry to disable it)
+  hacoctl stop-all                                stop the control plane process started by 'hacoctl start'`)
 }
 
 func printJoinCommand(baseURL string) error {
@@ -123,16 +146,24 @@ func printJoinCommand(baseURL string) error {
 // --json to get the same raw response hacoctl used to always print.
 func plan(baseURL string, args []string) error {
 	jsonOut := false
+	onlyService := ""
 	var rest []string
-	for _, a := range args {
-		if a == "--json" {
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--json":
 			jsonOut = true
-			continue
+		case "--service":
+			i++
+			if i >= len(args) {
+				return fmt.Errorf("--service requires a value")
+			}
+			onlyService = args[i]
+		default:
+			rest = append(rest, args[i])
 		}
-		rest = append(rest, a)
 	}
 	if len(rest) != 2 {
-		return fmt.Errorf("usage: hacoctl plan <project> <docker-compose.yml> [--json]")
+		return fmt.Errorf("usage: hacoctl plan <project> <docker-compose.yml> [--json] [--service <name>]")
 	}
 	project, file := rest[0], rest[1]
 
@@ -146,18 +177,22 @@ func plan(baseURL string, args []string) error {
 	}
 	if jsonOut {
 		body, _ := json.Marshal(map[string]string{
-			"project":     project,
-			"working_dir": workingDir,
-			"yaml":        string(yaml),
+			"project":      project,
+			"working_dir":  workingDir,
+			"yaml":         string(yaml),
+			"only_service": onlyService,
 		})
 		return post(baseURL, "/v1/compose/plan", body)
 	}
 
-	out, err := fetchPlan(baseURL, project, workingDir, yaml)
+	out, err := fetchPlan(baseURL, project, workingDir, yaml, onlyService)
 	if err != nil {
 		return err
 	}
 	renderPlanTable(project, out)
+	if len(out.Plan.Rejections) > 0 {
+		return fmt.Errorf("plan is invalid (%d rejection(s))", len(out.Plan.Rejections))
+	}
 	return nil
 }
 
@@ -175,7 +210,8 @@ type planView struct {
 				PinnedNodeID string `json:"PinnedNodeID"`
 			} `json:"Storage"`
 			Constraints struct {
-				HostPorts []int `json:"HostPorts"`
+				HostPorts    []int  `json:"HostPorts"`
+				PinnedNodeID string `json:"PinnedNodeID"`
 			} `json:"Constraints"`
 		} `json:"workloads"`
 		Warnings   []string `json:"warnings"`
@@ -198,11 +234,12 @@ type planView struct {
 
 // fetchPlan POSTs to /v1/compose/plan and returns the decoded response.
 // Shared by `plan` (display) and `deploy` (fresh-volume consent check).
-func fetchPlan(baseURL, project, workingDir string, yaml []byte) (planView, error) {
+func fetchPlan(baseURL, project, workingDir string, yaml []byte, onlyService string) (planView, error) {
 	body, _ := json.Marshal(map[string]string{
-		"project":     project,
-		"working_dir": workingDir,
-		"yaml":        string(yaml),
+		"project":      project,
+		"working_dir":  workingDir,
+		"yaml":         string(yaml),
+		"only_service": onlyService,
 	})
 	resp, err := http.Post(baseURL+"/v1/compose/plan", "application/json", bytes.NewReader(body))
 	if err != nil {
@@ -212,6 +249,15 @@ func fetchPlan(baseURL, project, workingDir string, yaml []byte) (planView, erro
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return planView{}, err
+	}
+	if resp.StatusCode == http.StatusUnprocessableEntity {
+		// An invalid plan (rejections) is an expected, renderable outcome,
+		// not a hard failure — decode it like a 200 so renderPlanTable can
+		// show the rejections instead of this dumping raw JSON.
+		var out planView
+		if err := json.Unmarshal(data, &out); err == nil {
+			return out, nil
+		}
 	}
 	if resp.StatusCode >= 300 {
 		var errBody struct {
@@ -257,23 +303,33 @@ func freshVolumeWarnings(v planView) map[string][]string {
 	return out
 }
 
-// deploy dry-run plans first so it can ask for explicit consent before a
-// pinned workload with x-haco-allow-fresh-volume gets rescheduled onto a
-// brand-new, empty volume — that's a data-loss trade-off the user opted a
-// service into ahead of time, but it still deserves a live confirmation
-// at the moment it's actually about to happen, not just silent action.
-func deploy(baseURL string, args []string) error {
-	yes := false
+// buildCmd just builds the image(s) a Compose file's build: services need
+// — no scheduling, no containers started — for pre-warming an image or
+// checking a build succeeds independent of being ready to deploy.
+// --no-cache forces a full rebuild even if nothing in the build context
+// looks different to Docker's cache; --service scopes to one service's
+// dependency closure the same way deploy/plan do, though only the
+// build: services within that closure actually get built.
+func buildCmd(baseURL string, args []string) error {
+	noCache := false
+	onlyService := ""
 	var rest []string
-	for _, a := range args {
-		if a == "--yes" || a == "-y" {
-			yes = true
-			continue
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--no-cache":
+			noCache = true
+		case "--service":
+			i++
+			if i >= len(args) {
+				return fmt.Errorf("--service requires a value")
+			}
+			onlyService = args[i]
+		default:
+			rest = append(rest, args[i])
 		}
-		rest = append(rest, a)
 	}
 	if len(rest) != 2 {
-		return fmt.Errorf("usage: hacoctl deploy <project> <docker-compose.yml> [--yes]")
+		return fmt.Errorf("usage: hacoctl build <project> <docker-compose.yml> [--no-cache] [--service <name>]")
 	}
 	project, file := rest[0], rest[1]
 
@@ -286,7 +342,56 @@ func deploy(baseURL string, args []string) error {
 		return err
 	}
 
-	if planned, err := fetchPlan(baseURL, project, workingDir, yaml); err == nil {
+	body, _ := json.Marshal(map[string]any{
+		"project":      project,
+		"working_dir":  workingDir,
+		"yaml":         string(yaml),
+		"no_cache":     noCache,
+		"only_service": onlyService,
+	})
+	return post(baseURL, "/v1/compose/build", body)
+}
+
+// deploy dry-run plans first so it can ask for explicit consent before a
+// pinned workload with x-haco-allow-fresh-volume gets rescheduled onto a
+// brand-new, empty volume — that's a data-loss trade-off the user opted a
+// service into ahead of time, but it still deserves a live confirmation
+// at the moment it's actually about to happen, not just silent action.
+func deploy(baseURL string, args []string) error {
+	yes, noCache := false, false
+	onlyService := ""
+	var rest []string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--yes", "-y":
+			yes = true
+		case "--no-cache":
+			noCache = true
+		case "--service":
+			i++
+			if i >= len(args) {
+				return fmt.Errorf("--service requires a value")
+			}
+			onlyService = args[i]
+		default:
+			rest = append(rest, args[i])
+		}
+	}
+	if len(rest) != 2 {
+		return fmt.Errorf("usage: hacoctl deploy <project> <docker-compose.yml> [--yes] [--no-cache] [--service <name>]")
+	}
+	project, file := rest[0], rest[1]
+
+	yaml, err := os.ReadFile(file)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", file, err)
+	}
+	workingDir, err := filepath.Abs(filepath.Dir(file))
+	if err != nil {
+		return err
+	}
+
+	if planned, err := fetchPlan(baseURL, project, workingDir, yaml, onlyService); err == nil {
 		if warnings := freshVolumeWarnings(planned); len(warnings) > 0 {
 			fmt.Println("WARNING: the following pinned services will get a brand-new, empty volume — data on their current node will NOT be migrated:")
 			for service, msgs := range warnings {
@@ -302,10 +407,12 @@ func deploy(baseURL string, args []string) error {
 	// A plan fetch failure here (e.g. nothing schedulable yet) isn't fatal
 	// to the consent check — deploy below will surface the real error.
 
-	body, _ := json.Marshal(map[string]string{
-		"project":     project,
-		"working_dir": workingDir,
-		"yaml":        string(yaml),
+	body, _ := json.Marshal(map[string]any{
+		"project":      project,
+		"working_dir":  workingDir,
+		"yaml":         string(yaml),
+		"no_cache":     noCache,
+		"only_service": onlyService,
 	})
 	return post(baseURL, "/v1/compose/deploy", body)
 }
@@ -333,6 +440,9 @@ func renderPlanTable(project string, v planView) {
 		if wl.Storage.PinnedNodeID != "" {
 			storage = fmt.Sprintf("%s (pinned: %s)", storage, wl.Storage.PinnedNodeID)
 		}
+		if wl.Constraints.PinnedNodeID != "" {
+			storage = fmt.Sprintf("%s (host-pinned: %s)", storage, wl.Constraints.PinnedNodeID)
+		}
 		ports := make([]string, len(wl.Constraints.HostPorts))
 		for i, p := range wl.Constraints.HostPorts {
 			ports[i] = strconv.Itoa(p)
@@ -344,7 +454,7 @@ func renderPlanTable(project string, v planView) {
 			d := v.Decisions[idx]
 			if d.Selected != "" {
 				node = d.Selected
-				if wl.Storage.PinnedNodeID != "" {
+				if wl.Storage.PinnedNodeID != "" || wl.Constraints.PinnedNodeID != "" {
 					why = "pinned"
 				} else if len(d.Scores) > 0 {
 					sort.Slice(d.Scores, func(i, j int) bool { return d.Scores[i].Total > d.Scores[j].Total })
@@ -441,14 +551,24 @@ func workloads(baseURL string, args []string) error {
 }
 
 // containers is a join view over workloads + nodes: which container is
-// running where, derived entirely from existing data (no new storage).
+// actually running where, derived entirely from existing data (no new
+// storage). Stopped/failed workloads have no live container, so they're
+// filtered out here — hacoctl workloads keeps the full history including
+// those.
 func containers(baseURL string, args []string) error {
 	if len(args) != 0 {
 		return fmt.Errorf("usage: hacoctl containers")
 	}
-	var w []workloadRecordView
-	if err := fetchJSON(baseURL, "/v1/workloads", &w); err != nil {
+	var all []workloadRecordView
+	if err := fetchJSON(baseURL, "/v1/workloads", &all); err != nil {
 		return err
+	}
+	w := make([]workloadRecordView, 0, len(all))
+	for _, rec := range all {
+		if rec.Status == "stopped" || rec.Status == "failed" {
+			continue
+		}
+		w = append(w, rec)
 	}
 	if len(w) == 0 {
 		fmt.Println("no containers")
@@ -513,9 +633,23 @@ func nodes(baseURL string) error {
 
 // nodeDetail prints one node's full detail; there's no dedicated
 // single-node endpoint yet, so this filters the existing node list.
+// node dispatches `hacoctl node <id>` (detail) and the cordon/uncordon
+// subcommands — kept under one verb since they all operate on "a node",
+// the same way `hacoctl node <id>` already reads as "this node".
+func node(baseURL string, args []string) error {
+	switch {
+	case len(args) == 2 && args[0] == "cordon":
+		return post(baseURL, "/v1/admin/nodes/"+neturl.PathEscape(args[1])+"/cordon", []byte(`{}`))
+	case len(args) == 2 && args[0] == "uncordon":
+		return post(baseURL, "/v1/admin/nodes/"+neturl.PathEscape(args[1])+"/uncordon", []byte(`{}`))
+	default:
+		return nodeDetail(baseURL, args)
+	}
+}
+
 func nodeDetail(baseURL string, args []string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("usage: hacoctl node <id>")
+		return fmt.Errorf("usage: hacoctl node <id> | hacoctl node cordon|uncordon <id>")
 	}
 	var nodes []nodeView
 	if err := fetchJSON(baseURL, "/v1/nodes", &nodes); err != nil {
@@ -595,21 +729,23 @@ func status(baseURL string, args []string) error {
 	return get(baseURL, "/v1/workloads/"+args[0]+"/"+args[1]+"/"+args[2])
 }
 
-// teardown stops every workload (so agents remove their containers) and
-// revokes every node's agent credential — the "start completely clean
-// again" command, built from the existing per-workload stop and
-// per-node revoke endpoints rather than a new bulk server-side operation.
-func teardown(baseURL string, args []string) error {
+// stopContainers stops every workload (so each agent removes its
+// container) without touching node credentials — the "clear the board but
+// keep nodes joined" command. teardown below reuses it as its first half.
+func stopContainers(baseURL string, args []string) error {
 	yes := false
 	for _, a := range args {
 		if a == "--yes" || a == "-y" {
 			yes = true
 		}
 	}
-	if !yes && !confirm("This will stop EVERY workload and revoke EVERY node's credential. Continue?") {
-		return fmt.Errorf("teardown aborted")
+	if !yes && !confirm("This will stop EVERY workload's container. Continue?") {
+		return fmt.Errorf("aborted")
 	}
+	return stopAllWorkloads(baseURL)
+}
 
+func stopAllWorkloads(baseURL string) error {
 	var wl []workloadRecordView
 	if err := fetchJSON(baseURL, "/v1/workloads", &wl); err != nil {
 		return fmt.Errorf("list workloads: %w", err)
@@ -626,8 +762,29 @@ func teardown(baseURL string, args []string) error {
 		}
 		fmt.Printf("stopped %s/%s/%s\n", w.Project, w.Service, w.Revision)
 	}
+	return nil
+}
 
-	own := envOr("HACO_HOST_NODE_ID", agent.DefaultHostNodeID())
+// teardown stops every workload (so agents remove their containers) and
+// revokes every node's agent credential — the "start completely clean
+// again" command, built from the existing per-workload stop and
+// per-node revoke endpoints rather than a new bulk server-side operation.
+func teardown(baseURL string, args []string) error {
+	yes := false
+	for _, a := range args {
+		if a == "--yes" || a == "-y" {
+			yes = true
+		}
+	}
+	if !yes && !confirm("This will stop EVERY workload and revoke EVERY node's credential. Continue?") {
+		return fmt.Errorf("teardown aborted")
+	}
+
+	if err := stopAllWorkloads(baseURL); err != nil {
+		return err
+	}
+
+	own := agent.HostNodeID()
 	var nodeList []nodeView
 	if err := fetchJSON(baseURL, "/v1/nodes", &nodeList); err != nil {
 		return fmt.Errorf("list nodes: %w", err)
@@ -644,6 +801,153 @@ func teardown(baseURL string, args []string) error {
 		fmt.Printf("revoked %s\n", n.ID)
 	}
 	return nil
+}
+
+// start launches the control-plane binary (found next to hacoctl, in
+// $PATH, or via HACO_CONTROLPLANE_BIN) so standing up a node doesn't
+// require knowing about a separate `controlplane` binary at all. It
+// no-ops if the control plane is already reachable, and by default
+// detaches into the background with its own log file; --foreground
+// runs it attached to this terminal instead. It also defaults the local
+// build/push registry on (HACO_REGISTRY_ADDR=auto) unless the caller
+// already set HACO_REGISTRY_ADDR or passed --no-registry, so a `build:`
+// service in a compose file works without that env var being set by hand
+// every time.
+func start(baseURL string, args []string) error {
+	foreground, registry := false, true
+	for _, a := range args {
+		switch a {
+		case "--foreground", "-f":
+			foreground = true
+		case "--no-registry":
+			registry = false
+		}
+	}
+
+	if controlPlaneUp(baseURL) {
+		fmt.Printf("control plane already running at %s\n", baseURL)
+		return nil
+	}
+
+	bin, err := controlPlaneBinary()
+	if err != nil {
+		return err
+	}
+
+	env := os.Environ()
+	if registry && os.Getenv("HACO_REGISTRY_ADDR") == "" {
+		env = append(env, "HACO_REGISTRY_ADDR=auto")
+	}
+
+	if foreground {
+		cmd := exec.Command(bin)
+		cmd.Env = env
+		cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
+		return cmd.Run()
+	}
+
+	dataDir := envOr("HACO_DATA_DIR", filepath.Join(homeDir(), ".haco"))
+	if err := os.MkdirAll(dataDir, 0o700); err != nil {
+		return fmt.Errorf("create data dir: %w", err)
+	}
+	logPath := filepath.Join(dataDir, "controlplane.log")
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return fmt.Errorf("open log file: %w", err)
+	}
+	defer logFile.Close()
+
+	cmd := exec.Command(bin)
+	cmd.Env = env
+	cmd.Stdout, cmd.Stderr = logFile, logFile
+	// Detach into its own session so it survives this process exiting,
+	// the same way `nohup ... &` would.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start control plane: %w", err)
+	}
+	pid := cmd.Process.Pid
+	pidPath := filepath.Join(dataDir, "controlplane.pid")
+	if err := os.WriteFile(pidPath, []byte(strconv.Itoa(pid)), 0o644); err != nil {
+		fmt.Printf("warning: write pid file: %v\n", err)
+	}
+	_ = cmd.Process.Release()
+	fmt.Printf("control plane starting (pid %d), logs: %s\n", pid, logPath)
+
+	for i := 0; i < 20; i++ {
+		if controlPlaneUp(baseURL) {
+			fmt.Printf("control plane ready at %s\n", baseURL)
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("control plane did not become ready within 10s; check %s", logPath)
+}
+
+// stopAll stops the background control-plane process `start` launched,
+// using the pid file it wrote — the counterpart to `start`, distinct from
+// `stop` (which stops one workload) and `teardown` (which stops workloads
+// and revokes nodes but leaves the control plane itself running).
+func stopAll(args []string) error {
+	dataDir := envOr("HACO_DATA_DIR", filepath.Join(homeDir(), ".haco"))
+	pidPath := filepath.Join(dataDir, "controlplane.pid")
+
+	data, err := os.ReadFile(pidPath)
+	if err != nil {
+		return fmt.Errorf("no pid file at %s (was the control plane started with `hacoctl start`?): %w", pidPath, err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return fmt.Errorf("invalid pid file %s: %w", pidPath, err)
+	}
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	if err := proc.Signal(syscall.SIGTERM); err != nil {
+		return fmt.Errorf("stop control plane (pid %d): %w", pid, err)
+	}
+	_ = os.Remove(pidPath)
+	fmt.Printf("control plane stopped (pid %d)\n", pid)
+	return nil
+}
+
+func controlPlaneUp(baseURL string) bool {
+	client := http.Client{Timeout: time.Second}
+	resp, err := client.Get(baseURL + "/v1/nodes")
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode < 500
+}
+
+// controlPlaneBinary finds the controlplane executable: next to hacoctl's
+// own binary (the common case after install.sh, or a `go build` into the
+// same bin/ directory), then $PATH, so `hacoctl start` needs no separate
+// knowledge of where it lives.
+func controlPlaneBinary() (string, error) {
+	if p := os.Getenv("HACO_CONTROLPLANE_BIN"); p != "" {
+		return p, nil
+	}
+	if exe, err := os.Executable(); err == nil {
+		candidate := filepath.Join(filepath.Dir(exe), "controlplane")
+		if _, statErr := os.Stat(candidate); statErr == nil {
+			return candidate, nil
+		}
+	}
+	if p, err := exec.LookPath("controlplane"); err == nil {
+		return p, nil
+	}
+	return "", fmt.Errorf("controlplane binary not found next to hacoctl or in PATH (set HACO_CONTROLPLANE_BIN)")
+}
+
+func homeDir() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "."
+	}
+	return home
 }
 
 // postQuiet is post without pretty-printing the response body — used in
@@ -703,6 +1007,18 @@ func get(baseURL, path string) error {
 
 func post(baseURL, path string, body []byte) error {
 	resp, err := http.Post(baseURL+path, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	return printResponse(resp)
+}
+
+func del(baseURL, path string) error {
+	req, err := http.NewRequest(http.MethodDelete, baseURL+path, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}

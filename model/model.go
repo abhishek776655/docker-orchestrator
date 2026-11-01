@@ -41,7 +41,14 @@ type Node struct {
 	Capabilities map[string]bool
 	Allocatable  Resources
 	Availability Availability
-	HeartbeatAt  time.Time
+	// DisabledByAdmin is true once an operator has cordoned this node
+	// (POST .../cordon), independent of heartbeat-driven Availability — so
+	// a heartbeat or re-registration never silently un-cordons it. The
+	// scheduler needs no separate check for this: cordoning also sets
+	// Availability to Disabled, which the existing "!= Available" hard
+	// filter already excludes.
+	DisabledByAdmin bool
+	HeartbeatAt     time.Time
 	// GPUs is empty on a node with no GPU, or where GPU telemetry isn't
 	// available — both look identical to the scheduler (SRS §9.2/§9.4).
 	GPUs []GPU
@@ -108,6 +115,12 @@ type Constraints struct {
 	RequiredCapabilities []string
 	HostPorts            []int
 	GPU                  GPURequirement
+
+	// PinnedNodeID is a general node-affinity hard requirement, independent
+	// of StoragePolicy.PinnedNodeID (which is specifically about
+	// persistent-volume data locality and participates in the fresh-volume
+	// reschedule waiver). Empty means no affinity.
+	PinnedNodeID string
 }
 
 // Workload is a normalized placement request (SRS 12.1).
@@ -116,6 +129,14 @@ type Workload struct {
 	Service  string
 	Revision string
 	Image    string
+	// SkipPull is set by the control plane when Image was built locally
+	// with no registry configured (registry-optional builds): such an
+	// image was never pushed anywhere and has no registry prefix, so a
+	// pull would always fail even though the image already exists on this
+	// agent's own Docker daemon. False for every normally-pulled image,
+	// including a registry-pushed build, where a pull must still happen
+	// to pick up a newer build under the same mutable tag.
+	SkipPull bool
 	// Command overrides the image's default entrypoint arguments when
 	// non-empty (e.g. telling an app to listen on the specific host port
 	// this workload was assigned, given the M2/M3 1:1 host-port
