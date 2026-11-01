@@ -51,7 +51,7 @@ func (s *Service) Registry() string { return s.registry }
 // already exists locally (e.g. source changed but the Dockerfile/context
 // hash alone wouldn't tell Docker that).
 func (s *Service) Build(ctx context.Context, project, revision string, spec compose.BuildSpec, noCache bool) (string, error) {
-	tarball, err := tarContext(spec.Context)
+	tarball, err := TarContext(spec.Context)
 	if err != nil {
 		return "", fmt.Errorf("package build context: %w", err)
 	}
@@ -150,9 +150,14 @@ func validateImagePlatform(image types.ImageInspect, requested string) error {
 	return nil
 }
 
-// tarContext packages a build context directory as the tar stream the
-// Docker Engine API build endpoint expects.
-func tarContext(dir string) (io.Reader, error) {
+// TarContext packages a build context directory as the tar stream the
+// Docker Engine API build endpoint expects. Exported so the control plane
+// can package a build context once and ship the resulting bytes to a
+// remote agent to build there itself (registry-optional builds,
+// multi-machine case) — this function does pure local file I/O, no Docker
+// client needed, so a control plane with no Docker at all can still do
+// this part.
+func TarContext(dir string) (io.Reader, error) {
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
 

@@ -97,7 +97,7 @@ func usage() {
 
 Usage:
   hacoctl build  <project> <docker-compose.yml>   just build the build: service images, no scheduling or containers (--no-cache forces a full rebuild; --service <name> scopes to that service's dependencies)
-  hacoctl deploy <project> <docker-compose.yml>   build, schedule, and run a Compose project (prompts if a pinned service needs a fresh volume; --yes skips it; --no-cache forces a full rebuild; --service <name> deploys only that service and its dependencies)
+  hacoctl deploy <project> <docker-compose.yml>   build, schedule, and run a Compose project, then show a live status table until every workload is ready/failed/stopped (like 'docker compose up -d'); prompts if a pinned service needs a fresh volume (--yes skips it); --no-cache forces a full rebuild; --service <name> deploys only that service and its dependencies
   hacoctl plan   <project> <docker-compose.yml>   dry-run the same, no side effects (table; add --json for raw; --service <name> to scope the same way)
   hacoctl status <project> <service> <revision>   one workload's current status
   hacoctl logs   <project> <service> <revision>   latest captured container log tail
@@ -414,7 +414,122 @@ func deploy(baseURL string, args []string) error {
 		"no_cache":     noCache,
 		"only_service": onlyService,
 	})
-	return post(baseURL, "/v1/compose/deploy", body)
+	return deployAndWatch(baseURL, project, body)
+}
+
+// deployResponse is the shape of POST /v1/compose/deploy's body, enough to
+// pull out which workloads it actually submitted — the live-status table
+// below follows those (and only those), the same set `--service` scoped.
+type deployResponse struct {
+	Results []struct {
+		Workload *struct {
+			Project  string `json:"Project"`
+			Service  string `json:"Service"`
+			Revision string `json:"Revision"`
+		} `json:"Workload"`
+	} `json:"results"`
+}
+
+// deployAndWatch submits the deploy, then — like `docker compose up -d` —
+// switches into a live, in-place-redrawn table of each submitted
+// workload's status until every one reaches a terminal state (ready,
+// failed, stopped) or the watch times out. Falls back to the old raw-JSON
+// dump if the response doesn't parse as expected or submitted nothing.
+func deployAndWatch(baseURL, project string, body []byte) error {
+	resp, err := http.Post(baseURL+"/v1/compose/deploy", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	if resp.StatusCode >= 300 {
+		var pretty bytes.Buffer
+		if json.Indent(&pretty, data, "", "  ") == nil {
+			fmt.Println(pretty.String())
+		} else {
+			fmt.Println(string(data))
+		}
+		return fmt.Errorf("control plane returned %s", resp.Status)
+	}
+
+	var dr deployResponse
+	var keys []string
+	if json.Unmarshal(data, &dr) == nil {
+		for _, r := range dr.Results {
+			if r.Workload != nil {
+				keys = append(keys, r.Workload.Project+"/"+r.Workload.Service+"/"+r.Workload.Revision)
+			}
+		}
+	}
+	if len(keys) == 0 {
+		var pretty bytes.Buffer
+		if json.Indent(&pretty, data, "", "  ") == nil {
+			fmt.Println(pretty.String())
+		} else {
+			fmt.Println(string(data))
+		}
+		return nil
+	}
+	return watchDeploy(baseURL, project, keys)
+}
+
+// terminalStatuses are the states watchDeploy stops waiting on — once
+// every submitted workload reaches one of these, the deploy is done
+// (successfully or not); anything else (assigned, pulling, building,
+// starting, running, waiting_dependencies) is still in progress.
+var terminalStatuses = map[string]bool{"ready": true, "failed": true, "stopped": true}
+
+func watchDeploy(baseURL, project string, keys []string) error {
+	sort.Strings(keys)
+	deadline := time.Now().Add(2 * time.Minute)
+	lastLines := 0
+
+	for {
+		var all []workloadRecordView
+		if err := fetchJSON(baseURL, "/v1/workloads?project="+neturl.QueryEscape(project), &all); err != nil {
+			return err
+		}
+		byKey := make(map[string]workloadRecordView, len(all))
+		for _, w := range all {
+			byKey[w.Project+"/"+w.Service+"/"+w.Revision] = w
+		}
+
+		var buf bytes.Buffer
+		tw := tabwriter.NewWriter(&buf, 0, 2, 2, ' ', 0)
+		fmt.Fprintln(tw, "SERVICE\tNODE\tSTATUS\tREASON")
+		done := true
+		for _, key := range keys {
+			service := strings.SplitN(key, "/", 3)[1]
+			node, status, reason := "-", "pending", "-"
+			if w, ok := byKey[key]; ok {
+				node, status, reason = orDash(w.NodeID), w.Status, orDash(w.StatusReason)
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", service, node, status, reason)
+			if !terminalStatuses[status] {
+				done = false
+			}
+		}
+		tw.Flush()
+
+		if lastLines > 0 {
+			fmt.Printf("\033[%dA\033[J", lastLines)
+		}
+		fmt.Print(buf.String())
+		lastLines = strings.Count(buf.String(), "\n")
+
+		if done {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			fmt.Println("(timed out waiting for all workloads to reach a terminal state; check `hacoctl workloads` for current status)")
+			return nil
+		}
+		time.Sleep(time.Second)
+	}
 }
 
 func confirm(prompt string) bool {

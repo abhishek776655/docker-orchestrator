@@ -89,6 +89,15 @@ type GPURequirement struct {
 	VRAMBytes int64
 }
 
+// RemoteBuildSpec is the subset of compose.BuildSpec an agent needs to
+// build an image itself, once it has the tarball — a self-contained copy
+// rather than a model dependency on the compose package.
+type RemoteBuildSpec struct {
+	Dockerfile string            `json:"dockerfile"`
+	Args       map[string]string `json:"args"`
+	Platform   string            `json:"platform"`
+}
+
 // StoragePolicy pins a workload to a node when it owns node-local
 // persistent state (SRS 10.2): the scheduler must never place such a
 // workload anywhere but PinnedNodeID.
@@ -137,6 +146,17 @@ type Workload struct {
 	// including a registry-pushed build, where a pull must still happen
 	// to pick up a newer build under the same mutable tag.
 	SkipPull bool
+	// RemoteBuild, when non-nil, tells the agent to build Image itself from
+	// a build-context tarball it fetches from the control plane, instead of
+	// pulling it — registry-optional builds, multi-machine case: this
+	// workload was scheduled onto a node other than the control plane's own
+	// host, so there is no way to get the image there except building it on
+	// that node directly (no registry, and the image was never built
+	// centrally). nil for every other workload, including a
+	// local-only-built one that stays on the control-plane host (SkipPull
+	// alone covers that case — no network transfer needed since it's the
+	// same Docker daemon that built it).
+	RemoteBuild *RemoteBuildSpec
 	// Command overrides the image's default entrypoint arguments when
 	// non-empty (e.g. telling an app to listen on the specific host port
 	// this workload was assigned, given the M2/M3 1:1 host-port
@@ -166,6 +186,13 @@ type Workload struct {
 type VolumeMount struct {
 	ContainerPath string `json:"container_path"`
 	ReadOnly      bool   `json:"read_only"`
+	// HostPath, when non-empty, is a literal absolute path on the node's
+	// own filesystem to bind-mount directly — a source-code live-mount
+	// (x-haco-bind-host-path), as opposed to the normal case (empty) where
+	// the agent manages its own directory for this mount. Only correct
+	// when the workload is pinned to the same machine this path was
+	// resolved on; compose.go enforces that at plan time.
+	HostPath string `json:"host_path,omitempty"`
 }
 
 // DesiredState is the controller's intent for a workload, independent of
@@ -186,6 +213,11 @@ const (
 	StatusPending  Status = "pending"
 	StatusAssigned Status = "assigned"
 	StatusPulling  Status = "pulling"
+	// StatusBuilding is StatusPulling's counterpart for a RemoteBuild
+	// workload: the agent is fetching its build context and building the
+	// image itself instead of pulling one (registry-optional builds,
+	// multi-machine case).
+	StatusBuilding Status = "building"
 	StatusStarting Status = "starting"
 	StatusRunning  Status = "running"
 	StatusReady    Status = "ready"

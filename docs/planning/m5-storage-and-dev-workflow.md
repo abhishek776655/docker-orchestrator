@@ -14,16 +14,23 @@ be flagged until supported" — and FR-020 is a SHOULD, not a MUST). M5
 spends its effort on the safety-critical half (persistent storage) instead.
 
 Update (post-roadmap item 4/5 era): a bind mount is no longer rejected
-outright. The M4 Compose importer now treats a bind mount's host path as
-ignored and manages it exactly like a named volume (node-local, pinned) —
-correct for a data directory meant to start empty, which satisfies "flagged
-until supported" for that case by making it behave safely rather than by
-refusing it. A *source-code* bind mount (live-reloading code from the
-literal host path) still isn't honored — that needs the literal path
-preserved (a `model.VolumeMount.HostPath` field and a real bind branch in
-`agent.Docker.prepareVolumes`), which is real file-watching source-sync and
-remains **not implemented**, left for a later milestone — a recorded
-decision, not a silent gap.
+outright. The M4 Compose importer now treats a plain bind mount's host
+path as ignored and manages it exactly like a named volume (node-local,
+pinned) — correct for a data directory meant to start empty, which
+satisfies "flagged until supported" for that case by making it behave
+safely rather than by refusing it.
+
+A *source-code* bind mount (live-reloading code from the literal host
+path) is now also supported, opt-in via `x-haco-bind-host-path: true` on
+the service: `model.VolumeMount.HostPath` carries the literal, validated
+absolute path through to `agent.Docker.prepareVolumes`, which bind-mounts
+it directly instead of substituting a managed directory. This is not full
+file-watching source-sync (no remote rsync, no watching a path on a
+*different* machine than the control plane) — it only works when the
+workload is pinned to the control-plane's own host, enforced as a hard
+plan-time rejection otherwise (conflicting `x-haco-pin-node`,
+`x-haco-place-anywhere`, or a host path that doesn't exist). Genuine
+cross-machine source-sync remains **not implemented**.
 
 ## Implemented
 
@@ -71,8 +78,10 @@ decision, not a silent gap.
 - No disk-quota enforcement, only a >90%-full warning after the fact.
 - No shared/replicated storage classes (SRS §10.1 "Shared persistent" and
   "Replicated/application-managed" remain explicitly future capabilities).
-- Source-sync for dev-mode bind mounts: not implemented, deferred per the
-  scope decision above.
+- Cross-machine source-sync for dev-mode bind mounts: not implemented.
+  Single-machine live-mount (`x-haco-bind-host-path`) is supported — see
+  the scope decision above — but there's no mechanism to sync or watch a
+  path that lives on a different machine than the control plane.
 - A node-local volume's data cannot migrate to another node automatically —
   by design (SRS: no writer on a different node without verified data
   access); see the backup/restore doc for the manual path.

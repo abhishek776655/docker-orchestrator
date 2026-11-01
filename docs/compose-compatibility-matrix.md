@@ -10,8 +10,10 @@
 | `depends_on` conditions | Supported | Validate graph and gate readiness |
 | `healthcheck` | Supported | Warn for obvious placeholder checks |
 | named volumes | Supported with policy | Node-local by default; creates affinity |
-| bind mounts (data dirs) | Supported with policy | Host path is ignored and treated as a managed node-local volume, same as a named volume — correct for a data directory meant to start empty, since it's never read back |
-| bind mounts (source-code live-mount) | Not implemented | Honoring the literal host path (for live code reload) needs a dedicated feature, not yet built |
+| bind mounts (single-file source) | Supported, automatic | A bind mount whose source is an existing file (not a directory) always honors the literal host path — there's no sensible "managed empty file" substitute, so this is never ambiguous and needs no flag |
+| bind mounts (build-context source) | Supported, automatic | A bind mount whose source is (or is inside) any service's build context — anywhere in the file, including a different service's — is inferred as a source-code live-mount and honors the literal host path, same as `x-haco-bind-host-path` |
+| bind mounts (other directory, source-code live-mount) | Supported via `x-haco-bind-host-path: true` | Honors the literal host path (live code reload) for a directory the two automatic cases above don't catch (e.g. a shared-library or init-scripts directory that isn't any service's build context); only works when the service is pinned to the control-plane's own host machine, enforced at plan time |
+| bind mounts (other directory, data dir) | Supported with policy | Host path is ignored and treated as a managed node-local volume, same as a named volume — correct for a data directory meant to start empty, since it's never read back |
 | `networks` | Supported as logical membership | Maps to discovery/connectivity policy |
 | `secrets` | Supported | Deliver through protected secret handling |
 | CPU/memory limits | Supported | Translate according to approved semantics |

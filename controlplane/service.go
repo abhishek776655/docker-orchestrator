@@ -6,10 +6,11 @@ package controlplane
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/abhishek/hardware-aware-container-orchestrator/agent"
 	"github.com/abhishek/hardware-aware-container-orchestrator/build"
 	"github.com/abhishek/hardware-aware-container-orchestrator/compose"
 	"github.com/abhishek/hardware-aware-container-orchestrator/model"
@@ -24,6 +25,16 @@ type Service struct {
 	store       *store.Store
 	builder     *build.Service // nil disables build-based deploys (image-only workloads still work)
 	joinManager *JoinManager
+
+	// buildContexts holds a tarball per workload key for registry-optional
+	// builds scheduled onto a node other than this control plane's own
+	// host (RemoteBuild on the workload): there's no registry to pull from,
+	// so the target agent fetches its build context from here and builds
+	// the image itself. In-memory only, matching this project's single
+	// control-plane-process design — a restart between deploy and the
+	// agent's fetch would mean redeploying, an accepted limitation.
+	buildContextsMu sync.Mutex
+	buildContexts   map[string][]byte
 }
 
 func New(s *store.Store) *Service { return &Service{store: s} }
@@ -49,7 +60,6 @@ func (svc *Service) ComposePlan(ctx context.Context, project, workingDir string,
 	if err != nil {
 		return nil, nil, err
 	}
-	plan.Rejections = append(plan.Rejections, svc.localBuildPlacementProblems(plan)...)
 	if !plan.Valid() {
 		return plan, nil, nil
 	}
@@ -105,40 +115,6 @@ func filterToClosure(plan *compose.Plan, onlyService string) (*compose.Plan, err
 		}
 	}
 	return &filtered, nil
-}
-
-// localBuildPlacementProblems catches, at plan time (before any build is
-// attempted), a `build:` service that can't actually run: with no registry
-// configured (svc.builder.Registry() == ""), a built image only exists on
-// this control plane's own Docker daemon, so the service must be
-// guaranteed to land there — pinned via x-haco-pin-host, x-haco-pin-node
-// to this host, or (for a stateful service) the new default host pin.
-// Anything else would build successfully and then fail scheduling, or
-// worse, schedule onto a node whose agent can never pull the image.
-func (svc *Service) localBuildPlacementProblems(plan *compose.Plan) []string {
-	if plan == nil || len(plan.Builds) == 0 || svc.builder == nil || svc.builder.Registry() != "" {
-		return nil
-	}
-	host := agent.HostNodeID()
-	workloadByService := make(map[string]model.Workload, len(plan.Workloads))
-	for _, wl := range plan.Workloads {
-		workloadByService[wl.Service] = wl
-	}
-	var problems []string
-	for _, b := range plan.Builds {
-		wl, ok := workloadByService[b.Service]
-		if !ok {
-			continue
-		}
-		pinned := wl.Storage.PinnedNodeID
-		if pinned == "" {
-			pinned = wl.Constraints.PinnedNodeID
-		}
-		if pinned != host {
-			problems = append(problems, fmt.Sprintf("%s: no registry configured, so this build only runs on this control-plane host (%s); add x-haco-pin-host: true to this service (or configure HACO_REGISTRY_ADDR)", b.Service, host))
-		}
-	}
-	return problems
 }
 
 // dryRunSchedule schedules every workload in order against a single
@@ -215,9 +191,6 @@ func (svc *Service) ComposeDeploy(ctx context.Context, project, workingDir strin
 	if !plan.Networking.Supported {
 		return plan, nil, fmt.Errorf("compose plan recommends %s networking, which is not provisioned yet: %s", plan.Networking.Mode, strings.Join(plan.Networking.Reasons, "; "))
 	}
-	if problems := svc.localBuildPlacementProblems(plan); len(problems) > 0 {
-		return plan, nil, fmt.Errorf("%s", strings.Join(problems, "; "))
-	}
 	if opts.OnlyService != "" {
 		plan, err = filterToClosure(plan, opts.OnlyService)
 		if err != nil {
@@ -225,17 +198,19 @@ func (svc *Service) ComposeDeploy(ctx context.Context, project, workingDir strin
 		}
 	}
 
-	builtImages, err := svc.buildImages(ctx, project, plan, opts.NoCache)
+	images, remoteBuilds, err := svc.resolveBuilds(ctx, project, plan, opts.NoCache)
 	if err != nil {
 		return plan, nil, err
 	}
 
-	localOnly := svc.builder != nil && svc.builder.Registry() == ""
 	var results []*SubmitResult
 	for _, wl := range plan.Workloads {
-		if ref, ok := builtImages[wl.Service]; ok {
+		if ref, ok := images[wl.Service]; ok {
 			wl.Image = ref
-			wl.SkipPull = localOnly
+			if rb, ok := remoteBuilds[wl.Service]; ok {
+				wl.RemoteBuild = rb
+				wl.SkipPull = true
+			}
 		}
 		result, err := svc.Submit(ctx, wl)
 		results = append(results, result)
@@ -246,10 +221,85 @@ func (svc *Service) ComposeDeploy(ctx context.Context, project, workingDir strin
 	return plan, results, nil
 }
 
-// buildImages builds every build: service in plan (e.g. the one surfaced
-// by a prior filterToClosure) and returns each one's resulting image ref,
-// keyed by service name. Shared by ComposeDeploy (build then schedule) and
-// ComposeBuild (build only).
+// resolveBuilds determines each build: service's final image reference.
+// With a registry configured, it builds and pushes centrally now (as
+// before) so any node can pull it. With no registry, an image can only
+// ever run on whichever Docker daemon actually builds it, so instead of
+// building here it packages the build context now and attaches a
+// RemoteBuildSpec to that service's workload: whichever agent the
+// scheduler assigns it to fetches the context and builds the image itself,
+// right before first use (registry-optional builds, multi-machine case —
+// this needs no Docker access on the control plane at all, since
+// build.TarContext is pure file I/O).
+func (svc *Service) resolveBuilds(ctx context.Context, project string, plan *compose.Plan, noCache bool) (map[string]string, map[string]*model.RemoteBuildSpec, error) {
+	images := map[string]string{}
+	remote := map[string]*model.RemoteBuildSpec{}
+	if len(plan.Builds) == 0 {
+		return images, remote, nil
+	}
+	workloadByService := make(map[string]model.Workload, len(plan.Workloads))
+	for _, wl := range plan.Workloads {
+		workloadByService[wl.Service] = wl
+	}
+	registry := ""
+	if svc.builder != nil {
+		registry = svc.builder.Registry()
+	}
+	for _, b := range plan.Builds {
+		if registry != "" {
+			if svc.builder == nil {
+				return images, remote, fmt.Errorf("service %s requires a build but no builder is configured", b.Service)
+			}
+			ref, err := svc.builder.Build(ctx, project, "latest", b, noCache)
+			if err != nil {
+				return images, remote, fmt.Errorf("build %s: %w", b.Service, err)
+			}
+			images[b.Service] = ref
+			continue
+		}
+		wl, ok := workloadByService[b.Service]
+		if !ok {
+			continue
+		}
+		tarball, err := build.TarContext(b.Context)
+		if err != nil {
+			return images, remote, fmt.Errorf("package build context for %s: %w", b.Service, err)
+		}
+		data, err := io.ReadAll(tarball)
+		if err != nil {
+			return images, remote, fmt.Errorf("read build context for %s: %w", b.Service, err)
+		}
+		images[b.Service] = fmt.Sprintf("%s-%s:%s", project, b.Service, wl.Revision)
+		remote[b.Service] = &model.RemoteBuildSpec{Dockerfile: b.Dockerfile, Args: b.Args, Platform: b.Platform}
+		svc.stashBuildContext(wl.Key(), data)
+	}
+	return images, remote, nil
+}
+
+// stashBuildContext holds a build-context tarball for an agent to fetch
+// (see Service.buildContexts' doc comment for why this is in-memory only).
+func (svc *Service) stashBuildContext(key string, tarball []byte) {
+	svc.buildContextsMu.Lock()
+	defer svc.buildContextsMu.Unlock()
+	if svc.buildContexts == nil {
+		svc.buildContexts = map[string][]byte{}
+	}
+	svc.buildContexts[key] = tarball
+}
+
+// FetchBuildContext returns the tarball stashed for a workload key, for
+// the agent-facing endpoint that serves it to whichever node fetches it.
+func (svc *Service) FetchBuildContext(key string) ([]byte, bool) {
+	svc.buildContextsMu.Lock()
+	defer svc.buildContextsMu.Unlock()
+	data, ok := svc.buildContexts[key]
+	return data, ok
+}
+
+// buildImages builds every build: service in plan centrally and
+// immediately, regardless of registry/placement — used only by
+// ComposeBuild ("just build it now"), where there's no scheduling decision
+// to defer to, unlike resolveBuilds (used by ComposeDeploy).
 func (svc *Service) buildImages(ctx context.Context, project string, plan *compose.Plan, noCache bool) (map[string]string, error) {
 	built := map[string]string{}
 	for _, b := range plan.Builds {
@@ -283,9 +333,6 @@ func (svc *Service) ComposeBuild(ctx context.Context, project, workingDir string
 	}
 	if !plan.Valid() {
 		return plan, nil, fmt.Errorf("compose plan for %s has %d rejection(s)", project, len(plan.Rejections))
-	}
-	if problems := svc.localBuildPlacementProblems(plan); len(problems) > 0 {
-		return plan, nil, fmt.Errorf("%s", strings.Join(problems, "; "))
 	}
 	if opts.OnlyService != "" {
 		plan, err = filterToClosure(plan, opts.OnlyService)

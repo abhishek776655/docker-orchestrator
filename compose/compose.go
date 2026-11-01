@@ -103,10 +103,21 @@ func Load(ctx context.Context, project, workingDir string, yaml []byte) (*Plan, 
 	}
 	sort.Strings(names) // deterministic plan output regardless of map order
 
+	// Collected up front so convertService's bind-mount handling can check
+	// a mount's source against every service's build context, not just its
+	// own — a cross-service shared-library mount (service A bind-mounting
+	// service B's source tree) is still a build context, just not A's own.
+	var buildContexts []string
+	for _, name := range names {
+		if b := proj.Services[name].Build; b != nil && b.Context != "" {
+			buildContexts = append(buildContexts, b.Context)
+		}
+	}
+
 	for _, name := range names {
 		svc := proj.Services[name]
 		analyzeServicePorts(&plan.Networking, name, svc)
-		wl, build, warnings, rejections := convertService(project, workingDir, name, svc)
+		wl, build, warnings, rejections := convertService(project, workingDir, name, svc, buildContexts)
 		plan.Warnings = append(plan.Warnings, warnings...)
 		plan.Rejections = append(plan.Rejections, rejections...)
 		plan.Workloads = append(plan.Workloads, wl)
@@ -161,7 +172,7 @@ func recommendOverlay(networking *NetworkRecommendation, reason string) {
 	networking.Reasons = append(networking.Reasons, reason)
 }
 
-func convertService(project, workingDir, name string, svc types.ServiceConfig) (model.Workload, *BuildSpec, []string, []string) {
+func convertService(project, workingDir, name string, svc types.ServiceConfig, buildContexts []string) (model.Workload, *BuildSpec, []string, []string) {
 	var warnings, rejections []string
 	buildPlatform := "linux/amd64"
 	if _, ok := platformArch(svc.Platform); ok {
@@ -283,21 +294,58 @@ func convertService(project, workingDir, name string, svc types.ServiceConfig) (
 
 	pinHost, _ := svc.Extensions["x-haco-pin-host"].(bool)
 	placeAnywhere, _ := svc.Extensions["x-haco-place-anywhere"].(bool)
+	bindHostPath, _ := svc.Extensions["x-haco-bind-host-path"].(bool)
 
 	wl.Storage.Class = model.Ephemeral
 	for _, v := range svc.Volumes {
 		switch v.Type {
 		case "bind", "volume":
-			// A bind mount's host path (v.Source) is intentionally ignored
-			// here and treated exactly like a named volume: only v.Target
-			// (the container path) matters, and prepareVolumes creates and
-			// manages its own directory per (workload key, container path)
-			// regardless of how that path was declared in compose. That's
-			// correct for a data directory (mysql/postgres/redis/etc. are
-			// meant to start empty), but wrong for a source-code live-mount
-			// that needs the literal host path honored — that's a separate,
-			// larger feature (model.VolumeMount.HostPath + a real bind
-			// branch in agent/docker.go's prepareVolumes), not handled yet.
+			if v.Type == "bind" {
+				// Honoring the literal host path, in detection order —
+				// each check only applies when earlier ones didn't match:
+				//   1. Source is a single file: there's no sensible "managed
+				//      empty file" substitute, so this is never ambiguous and
+				//      needs no flag at all.
+				//   2. Source is a directory that IS (or is inside) some
+				//      service's build context — anywhere in the compose
+				//      file, not just this service's own — which is almost
+				//      always a source-code live-mount, including a
+				//      cross-service shared-library mount (service A
+				//      bind-mounting service B's source tree).
+				//   3. Explicit x-haco-bind-host-path: true — the manual
+				//      escape hatch for anything 1 and 2 don't catch (e.g. a
+				//      directory that isn't anyone's build context, like a
+				//      one-off init-scripts directory).
+				// Anything else falls through to the managed-volume default.
+				reason := ""
+				switch {
+				case isRegularFile(v.Source):
+					reason = "a bind mount whose source is a single file"
+				case matchesAnyBuildContext(v.Source, buildContexts):
+					reason = "a bind mount whose source is a service's build context"
+				case bindHostPath:
+					reason = "x-haco-bind-host-path"
+				}
+				if reason != "" {
+					storage, mount, probs := bindLiteralHostPath(name, reason, v, svc, placeAnywhere)
+					if len(probs) > 0 {
+						rejections = append(rejections, probs...)
+						continue
+					}
+					wl.Storage = storage
+					wl.Volumes = append(wl.Volumes, mount)
+					continue
+				}
+			}
+			// Otherwise, a bind mount's host path (v.Source) is
+			// intentionally ignored and it's treated exactly like a named
+			// volume: only v.Target (the container path) matters, and
+			// prepareVolumes creates and manages its own directory per
+			// (workload key, container path) regardless of how that path
+			// was declared in compose. Correct for a data directory
+			// (mysql/postgres/redis/etc. are meant to start empty);
+			// x-haco-bind-host-path above is the escape hatch when the
+			// literal path matters instead (a source-code live-mount).
 			//
 			// Node affinity, in priority order:
 			//   1. x-haco-pin-node: <id>      — explicit node, as before.
@@ -360,6 +408,75 @@ func convertService(project, workingDir, name string, svc types.ServiceConfig) (
 	}
 
 	return wl, build, warnings, rejections
+}
+
+// isRegularFile reports whether path is an existing, absolute path to a
+// (non-directory) file — the single-file bind-mount auto-detection.
+func isRegularFile(path string) bool {
+	if path == "" || !filepath.IsAbs(path) {
+		return false
+	}
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
+// matchesAnyBuildContext reports whether path is equal to, or a
+// subdirectory of, any entry in contexts — the cross-service build-context
+// bind-mount auto-detection. contexts is every service's build.context in
+// the whole compose file, not just the current service's own.
+func matchesAnyBuildContext(path string, contexts []string) bool {
+	if path == "" || !filepath.IsAbs(path) {
+		return false
+	}
+	clean := filepath.Clean(path)
+	for _, ctx := range contexts {
+		ctx = filepath.Clean(ctx)
+		if clean == ctx {
+			return true
+		}
+		if rel, err := filepath.Rel(ctx, clean); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+// bindLiteralHostPath honors a bind mount's literal host path instead of
+// substituting a managed directory — shared by the explicit
+// x-haco-bind-host-path escape hatch and the two automatic heuristics
+// above it in precedence. reason names which one fired, for the rejection
+// messages below. Only correct when the workload actually runs on this
+// control plane's own machine (the filesystem that path was resolved on),
+// so the pin is forced, not defaulted, and a conflicting x-haco-pin-node
+// or x-haco-place-anywhere is a plan-time rejection rather than silently
+// overridden.
+func bindLiteralHostPath(name, reason string, v types.ServiceVolumeConfig, svc types.ServiceConfig, placeAnywhere bool) (model.StoragePolicy, model.VolumeMount, []string) {
+	if placeAnywhere {
+		return model.StoragePolicy{}, model.VolumeMount{}, []string{
+			fmt.Sprintf("%s: %s requires a literal host path, which only works on one specific machine, but x-haco-place-anywhere is also set", name, reason),
+		}
+	}
+	pinned, _ := svc.Extensions["x-haco-pin-node"].(string)
+	host := agent.HostNodeID()
+	if pinned != "" && pinned != host {
+		return model.StoragePolicy{}, model.VolumeMount{}, []string{
+			fmt.Sprintf("%s: %s requires this control-plane host (%s), but x-haco-pin-node is %q", name, reason, host, pinned),
+		}
+	}
+	hostPath := v.Source
+	if !filepath.IsAbs(hostPath) {
+		return model.StoragePolicy{}, model.VolumeMount{}, []string{
+			fmt.Sprintf("%s: bind mount source %q did not resolve to an absolute path", name, v.Source),
+		}
+	}
+	if _, err := os.Stat(hostPath); err != nil {
+		return model.StoragePolicy{}, model.VolumeMount{}, []string{
+			fmt.Sprintf("%s: bind mount host path %q does not exist on this control-plane host", name, hostPath),
+		}
+	}
+	storage := model.StoragePolicy{Class: model.NodeLocalPersistent, PinnedNodeID: host}
+	mount := model.VolumeMount{ContainerPath: v.Target, ReadOnly: v.ReadOnly, HostPath: hostPath}
+	return storage, mount, nil
 }
 
 func isPlaceholderHealthCheck(test types.HealthCheckTest) bool {

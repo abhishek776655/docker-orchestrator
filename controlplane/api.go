@@ -59,6 +59,7 @@ func NewAgentHandler(svc *Service) http.Handler {
 	mux.Handle("POST /v1/nodes", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleRegisterNode)))
 	mux.Handle("POST /v1/nodes/{id}/heartbeat", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleHeartbeat)))
 	mux.Handle("GET /v1/agent/{node}/assignments", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleAssignments)))
+	mux.Handle("GET /v1/agent/{node}/build-context/{project}/{service}/{revision}", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleBuildContext)))
 	mux.Handle("POST /v1/agent/status", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleReportStatus)))
 	mux.Handle("GET /v1/services/{project}/{service}", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleListServiceInstances)))
 	mux.Handle("GET /v1/services/{project}", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleListProjectServices)))
@@ -312,6 +313,38 @@ func (svc *Service) handleAssignments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, recs)
+}
+
+// handleBuildContext serves a stashed build-context tarball to the agent
+// that actually needs it — the transport half of registry-optional builds'
+// multi-machine case (resolveBuilds stashes the bytes at deploy time). The
+// requesting node must be both the authenticated credential's own node and
+// the workload's actual assigned node, so one node can never fetch
+// another's build context.
+func (svc *Service) handleBuildContext(w http.ResponseWriter, r *http.Request) {
+	nodeID := r.PathValue("node")
+	if authenticated := authenticatedNode(r); authenticated != "" && authenticated != nodeID {
+		writeError(w, http.StatusForbidden, fmt.Errorf("credential is not authorized for node %q", nodeID))
+		return
+	}
+	key := strings.Join([]string{r.PathValue("project"), r.PathValue("service"), r.PathValue("revision")}, "/")
+	rec, err := svc.GetWorkload(r.Context(), key)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	if rec.NodeID != nodeID {
+		writeError(w, http.StatusForbidden, fmt.Errorf("workload %q is not assigned to node %q", key, nodeID))
+		return
+	}
+	data, ok := svc.FetchBuildContext(key)
+	if !ok {
+		writeError(w, http.StatusNotFound, fmt.Errorf("no stashed build context for %q", key))
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-tar")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
 }
 
 type reportStatusRequest struct {

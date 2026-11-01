@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -89,8 +90,23 @@ func (d *Docker) prepareVolumes(w model.Workload) ([]string, []string, error) {
 	var warnings []string
 	for _, v := range w.Volumes {
 		hostPath := d.VolumeHostPath(w.Key(), v.ContainerPath)
-		if err := os.MkdirAll(hostPath, 0o755); err != nil {
-			return nil, nil, fmt.Errorf("create volume directory %s: %w", hostPath, err)
+		if v.HostPath != "" {
+			// x-haco-bind-host-path: a source-code live-mount honoring the
+			// literal path compose.go resolved and validated at plan time —
+			// never a managed directory under d.dataDir. Re-check existence
+			// here too, since plan-time validation ran on whichever process
+			// handled that request; this is the process that actually
+			// starts the container.
+			if info, err := os.Stat(v.HostPath); err != nil {
+				return nil, nil, fmt.Errorf("bind mount host path %s: %w", v.HostPath, err)
+			} else if !info.IsDir() {
+				return nil, nil, fmt.Errorf("bind mount host path %s is not a directory", v.HostPath)
+			}
+			hostPath = v.HostPath
+		} else {
+			if err := os.MkdirAll(hostPath, 0o755); err != nil {
+				return nil, nil, fmt.Errorf("create volume directory %s: %w", hostPath, err)
+			}
 		}
 		if pct, err := diskUsedPercent(hostPath); err == nil && pct > 90 {
 			warnings = append(warnings, fmt.Sprintf("volume %s is %.0f%% full", hostPath, pct))
@@ -166,6 +182,84 @@ func (d *Docker) PullImage(ctx context.Context, ref string) error {
 	defer rc.Close()
 	_, err = io.Copy(io.Discard, rc)
 	return err
+}
+
+// HasImage reports whether ref already exists in this daemon's local image
+// store — used to skip a redundant local build on every poll once a
+// RemoteBuild workload's image already exists (the same idempotency
+// PullImage gets for free from Docker's own pull-is-a-no-op-if-current
+// behavior; a local build has no such shortcut, so the agent checks
+// itself).
+func (d *Docker) HasImage(ctx context.Context, ref string) bool {
+	_, _, err := d.cli.ImageInspectWithRaw(ctx, ref)
+	return err == nil
+}
+
+// BuildImage builds a RemoteBuild workload's image from a tarball fetched
+// from the control plane (registry-optional builds, multi-machine case) —
+// a plain Docker Engine API build, same mechanics as build.Service.Build
+// but against this agent's own daemon, and never pushed anywhere (there is
+// no registry in this flow by definition).
+func (d *Docker) BuildImage(ctx context.Context, tarball io.Reader, ref, dockerfile string, buildArgs map[string]string, platform string) error {
+	args := map[string]*string{}
+	for k, v := range buildArgs {
+		v := v
+		args[k] = &v
+	}
+	resp, err := d.cli.ImageBuild(ctx, tarball, types.ImageBuildOptions{
+		Dockerfile: dockerfile,
+		BuildArgs:  args,
+		Tags:       []string{ref},
+		Remove:     true,
+		PullParent: true,
+		Platform:   platform,
+	})
+	if err != nil {
+		return fmt.Errorf("build %s: %w", ref, err)
+	}
+	defer resp.Body.Close()
+	decoder := json.NewDecoder(resp.Body)
+	for {
+		var message struct {
+			Error       string `json:"error"`
+			ErrorDetail struct {
+				Message string `json:"message"`
+			} `json:"errorDetail"`
+		}
+		if err := decoder.Decode(&message); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return fmt.Errorf("read build %s output: %w", ref, err)
+		}
+		if message.ErrorDetail.Message != "" {
+			return fmt.Errorf("build %s: %s", ref, message.ErrorDetail.Message)
+		}
+		if message.Error != "" {
+			return fmt.Errorf("build %s: %s", ref, message.Error)
+		}
+	}
+	built, _, err := d.cli.ImageInspectWithRaw(ctx, ref)
+	if err != nil {
+		return fmt.Errorf("inspect built image %s: %w", ref, err)
+	}
+	return validateBuiltPlatform(built, platform)
+}
+
+func validateBuiltPlatform(image types.ImageInspect, requested string) error {
+	if requested == "" {
+		return nil
+	}
+	parts := strings.SplitN(requested, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return fmt.Errorf("invalid requested platform %q", requested)
+	}
+	actual := strings.ToLower(image.Os + "/" + image.Architecture)
+	expected := strings.ToLower(parts[0] + "/" + parts[1])
+	if actual != expected {
+		return fmt.Errorf("built image platform is %s, requested %s", actual, expected)
+	}
+	return nil
 }
 
 // ContainerName is the deterministic name for a workload's container, so

@@ -63,38 +63,45 @@ Built: `deploy`, `plan`, `status`, `nodes`, `node <id>`, `workloads`,
 
 Also now built (§5): `hacoctl node cordon <id>` / `uncordon <id>`.
 
-## 4. Registry-optional builds
+## 4. Registry-optional builds — ✅ done (both cases, unified)
 
-Two genuinely different cases, not one flag:
+Originally scoped as two different cases; they ended up being the same
+mechanism, so there's no special-casing between "single machine" and
+"multi-machine" at all:
 
-- **Single-machine / shared-daemon case — ✅ done.** `build.Service`
-  always exists now (cmd/controlplane wires it up with or without a
-  registry); with none configured it tags
-  `<project>-<service>:<revision>` locally and skips the push. The
-  agent skips `PullImage` for such a workload (`model.Workload.SkipPull`,
-  set by `ComposeDeploy`) since the image was never pushed anywhere and a
-  pull would always fail. Because the image only exists on *this*
-  Docker daemon, `hacoctl plan`/`deploy` reject a build service up front
-  unless it's guaranteed to land on this control-plane host — via the
-  stateful-service default host pin (§ above), an explicit
-  `x-haco-pin-node: <host-id>`, or the new `x-haco-pin-host: true`.
-  `hacoctl start` defaults the registry *on* (`HACO_REGISTRY_ADDR=auto`)
-  so this mode is opt-in via `--no-registry`, not the default.
-  Also added as part of this: a missing/invalid `build.context` or
-  `Dockerfile` is now a plan-time rejection, not a deploy-time build
-  failure.
-- **Real multi-machine, no registry** (still open): the build has to happen *on the
-  target node*, because that's the only Docker daemon that will ever see
-  the result. Needs:
-  - The **agent**, not the control plane, invokes the build.
-  - The build context (source tree) has to reach that agent — a new
-    endpoint to ship the tarball from wherever `hacoctl deploy` was run
-    (or wherever the control plane keeps it) to the target agent over
-    HTTP.
-  - A real limitation to accept: if a workload is ever rescheduled to a
-    *different* node later (M6 reconciliation), that node won't have the
-    image and would need to rebuild from scratch — no cross-node image
-    cache without a registry, by definition.
+- With a registry configured, `ComposeDeploy` still builds centrally and
+  pushes (`build.Service.Build`) exactly as before — any node pulls it
+  normally.
+- With **no registry**, a build is never done centrally at all, regardless
+  of where the workload is scheduled, including the control-plane's own
+  host. Instead (`Service.resolveBuilds`): the control plane packages the
+  build context (`build.TarContext` — pure file I/O, no Docker client
+  needed at all) and stashes it in memory, keyed by workload key; the
+  workload gets a deterministic `<project>-<service>:<revision>` image
+  name and `model.Workload.RemoteBuild` (Dockerfile/args/platform). The
+  scheduler places it on whichever node scores best — **no host-pin
+  requirement of any kind** — since the image is never expected to exist
+  anywhere before that node builds it.
+- The agent that actually gets the assignment (`agent.Agent.buildRemote`)
+  fetches the tarball from a new authenticated endpoint
+  (`GET /v1/agent/{node}/build-context/{project}/{service}/{revision}`,
+  which checks the requesting node is the workload's actual assigned
+  node) and builds the image itself (`agent.Docker.BuildImage`) — status
+  `building`, a `StatusPulling` counterpart. `HasImage` skips a redundant
+  rebuild once it's already there (e.g. the next poll, or a restart).
+- Accepted limitation, as originally scoped: if the workload is later
+  rescheduled to a *different* node (M6 reconciliation), that node has no
+  image either and goes through the same fetch-and-build path again from
+  the same stashed tarball — no cross-node image cache without a
+  registry, by definition. The tarball itself is in-memory-only on the
+  control plane (matches the project's single-control-plane-process
+  design) — a control-plane restart between deploy and the agent's first
+  fetch means redeploying.
+- Also added as part of this: a missing/invalid `build.context` or
+  `Dockerfile` is a plan-time rejection, not a deploy-time build
+  failure; `hacoctl start` defaults the registry *on*
+  (`HACO_REGISTRY_ADDR=auto`), so remote-build is opt-in via
+  `--no-registry`, not the default.
 
 ## 5. Node active/passive (cordon) — ✅ done
 

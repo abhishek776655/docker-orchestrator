@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -233,7 +234,15 @@ func (a *Agent) execute(ctx context.Context, rec store.WorkloadRecord) {
 		return
 	}
 
-	if !rec.SkipPull {
+	if rec.RemoteBuild != nil {
+		if !a.docker.HasImage(ctx, rec.Image) {
+			a.report(ctx, key, model.StatusBuilding, "", "")
+			if err := a.buildRemote(ctx, rec); err != nil {
+				a.report(ctx, key, model.StatusFailed, "remote build failed: "+err.Error(), "")
+				return
+			}
+		}
+	} else if !rec.SkipPull {
 		a.report(ctx, key, model.StatusPulling, "", "")
 		if err := a.docker.PullImage(ctx, rec.Image); err != nil {
 			a.report(ctx, key, model.StatusFailed, "pull failed: "+err.Error(), "")
@@ -264,6 +273,27 @@ func (a *Agent) execute(ctx context.Context, rec store.WorkloadRecord) {
 	// M2 has no real readiness probe yet (healthcheck handling is part of
 	// the Compose importer, M4); a running container is immediately ready.
 	a.report(ctx, key, model.StatusReady, "", containerID)
+}
+
+// buildRemote fetches the build-context tarball the control plane stashed
+// for this workload (resolveBuilds, controlplane/service.go) and builds
+// the image itself — registry-optional builds, multi-machine case: there
+// is no registry to pull rec.Image from, so this agent's own Docker daemon
+// is the only one that will ever produce it.
+func (a *Agent) buildRemote(ctx context.Context, rec store.WorkloadRecord) error {
+	path := fmt.Sprintf("/v1/agent/%s/build-context/%s/%s/%s", a.cfg.NodeID, rec.Project, rec.Service, rec.Revision)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.cfg.ControlPlaneURL+path, nil)
+	if err != nil {
+		return err
+	}
+	resp, tarball, err := a.doRaw(req)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("fetch build context: control plane returned %s: %s", resp.Status, string(tarball))
+	}
+	return a.docker.BuildImage(ctx, bytes.NewReader(tarball), rec.Image, rec.RemoteBuild.Dockerfile, rec.RemoteBuild.Args, rec.RemoteBuild.Platform)
 }
 
 // resolveDependencies returns Docker extra-host entries for all assigned
@@ -365,4 +395,24 @@ func (a *Agent) do(req *http.Request, out any) error {
 		return json.NewDecoder(resp.Body).Decode(out)
 	}
 	return nil
+}
+
+// doRaw is do without JSON decoding or a non-2xx short-circuit — for
+// fetching a binary body (a build-context tarball) where the caller needs
+// the response body either way, to report the error text on failure.
+func (a *Agent) doRaw(req *http.Request) (*http.Response, []byte, error) {
+	if a.cfg.Credential != "" {
+		req.Header.Set("Authorization", "Bearer "+a.cfg.Credential)
+		req.Header.Set("X-HACO-Node-ID", a.cfg.NodeID)
+	}
+	resp, err := a.http.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, nil, err
+	}
+	return resp, data, nil
 }
