@@ -519,6 +519,30 @@ func (s *Store) CreateWorkload(ctx context.Context, w WorkloadRecord) error {
 	return err
 }
 
+// StopWorkload records an admin-requested stop: desired_state and status
+// both flip to "stopped", which drops the workload from AssignedWorkloads
+// (status <> 'stopped') so the next agent poll no longer sees it assigned —
+// the existing orphan-cleanup path then stops and removes its container.
+func (s *Store) StopWorkload(ctx context.Context, key string) error {
+	now := formatTime(time.Now())
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE workloads SET desired_state = ?, status = ?, status_reason = '', updated_at = ?
+		WHERE key = ?
+	`, string(model.DesiredStopped), string(model.StatusStopped), now, key)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("%w: workload %q", ErrNotFound, key)
+	}
+	_, _ = s.db.ExecContext(ctx, `INSERT INTO events (workload_key, type, message, created_at) VALUES (?, 'status', ?, ?)`, key, "stopped: requested by operator", now)
+	return nil
+}
+
 // UpdateStatus transitions a workload's observed status (SRS 12.1
 // "Runtime state"; FR-008, FR-009).
 func (s *Store) UpdateStatus(ctx context.Context, key string, status model.Status, reason, containerID string) error {

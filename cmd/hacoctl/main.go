@@ -36,6 +36,8 @@ func main() {
 		err = status(url, os.Args[2:])
 	case "logs":
 		err = logs(url, os.Args[2:])
+	case "stop":
+		err = stop(url, os.Args[2:])
 	case "events":
 		err = get(url, "/v1/events")
 	case "metrics":
@@ -66,6 +68,7 @@ Usage:
   hacoctl plan   <project> <docker-compose.yml>   dry-run the same, no side effects
   hacoctl status <project> <service> <revision>   one workload's current status
   hacoctl logs   <project> <service> <revision>   latest captured container log tail
+  hacoctl stop   <project> <service> <revision>   stop the workload and remove its container
   hacoctl nodes                                   list registered nodes
   hacoctl events                                  recent audit events
   hacoctl metrics                                 node/workload counts
@@ -123,6 +126,15 @@ func status(baseURL string, args []string) error {
 		return fmt.Errorf("usage: hacoctl status <project> <service> <revision>")
 	}
 	return get(baseURL, "/v1/workloads/"+args[0]+"/"+args[1]+"/"+args[2])
+}
+
+func stop(baseURL string, args []string) error {
+	if len(args) != 3 {
+		return fmt.Errorf("usage: hacoctl stop <project> <service> <revision>")
+	}
+	path := fmt.Sprintf("/v1/workloads/%s/%s/%s/stop",
+		neturl.PathEscape(args[0]), neturl.PathEscape(args[1]), neturl.PathEscape(args[2]))
+	return post(baseURL, path, []byte(`{}`))
 }
 
 func logs(baseURL string, args []string) error {

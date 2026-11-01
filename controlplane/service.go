@@ -160,6 +160,12 @@ func (svc *Service) AssignedWorkloads(ctx context.Context, nodeID string) ([]sto
 	return svc.store.AssignedWorkloads(ctx, nodeID)
 }
 
+// StopWorkload sets a workload's desired state to stopped; the agent
+// that owns it removes the container on its next assignment poll.
+func (svc *Service) StopWorkload(ctx context.Context, key string) error {
+	return svc.store.StopWorkload(ctx, key)
+}
+
 // ReportStatus records an agent-observed status transition (SRS 6.2).
 func (svc *Service) ReportStatus(ctx context.Context, key string, status model.Status, reason, containerID string) error {
 	return svc.store.UpdateStatus(ctx, key, status, reason, containerID)

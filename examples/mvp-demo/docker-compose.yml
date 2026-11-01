@@ -19,11 +19,25 @@ services:
       - "9090:9090"
     environment:
       CACHE_URL: cache:6380
+      WORKER_URL: worker:7001
     depends_on:
       cache:
         condition: service_started
     cpus: "0.25"
     mem_limit: "67108864"
 
+  worker:
+    image: redis:7-alpine
+    platform: linux/arm64
+    command: ["redis-server", "--port", "7001", "--protected-mode", "no"]
+    ports:
+      - "7001:7001"
+    volumes:
+      - worker-data:/data
+    x-haco-pin-node: 192-168-1-15
+    cpus: "0.1"
+    mem_limit: "67108864"
+
 volumes:
   cache-data:
+  worker-data:

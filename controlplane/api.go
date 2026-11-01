@@ -27,6 +27,7 @@ func NewHandler(svc *Service) http.Handler {
 	mux.HandleFunc("POST /v1/workloads", svc.handleSubmit)
 	mux.HandleFunc("GET /v1/workloads/{key...}", svc.handleGetWorkload)
 	mux.HandleFunc("GET /v1/workloads/{project}/{service}/{revision}/logs", svc.handleGetWorkloadLogs)
+	mux.HandleFunc("POST /v1/workloads/{project}/{service}/{revision}/stop", svc.handleStopWorkload)
 
 	mux.HandleFunc("GET /v1/agent/{node}/assignments", svc.handleAssignments)
 	mux.HandleFunc("POST /v1/agent/status", svc.handleReportStatus)
@@ -415,4 +416,18 @@ func (svc *Service) handleGetWorkloadLogs(w http.ResponseWriter, r *http.Request
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	_, _ = io.WriteString(w, logs)
+}
+
+func (svc *Service) handleStopWorkload(w http.ResponseWriter, r *http.Request) {
+	key := strings.Join([]string{r.PathValue("project"), r.PathValue("service"), r.PathValue("revision")}, "/")
+	err := svc.StopWorkload(r.Context(), key)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "stopped"})
 }
