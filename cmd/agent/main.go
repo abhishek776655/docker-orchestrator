@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 
 	"github.com/abhishek/hardware-aware-container-orchestrator/agent"
@@ -17,7 +16,7 @@ import (
 )
 
 func main() {
-	nodeID := envOr("HACO_NODE_ID", defaultNodeID())
+	nodeID := envOr("HACO_NODE_ID", agent.DefaultHostNodeID())
 	credentialPath := envOr("HACO_AGENT_CREDENTIAL_FILE", filepath.Join(defaultDataDir(), "agent-credentials", nodeID+".json"))
 	if len(os.Args) == 3 && os.Args[1] == "join" {
 		bundle, err := agentjoin.Decode(os.Args[2])
@@ -69,24 +68,6 @@ func run(cfg agent.Config) {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "Usage:\n  agent join <one-time-token>   Join and run this node\n  agent run                    Run using the saved node credential")
-}
-
-func defaultNodeID() string {
-	host, err := os.Hostname()
-	if err != nil || host == "" {
-		return "node-local"
-	}
-	host = strings.ToLower(host)
-	id := strings.Map(func(r rune) rune {
-		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '_' {
-			return r
-		}
-		return '-'
-	}, host)
-	if !agentjoin.ValidNodeID(id) {
-		return "node-local"
-	}
-	return id
 }
 
 func defaultDataDir() string {

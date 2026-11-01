@@ -40,9 +40,53 @@ func (svc *Service) WithJoinManager(m *JoinManager) *Service {
 }
 
 // ComposePlan parses and validates a Compose file without applying
-// anything (SRS UC-02, FR-023).
-func (svc *Service) ComposePlan(ctx context.Context, project, workingDir string, yaml []byte) (*compose.Plan, error) {
-	return compose.Load(ctx, project, workingDir, yaml)
+// anything (SRS UC-02, FR-023), and dry-run schedules every workload
+// against current node/reservation state so the plan shows where each
+// service would land without persisting or starting anything.
+func (svc *Service) ComposePlan(ctx context.Context, project, workingDir string, yaml []byte) (*compose.Plan, []*model.Decision, error) {
+	plan, err := compose.Load(ctx, project, workingDir, yaml)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !plan.Valid() {
+		return plan, nil, nil
+	}
+
+	decisions, err := svc.dryRunSchedule(ctx, plan.Workloads)
+	return plan, decisions, err
+}
+
+// dryRunSchedule schedules every workload in order against a single
+// in-memory Scheduler seeded from current reservations, without
+// persisting anything — each call's reservation feeds the next, the same
+// way sequential Submit calls would via the database.
+func (svc *Service) dryRunSchedule(ctx context.Context, workloads []model.Workload) ([]*model.Decision, error) {
+	nodes, err := svc.store.ListNodes(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list nodes: %w", err)
+	}
+
+	// Seed once: Schedule() itself reserves into the shared scheduler as
+	// it goes, so re-seeding per workload here would double-count
+	// already-active reservations.
+	cpuMem, ports, err := svc.store.ActiveReservations(ctx, "")
+	if err != nil {
+		return nil, fmt.Errorf("load reservations: %w", err)
+	}
+	sched := scheduler.New(nodes)
+	for nodeID, res := range cpuMem {
+		sched.SeedReservation(nodeID, res, ports[nodeID])
+	}
+
+	var decisions []*model.Decision
+	for _, w := range workloads {
+		decision, err := sched.Schedule(w)
+		decisions = append(decisions, decision)
+		if err != nil {
+			return decisions, fmt.Errorf("schedule %s: %w", w.Service, err)
+		}
+	}
+	return decisions, nil
 }
 
 // ComposeDeploy plans a Compose file, builds any services that need it,
@@ -138,6 +182,12 @@ func (svc *Service) Submit(ctx context.Context, w model.Workload) (*SubmitResult
 	if w.DesiredState == "" {
 		w.DesiredState = model.DesiredRunning
 	}
+	if w.Storage.Class == model.NodeLocalPersistent && w.Storage.AllowFreshVolumeOnReschedule && w.Storage.PinnedNodeID != decision.Selected {
+		// Schedule() relaxed affinity because the pinned node was down;
+		// the pin itself moves to wherever it actually landed, which gets
+		// a brand-new empty volume (see decision.Warnings for the notice).
+		w.Storage.PinnedNodeID = decision.Selected
+	}
 	rec := store.WorkloadRecord{
 		Workload: w,
 		Status:   model.StatusAssigned,
@@ -153,6 +203,11 @@ func (svc *Service) Submit(ctx context.Context, w model.Workload) (*SubmitResult
 // GetWorkload returns one workload's current status.
 func (svc *Service) GetWorkload(ctx context.Context, key string) (*store.WorkloadRecord, error) {
 	return svc.store.GetWorkload(ctx, key)
+}
+
+// ListWorkloads returns every workload, optionally filtered to one project.
+func (svc *Service) ListWorkloads(ctx context.Context, project string) ([]store.WorkloadRecord, error) {
+	return svc.store.ListWorkloads(ctx, project)
 }
 
 // AssignedWorkloads is the agent's pull feed for one node.

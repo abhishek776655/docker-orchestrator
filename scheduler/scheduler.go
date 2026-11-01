@@ -95,6 +95,19 @@ func (s *Scheduler) SeedVRAMReservation(nodeID string, vramBytes int64) {
 func (s *Scheduler) Schedule(w model.Workload) (*model.Decision, error) {
 	decision := &model.Decision{WorkloadKey: w.Key()}
 
+	if w.Storage.Class == model.NodeLocalPersistent && w.Storage.PinnedNodeID != "" && w.Storage.AllowFreshVolumeOnReschedule {
+		pinned, ok := s.nodes[w.Storage.PinnedNodeID]
+		if !ok || pinned.node.Availability != model.Available {
+			// Pinned node is gone or unreachable, and this workload opted
+			// into rescheduling anyway: drop the affinity requirement so
+			// it schedules like an ephemeral workload. The node it lands
+			// on gets a brand-new, empty volume (FR-017's default
+			// never-auto-move protection is explicitly waived here).
+			w.Storage.PinnedNodeID = ""
+			decision.Warnings = append(decision.Warnings, "pinned node unavailable; scheduling with a fresh volume (previous data on the pinned node was not migrated)")
+		}
+	}
+
 	var eligible []*nodeState
 	for _, id := range s.order {
 		ns := s.nodes[id]

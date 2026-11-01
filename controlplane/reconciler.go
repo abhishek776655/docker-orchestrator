@@ -63,7 +63,7 @@ func (svc *Service) reconcileOnce(ctx context.Context, heartbeatTimeout time.Dur
 	}
 
 	for _, wl := range orphaned {
-		if wl.Storage.Class == model.NodeLocalPersistent {
+		if wl.Storage.Class == model.NodeLocalPersistent && !wl.Storage.AllowFreshVolumeOnReschedule {
 			// Node affinity for persistent state must never be broken
 			// automatically (SRS §6.3, FR-017): report the failure, do
 			// not relocate.
@@ -73,6 +73,10 @@ func (svc *Service) reconcileOnce(ctx context.Context, heartbeatTimeout time.Dur
 			continue
 		}
 
+		// sched.Schedule relaxes the storage-affinity check itself when
+		// AllowFreshVolumeOnReschedule is set and the pinned node is down
+		// (see scheduler.Schedule), so this call is the same for both
+		// ephemeral and opted-in pinned workloads.
 		decision, err := sched.Schedule(wl.Workload)
 		if err != nil {
 			// No healthy node can take it right now; leave it assigned
@@ -82,6 +86,16 @@ func (svc *Service) reconcileOnce(ctx context.Context, heartbeatTimeout time.Dur
 			log.Printf("reconcile: no eligible node for %s yet: %v", wl.Key(), err)
 			continue
 		}
+
+		if wl.Storage.Class == model.NodeLocalPersistent {
+			if err := svc.store.ReassignWithFreshVolume(ctx, wl.Key(), decision.Selected); err != nil {
+				log.Printf("reconcile: reassign %s: %v", wl.Key(), err)
+				continue
+			}
+			log.Printf("reconcile: rescheduled %s from %s to %s onto a FRESH VOLUME (previous data on %s not migrated)", wl.Key(), wl.NodeID, decision.Selected, wl.NodeID)
+			continue
+		}
+
 		if err := svc.store.Reassign(ctx, wl.Key(), decision.Selected); err != nil {
 			log.Printf("reconcile: reassign %s: %v", wl.Key(), err)
 			continue

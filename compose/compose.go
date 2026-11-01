@@ -279,7 +279,8 @@ func convertService(project, workingDir, name string, svc types.ServiceConfig) (
 				rejections = append(rejections, fmt.Sprintf("%s: named volume %s needs node affinity; set x-haco-pin-node: <node-id> on this service", name, v.Target))
 				continue
 			}
-			wl.Storage = model.StoragePolicy{Class: model.NodeLocalPersistent, PinnedNodeID: pinned}
+			allowFresh, _ := svc.Extensions["x-haco-allow-fresh-volume"].(bool)
+			wl.Storage = model.StoragePolicy{Class: model.NodeLocalPersistent, PinnedNodeID: pinned, AllowFreshVolumeOnReschedule: allowFresh}
 			wl.Volumes = append(wl.Volumes, model.VolumeMount{ContainerPath: v.Target, ReadOnly: v.ReadOnly})
 		default:
 			warnings = append(warnings, fmt.Sprintf("%s: volume type %q is not evaluated for storage affinity", name, v.Type))

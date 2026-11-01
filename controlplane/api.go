@@ -25,6 +25,7 @@ func NewHandler(svc *Service) http.Handler {
 	mux.HandleFunc("GET /v1/nodes", svc.handleListNodes)
 
 	mux.HandleFunc("POST /v1/workloads", svc.handleSubmit)
+	mux.HandleFunc("GET /v1/workloads", svc.handleListWorkloads)
 	mux.HandleFunc("GET /v1/workloads/{key...}", svc.handleGetWorkload)
 	mux.HandleFunc("GET /v1/workloads/{project}/{service}/{revision}/logs", svc.handleGetWorkloadLogs)
 	mux.HandleFunc("POST /v1/workloads/{project}/{service}/{revision}/stop", svc.handleStopWorkload)
@@ -252,6 +253,15 @@ func (svc *Service) handleSubmit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, result)
 }
 
+func (svc *Service) handleListWorkloads(w http.ResponseWriter, r *http.Request) {
+	workloads, err := svc.ListWorkloads(r.Context(), r.URL.Query().Get("project"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, workloads)
+}
+
 func (svc *Service) handleGetWorkload(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 	rec, err := svc.GetWorkload(r.Context(), key)
@@ -314,7 +324,7 @@ func (svc *Service) handleComposePlan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	plan, err := svc.ComposePlan(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml))
+	plan, decisions, err := svc.ComposePlan(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -323,7 +333,7 @@ func (svc *Service) handleComposePlan(w http.ResponseWriter, r *http.Request) {
 	if !plan.Valid() {
 		status = http.StatusUnprocessableEntity
 	}
-	writeJSON(w, status, plan)
+	writeJSON(w, status, map[string]any{"plan": plan, "decisions": decisions})
 }
 
 func (svc *Service) handleComposeDeploy(w http.ResponseWriter, r *http.Request) {

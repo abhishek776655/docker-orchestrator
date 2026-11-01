@@ -88,6 +88,15 @@ type GPURequirement struct {
 type StoragePolicy struct {
 	Class        StorageClass
 	PinnedNodeID string // required when Class == NodeLocalPersistent
+
+	// AllowFreshVolumeOnReschedule opts a pinned workload out of the
+	// default safety rule (FR-017: pinned workloads are never auto-moved).
+	// When true and the pinned node is unavailable, the scheduler may
+	// place the workload on a different node with a brand-new, empty
+	// volume — the pinned node's existing data is not migrated and is
+	// effectively lost. Off by default; only safe for data that is
+	// disposable (caches, scratch state).
+	AllowFreshVolumeOnReschedule bool
 }
 
 // Constraints are the hard eligibility requirements for a workload

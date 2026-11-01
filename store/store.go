@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS workloads (
 	container_ports      text NOT NULL DEFAULT '[]',
 	storage_class        text NOT NULL,
 	storage_pinned_node  text NOT NULL DEFAULT '',
+	storage_allow_fresh_volume integer NOT NULL DEFAULT 0,
 	volumes              text NOT NULL DEFAULT '[]',
 	depends_on           text NOT NULL DEFAULT '[]',
 	desired_state        text NOT NULL,
@@ -118,6 +119,10 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
+	// Additive migration for databases created before this column existed;
+	// SQLite has no "ADD COLUMN IF NOT EXISTS", so the error from a column
+	// that's already there is expected and ignored.
+	_, _ = db.ExecContext(ctx, `ALTER TABLE workloads ADD COLUMN storage_allow_fresh_volume integer NOT NULL DEFAULT 0`)
 	return &Store{db: db}, nil
 }
 
@@ -258,7 +263,7 @@ func (s *Store) MarkStaleNodesUnavailable(ctx context.Context, timeout time.Dura
 // FR-015).
 func (s *Store) WorkloadsOnUnavailableNodes(ctx context.Context) ([]WorkloadRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT w.project, w.service, w.revision, w.image, w.command, w.env, w.cpu_millis, w.memory_bytes, w.architecture, w.host_ports, w.container_ports, w.storage_class, w.storage_pinned_node, w.volumes, w.depends_on, w.desired_state, w.status, w.status_reason, w.node_id, w.container_id
+		SELECT w.project, w.service, w.revision, w.image, w.command, w.env, w.cpu_millis, w.memory_bytes, w.architecture, w.host_ports, w.container_ports, w.storage_class, w.storage_pinned_node, w.storage_allow_fresh_volume, w.volumes, w.depends_on, w.desired_state, w.status, w.status_reason, w.node_id, w.container_id
 		FROM workloads w
 		JOIN nodes n ON n.id = w.node_id
 		WHERE n.availability = 'unavailable' AND w.status NOT IN ('failed', 'stopped')
@@ -290,6 +295,22 @@ func (s *Store) Reassign(ctx context.Context, key, newNodeID string) error {
 	`, newNodeID, now, key)
 	if err == nil {
 		_, _ = s.db.ExecContext(ctx, `INSERT INTO events (workload_key, node_id, type, message, created_at) VALUES (?, ?, 'reassigned', 'rescheduled after node loss', ?)`, key, newNodeID, now)
+	}
+	return err
+}
+
+// ReassignWithFreshVolume is Reassign for a pinned workload that opted
+// into FR-017's waiver (model.StoragePolicy.AllowFreshVolumeOnReschedule):
+// it also moves the storage pin itself to the new node, since the new
+// node starts a brand-new, empty volume rather than the old one's data.
+func (s *Store) ReassignWithFreshVolume(ctx context.Context, key, newNodeID string) error {
+	now := formatTime(time.Now())
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE workloads SET node_id = ?, storage_pinned_node = ?, status = 'assigned', status_reason = '', container_id = '', updated_at = ?
+		WHERE key = ?
+	`, newNodeID, newNodeID, now, key)
+	if err == nil {
+		_, _ = s.db.ExecContext(ctx, `INSERT INTO events (workload_key, node_id, type, message, created_at) VALUES (?, ?, 'reassigned', 'rescheduled onto a fresh volume after pinned node loss (previous data not migrated)', ?)`, key, newNodeID, now)
 	}
 	return err
 }
@@ -494,8 +515,8 @@ func (s *Store) CreateWorkload(ctx context.Context, w WorkloadRecord) error {
 	// stale fields behind. container_id is reset so the agent doesn't
 	// mistake a new spec for an already-running old container.
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO workloads (key, project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, storage_class, storage_pinned_node, volumes, depends_on, desired_state, status, status_reason, node_id, container_id, created_at, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		INSERT INTO workloads (key, project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, storage_class, storage_pinned_node, storage_allow_fresh_volume, volumes, depends_on, desired_state, status, status_reason, node_id, container_id, created_at, updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT (key) DO UPDATE SET
 			image = excluded.image,
 			command = excluded.command,
@@ -507,6 +528,7 @@ func (s *Store) CreateWorkload(ctx context.Context, w WorkloadRecord) error {
 			container_ports = excluded.container_ports,
 			storage_class = excluded.storage_class,
 			storage_pinned_node = excluded.storage_pinned_node,
+			storage_allow_fresh_volume = excluded.storage_allow_fresh_volume,
 			volumes = excluded.volumes,
 			depends_on = excluded.depends_on,
 			desired_state = excluded.desired_state,
@@ -515,7 +537,7 @@ func (s *Store) CreateWorkload(ctx context.Context, w WorkloadRecord) error {
 			node_id = excluded.node_id,
 			container_id = '',
 			updated_at = excluded.updated_at
-	`, w.Key(), w.Project, w.Service, w.Revision, w.Image, command, env, w.Resources.CPUMillis, w.Resources.MemoryBytes, w.Constraints.Architecture, hostPorts, containerPorts, string(w.Storage.Class), w.Storage.PinnedNodeID, volumes, dependsOn, string(w.DesiredState), string(w.Status), w.StatusReason, w.NodeID, w.ContainerID, now, now)
+	`, w.Key(), w.Project, w.Service, w.Revision, w.Image, command, env, w.Resources.CPUMillis, w.Resources.MemoryBytes, w.Constraints.Architecture, hostPorts, containerPorts, string(w.Storage.Class), w.Storage.PinnedNodeID, w.Storage.AllowFreshVolumeOnReschedule, volumes, dependsOn, string(w.DesiredState), string(w.Status), w.StatusReason, w.NodeID, w.ContainerID, now, now)
 	return err
 }
 
@@ -560,7 +582,7 @@ func (s *Store) UpdateStatus(ctx context.Context, key string, status model.Statu
 // GetWorkload returns one workload by key.
 func (s *Store) GetWorkload(ctx context.Context, key string) (*WorkloadRecord, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, storage_class, storage_pinned_node, volumes, depends_on, desired_state, status, status_reason, node_id, container_id
+		SELECT project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, storage_class, storage_pinned_node, storage_allow_fresh_volume, volumes, depends_on, desired_state, status, status_reason, node_id, container_id
 		FROM workloads WHERE key = ?
 	`, key)
 	rec, err := scanWorkload(row)
@@ -570,13 +592,44 @@ func (s *Store) GetWorkload(ctx context.Context, key string) (*WorkloadRecord, e
 	return rec, err
 }
 
+// ListWorkloads returns every workload, optionally filtered to one
+// project (empty string means all projects), ordered for stable display.
+func (s *Store) ListWorkloads(ctx context.Context, project string) ([]WorkloadRecord, error) {
+	query := `
+		SELECT project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, storage_class, storage_pinned_node, storage_allow_fresh_volume, volumes, depends_on, desired_state, status, status_reason, node_id, container_id
+		FROM workloads
+	`
+	var args []any
+	if project != "" {
+		query += " WHERE project = ?"
+		args = append(args, project)
+	}
+	query += " ORDER BY project, service, revision"
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []WorkloadRecord
+	for rows.Next() {
+		rec, err := scanWorkloadRow(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *rec)
+	}
+	return out, rows.Err()
+}
+
 // AssignedWorkloads returns workloads assigned to a node, including failed
 // workloads so the agent can retain their containers for log inspection.
 // Stopped workloads are excluded because their containers should be cleaned
 // up. This is the agent's pull-based assignment feed (SRS 6.2).
 func (s *Store) AssignedWorkloads(ctx context.Context, nodeID string) ([]WorkloadRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, storage_class, storage_pinned_node, volumes, depends_on, desired_state, status, status_reason, node_id, container_id
+		SELECT project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, storage_class, storage_pinned_node, storage_allow_fresh_volume, volumes, depends_on, desired_state, status, status_reason, node_id, container_id
 		FROM workloads WHERE node_id = ? AND status <> 'stopped'
 	`, nodeID)
 	if err != nil {
@@ -690,7 +743,7 @@ func scanWorkloadRow(row scannable) (*WorkloadRecord, error) {
 	var rec WorkloadRecord
 	var command, env, hostPorts, containerPorts, volumes, dependsOn []byte
 	var storageClass, status string
-	if err := row.Scan(&rec.Project, &rec.Service, &rec.Revision, &rec.Image, &command, &env, &rec.Resources.CPUMillis, &rec.Resources.MemoryBytes, &rec.Constraints.Architecture, &hostPorts, &containerPorts, &storageClass, &rec.Storage.PinnedNodeID, &volumes, &dependsOn, (*string)(&rec.DesiredState), &status, &rec.StatusReason, &rec.NodeID, &rec.ContainerID); err != nil {
+	if err := row.Scan(&rec.Project, &rec.Service, &rec.Revision, &rec.Image, &command, &env, &rec.Resources.CPUMillis, &rec.Resources.MemoryBytes, &rec.Constraints.Architecture, &hostPorts, &containerPorts, &storageClass, &rec.Storage.PinnedNodeID, &rec.Storage.AllowFreshVolumeOnReschedule, &volumes, &dependsOn, (*string)(&rec.DesiredState), &status, &rec.StatusReason, &rec.NodeID, &rec.ContainerID); err != nil {
 		return nil, err
 	}
 	rec.Status = model.Status(status)

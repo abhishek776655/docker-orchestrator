@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/abhishek/hardware-aware-container-orchestrator/agent"
 	"github.com/abhishek/hardware-aware-container-orchestrator/agentjoin"
 	"github.com/abhishek/hardware-aware-container-orchestrator/build"
 	"github.com/abhishek/hardware-aware-container-orchestrator/controlplane"
@@ -122,8 +123,55 @@ func main() {
 	}
 	log.Printf("agent API listening on https://%s (certificate pin %s)", net.JoinHostPort(advertiseHost, fmt.Sprint(port)), fingerprint)
 	fmt.Printf("One-time agent join command (expires in 10 minutes): ./bin/agent join '%s'\n", encoded)
+
+	if envOr("HACO_AUTO_JOIN_HOST", "true") != "false" {
+		go runHostAgent(ctx, joinManager, advertiseHost, dataDir)
+	}
+
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("serve operator API: %v", err)
+	}
+}
+
+// runHostAgent auto-joins and runs an agent for the machine the control
+// plane itself is on, so a single-machine (or first-node) deployment needs
+// no separate `./bin/agent join ...` step. It fails soft — logged, not
+// fatal — since running a control plane with no local Docker workload is
+// an explicitly supported mode (HACO_AUTO_JOIN_HOST=false opts out, or a
+// missing Docker daemon here just skips it).
+func runHostAgent(ctx context.Context, jm *controlplane.JoinManager, advertiseHost, dataDir string) {
+	nodeID := envOr("HACO_HOST_NODE_ID", agent.DefaultHostNodeID())
+	credentialPath := filepath.Join(dataDir, "agent-credentials", nodeID+".json")
+
+	cfg, err := agent.LoadCredential(credentialPath)
+	if err != nil {
+		bundle, issueErr := jm.Issue(ctx)
+		if issueErr != nil {
+			log.Printf("auto-join host node %s: issue token: %v", nodeID, issueErr)
+			return
+		}
+		cfg, err = agent.Join(ctx, bundle, nodeID, credentialPath)
+		if err != nil {
+			log.Printf("auto-join host node %s: %v", nodeID, err)
+			return
+		}
+		log.Printf("host auto-joined control plane as node %s", nodeID)
+	}
+	if address := os.Getenv("HACO_HOST_NODE_ADDRESS"); address != "" {
+		cfg.Address = address
+	} else {
+		cfg.Address = advertiseHost
+	}
+
+	docker, err := agent.NewDocker(nodeID, filepath.Join(dataDir, "volumes", nodeID))
+	if err != nil {
+		log.Printf("auto-join host node %s: docker unavailable, running control-plane-only (%v)", nodeID, err)
+		return
+	}
+
+	log.Printf("host agent running as node %s", nodeID)
+	if err := agent.New(cfg, docker).Run(ctx); err != nil && ctx.Err() == nil {
+		log.Printf("host agent: %v", err)
 	}
 }
 
