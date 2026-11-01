@@ -40,7 +40,7 @@ func main() {
 	}
 	cfg, err := agent.LoadCredential(credentialPath)
 	if err != nil {
-		log.Fatalf("load agent credential: %v; start with: ./bin/agent join <one-time-token>", err)
+		log.Fatalf("load agent credential: %v; start with: hacoctl agent join <one-time-token>", err)
 	}
 	if address := os.Getenv("HACO_NODE_ADDRESS"); address != "" {
 		cfg.Address = address

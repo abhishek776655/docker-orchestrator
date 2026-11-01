@@ -76,6 +76,8 @@ func main() {
 		err = start(url, os.Args[2:])
 	case "stop-all":
 		err = stopAll(os.Args[2:])
+	case "agent":
+		err = agentCmd(os.Args[2:])
 	case "remove-node":
 		if len(os.Args) != 3 {
 			err = fmt.Errorf("usage: hacoctl remove-node <node-id>")
@@ -99,7 +101,7 @@ Usage:
   hacoctl build  <project> <docker-compose.yml>   just build the build: service images, no scheduling or containers (--no-cache forces a full rebuild; --service <name> scopes to that service's dependencies)
   hacoctl deploy <project> <docker-compose.yml>   build, schedule, and run a Compose project, then show a live status table until every workload is ready/failed/stopped (like 'docker compose up -d'); prompts if a pinned service needs a fresh volume (--yes skips it); --no-cache forces a full rebuild; --service <name> deploys only that service and its dependencies
   hacoctl plan   <project> <docker-compose.yml>   dry-run the same, no side effects (table; add --json for raw; --service <name> to scope the same way)
-  hacoctl status <project> <service> <revision>   one workload's current status
+  hacoctl status [project] [service] [revision]   table of every workload (optionally filtered to one project), or one workload's full detail once service is named (revision defaults to "latest")
   hacoctl logs   <project> <service> <revision>   latest captured container log tail
   hacoctl stop   <project> <service> <revision>   stop the workload and remove its container
   hacoctl nodes                                   list registered nodes
@@ -116,8 +118,10 @@ Usage:
   hacoctl remove-node <node-id>                   hard-delete that node record and its credential
   hacoctl stop-containers                         stop every workload's container, nodes stay joined (--yes skips confirmation)
   hacoctl teardown                                stop every workload and revoke every node credential (--yes skips confirmation)
-  hacoctl start                                   start the control plane in the background, with the local build registry on by default (--foreground to run attached, --no-registry to disable it)
-  hacoctl stop-all                                stop the control plane process started by 'hacoctl start'`)
+  hacoctl start                                   start the control plane in the background, with the local build registry on by default (--foreground to run attached, --no-registry to disable the registry, --logs to tail its log right after starting)
+  hacoctl stop-all                                stop the control plane process started by 'hacoctl start'
+  hacoctl agent join <token>                      join this machine as a worker node (one-time token from 'hacoctl start')
+  hacoctl agent run                                run this machine's already-joined node (reuses the saved credential, no token needed)`)
 }
 
 func printJoinCommand(baseURL string) error {
@@ -137,7 +141,7 @@ func printJoinCommand(baseURL string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("./bin/agent join '%s'\n", encoded)
+	fmt.Printf("hacoctl agent join '%s'\n", encoded)
 	return nil
 }
 
@@ -407,6 +411,7 @@ func deploy(baseURL string, args []string) error {
 	// A plan fetch failure here (e.g. nothing schedulable yet) isn't fatal
 	// to the consent check — deploy below will surface the real error.
 
+	fmt.Printf("Connecting to control plane at %s...\n", baseURL)
 	body, _ := json.Marshal(map[string]any{
 		"project":      project,
 		"working_dir":  workingDir,
@@ -474,6 +479,7 @@ func deployAndWatch(baseURL, project string, body []byte) error {
 		}
 		return nil
 	}
+	fmt.Println("Connected. Deploy submitted; watching workload status...")
 	return watchDeploy(baseURL, project, keys)
 }
 
@@ -483,10 +489,42 @@ func deployAndWatch(baseURL, project string, body []byte) error {
 // starting, running, waiting_dependencies) is still in progress.
 var terminalStatuses = map[string]bool{"ready": true, "failed": true, "stopped": true}
 
+const (
+	ansiReset  = "\033[0m"
+	ansiGreen  = "\033[32m"
+	ansiYellow = "\033[33m"
+	ansiRed    = "\033[31m"
+	ansiGray   = "\033[90m"
+)
+
+// colorStatus wraps status in an ANSI color matching its meaning: green
+// once it's actually running, red once it's failed, gray once it's a
+// deliberate stop, yellow for everything still in progress in between.
+func colorStatus(status string) string {
+	switch status {
+	case "ready", "running":
+		return ansiGreen + status + ansiReset
+	case "failed":
+		return ansiRed + status + ansiReset
+	case "stopped":
+		return ansiGray + status + ansiReset
+	default:
+		return ansiYellow + status + ansiReset
+	}
+}
+
 func watchDeploy(baseURL, project string, keys []string) error {
 	sort.Strings(keys)
 	deadline := time.Now().Add(2 * time.Minute)
 	lastLines := 0
+	announcedNodes := map[string]bool{}
+
+	serviceW := len("SERVICE")
+	for _, key := range keys {
+		if s := len(strings.SplitN(key, "/", 3)[1]); s > serviceW {
+			serviceW = s
+		}
+	}
 
 	for {
 		var all []workloadRecordView
@@ -498,9 +536,30 @@ func watchDeploy(baseURL, project string, keys []string) error {
 			byKey[w.Project+"/"+w.Service+"/"+w.Revision] = w
 		}
 
+		// New nodes discovered this tick are announced as their own
+		// scrolling log lines (like "connecting"/"connected" output),
+		// never erased by the table redraw below — so skip erasing the
+		// previous frame this one time; it stays as history above.
+		var newNodes []string
+		for _, key := range keys {
+			if w, ok := byKey[key]; ok && w.NodeID != "" && !announcedNodes[w.NodeID] {
+				announcedNodes[w.NodeID] = true
+				newNodes = append(newNodes, w.NodeID)
+			}
+		}
+		for _, n := range newNodes {
+			fmt.Printf("Connecting to node %s... connected.\n", n)
+		}
+		if len(newNodes) > 0 {
+			lastLines = 0
+		}
+
+		// Columns are padded manually (not via tabwriter) on the PLAIN
+		// text width before coloring, since tabwriter has no notion of
+		// ANSI escape bytes and would misalign anything after a colored
+		// cell.
 		var buf bytes.Buffer
-		tw := tabwriter.NewWriter(&buf, 0, 2, 2, ' ', 0)
-		fmt.Fprintln(tw, "SERVICE\tNODE\tSTATUS\tREASON")
+		fmt.Fprintf(&buf, "%-*s  %-13s  %-21s  %s\n", serviceW, "SERVICE", "NODE", "STATUS", "REASON")
 		done := true
 		for _, key := range keys {
 			service := strings.SplitN(key, "/", 3)[1]
@@ -508,12 +567,19 @@ func watchDeploy(baseURL, project string, keys []string) error {
 			if w, ok := byKey[key]; ok {
 				node, status, reason = orDash(w.NodeID), w.Status, orDash(w.StatusReason)
 			}
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", service, node, status, reason)
+			// Color is matched against the raw status, then padding is
+			// appended after the reset code — coloring the already-padded
+			// string would never match (trailing spaces break the switch).
+			pad := 21 - len(status)
+			if pad < 0 {
+				pad = 0
+			}
+			coloredStatus := colorStatus(status) + strings.Repeat(" ", pad)
+			fmt.Fprintf(&buf, "%-*s  %-13s  %s  %s\n", serviceW, service, node, coloredStatus, reason)
 			if !terminalStatuses[status] {
 				done = false
 			}
 		}
-		tw.Flush()
 
 		if lastLines > 0 {
 			fmt.Printf("\033[%dA\033[J", lastLines)
@@ -611,14 +677,18 @@ func renderPlanTable(project string, v planView) {
 }
 
 type workloadRecordView struct {
-	Project      string `json:"Project"`
-	Service      string `json:"Service"`
-	Revision     string `json:"Revision"`
-	DesiredState string `json:"DesiredState"`
-	Status       string `json:"Status"`
-	StatusReason string `json:"StatusReason"`
-	NodeID       string `json:"NodeID"`
-	ContainerID  string `json:"ContainerID"`
+	Project        string `json:"Project"`
+	Service        string `json:"Service"`
+	Revision       string `json:"Revision"`
+	DesiredState   string `json:"DesiredState"`
+	Status         string `json:"Status"`
+	StatusReason   string `json:"StatusReason"`
+	NodeID         string `json:"NodeID"`
+	ContainerID    string `json:"ContainerID"`
+	ContainerPorts []int  `json:"ContainerPorts"`
+	Constraints    struct {
+		HostPorts []int `json:"HostPorts"`
+	} `json:"Constraints"`
 }
 
 func fetchJSON(baseURL, path string, out any) error {
@@ -696,17 +766,45 @@ func containers(baseURL string, args []string) error {
 		return w[i].Project+w[i].Service < w[j].Project+w[j].Service
 	})
 	tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(tw, "NODE\tWORKLOAD\tCONTAINER ID\tSTATUS")
+	fmt.Fprintln(tw, "NODE\tPROJECT\tSERVICE\tCONTAINER ID\tSTATUS\tPORTS\tINTERNAL URL")
 	for _, rec := range w {
-		workload := fmt.Sprintf("%s/%s/%s", rec.Project, rec.Service, rec.Revision)
 		cid := rec.ContainerID
 		if len(cid) > 12 {
 			cid = cid[:12]
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", orDash(rec.NodeID), workload, orDash(cid), rec.Status)
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			orDash(rec.NodeID), rec.Project, rec.Service, orDash(cid), rec.Status,
+			intListOrDash(rec.Constraints.HostPorts), internalURLs(rec.Service, rec.ContainerPorts))
 	}
 	tw.Flush()
 	return nil
+}
+
+// intListOrDash renders a list of ports as "9090,9091", or "-" when empty
+// (an internal-only service with no published host port).
+func intListOrDash(ports []int) string {
+	if len(ports) == 0 {
+		return "-"
+	}
+	parts := make([]string, len(ports))
+	for i, p := range ports {
+		parts[i] = strconv.Itoa(p)
+	}
+	return strings.Join(parts, ",")
+}
+
+// internalURLs renders a workload's service-name-based, container-internal
+// addresses ("cache:6380") — the same host:port other services reach it at
+// via extra_hosts-based discovery, whether or not any port is published.
+func internalURLs(service string, containerPorts []int) string {
+	if len(containerPorts) == 0 {
+		return "-"
+	}
+	parts := make([]string, len(containerPorts))
+	for i, p := range containerPorts {
+		parts[i] = fmt.Sprintf("%s:%d", service, p)
+	}
+	return strings.Join(parts, ",")
 }
 
 type nodeView struct {
@@ -837,11 +935,24 @@ func orDash(s string) string {
 	return s
 }
 
+// status is a table of everything with no/one argument (just like
+// `hacoctl workloads`, which it shares its implementation with), or one
+// workload's full detail once you name a service. Revision defaults to
+// "latest" since that's the only one anything in this codebase ever
+// produces today — there's no content-addressed revisioning yet (every
+// deploy replaces the same project/service/latest workload in place), so
+// in practice it never needs to be spelled out.
 func status(baseURL string, args []string) error {
-	if len(args) != 3 {
-		return fmt.Errorf("usage: hacoctl status <project> <service> <revision>")
+	switch len(args) {
+	case 0, 1:
+		return workloads(baseURL, args)
+	case 2:
+		return get(baseURL, "/v1/workloads/"+args[0]+"/"+args[1]+"/latest")
+	case 3:
+		return get(baseURL, "/v1/workloads/"+args[0]+"/"+args[1]+"/"+args[2])
+	default:
+		return fmt.Errorf("usage: hacoctl status [project] [service] [revision]")
 	}
-	return get(baseURL, "/v1/workloads/"+args[0]+"/"+args[1]+"/"+args[2])
 }
 
 // stopContainers stops every workload (so each agent removes its
@@ -929,18 +1040,26 @@ func teardown(baseURL string, args []string) error {
 // service in a compose file works without that env var being set by hand
 // every time.
 func start(baseURL string, args []string) error {
-	foreground, registry := false, true
+	foreground, registry, showLogs := false, true, false
 	for _, a := range args {
 		switch a {
 		case "--foreground", "-f":
 			foreground = true
 		case "--no-registry":
 			registry = false
+		case "--logs":
+			showLogs = true
 		}
 	}
 
+	dataDir := envOr("HACO_DATA_DIR", filepath.Join(homeDir(), ".haco"))
+	logPath := filepath.Join(dataDir, "controlplane.log")
+
 	if controlPlaneUp(baseURL) {
 		fmt.Printf("control plane already running at %s\n", baseURL)
+		if showLogs {
+			return tailLogFile(logPath)
+		}
 		return nil
 	}
 
@@ -961,11 +1080,9 @@ func start(baseURL string, args []string) error {
 		return cmd.Run()
 	}
 
-	dataDir := envOr("HACO_DATA_DIR", filepath.Join(homeDir(), ".haco"))
 	if err := os.MkdirAll(dataDir, 0o700); err != nil {
 		return fmt.Errorf("create data dir: %w", err)
 	}
-	logPath := filepath.Join(dataDir, "controlplane.log")
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return fmt.Errorf("open log file: %w", err)
@@ -992,6 +1109,9 @@ func start(baseURL string, args []string) error {
 	for i := 0; i < 20; i++ {
 		if controlPlaneUp(baseURL) {
 			fmt.Printf("control plane ready at %s\n", baseURL)
+			if showLogs {
+				return tailLogFile(logPath)
+			}
 			return nil
 		}
 		time.Sleep(500 * time.Millisecond)
@@ -1037,24 +1157,85 @@ func controlPlaneUp(baseURL string) bool {
 	return resp.StatusCode < 500
 }
 
+// tailLogFile streams new output appended to the control-plane log file —
+// `hacoctl start --logs`, so there's no need for a separate terminal/
+// command just to watch what the control plane is doing. Starts from the
+// file's current end (only output from this point on, not the whole
+// history across every previous start) and polls rather than using a
+// filesystem-watch dependency; blocks until interrupted (Ctrl+C).
+func tailLogFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open log file: %w", err)
+	}
+	defer f.Close()
+	if _, err := f.Seek(0, io.SeekEnd); err != nil {
+		return err
+	}
+	fmt.Printf("Tailing %s (Ctrl+C to stop)...\n", path)
+	buf := make([]byte, 4096)
+	for {
+		n, err := f.Read(buf)
+		if n > 0 {
+			os.Stdout.Write(buf[:n])
+		}
+		if err != nil && err != io.EOF {
+			return err
+		}
+		if n == 0 {
+			time.Sleep(300 * time.Millisecond)
+		}
+	}
+}
+
 // controlPlaneBinary finds the controlplane executable: next to hacoctl's
 // own binary (the common case after install.sh, or a `go build` into the
 // same bin/ directory), then $PATH, so `hacoctl start` needs no separate
 // knowledge of where it lives.
 func controlPlaneBinary() (string, error) {
-	if p := os.Getenv("HACO_CONTROLPLANE_BIN"); p != "" {
+	return findSiblingBinary("controlplane", "HACO_CONTROLPLANE_BIN")
+}
+
+func agentBinary() (string, error) {
+	return findSiblingBinary("agent", "HACO_AGENT_BIN")
+}
+
+// findSiblingBinary locates another binary from this project: an env var
+// override first, then next to hacoctl's own binary (the common case
+// after install.sh, or a `go build` into the same bin/ directory), then
+// $PATH — the same resolution controlPlaneBinary used before `hacoctl
+// agent run`/`join` needed the same logic for the agent binary.
+func findSiblingBinary(name, envVar string) (string, error) {
+	if p := os.Getenv(envVar); p != "" {
 		return p, nil
 	}
 	if exe, err := os.Executable(); err == nil {
-		candidate := filepath.Join(filepath.Dir(exe), "controlplane")
+		candidate := filepath.Join(filepath.Dir(exe), name)
 		if _, statErr := os.Stat(candidate); statErr == nil {
 			return candidate, nil
 		}
 	}
-	if p, err := exec.LookPath("controlplane"); err == nil {
+	if p, err := exec.LookPath(name); err == nil {
 		return p, nil
 	}
-	return "", fmt.Errorf("controlplane binary not found next to hacoctl or in PATH (set HACO_CONTROLPLANE_BIN)")
+	return "", fmt.Errorf("%s binary not found next to hacoctl or in PATH (set %s)", name, envVar)
+}
+
+// agentCmd runs `hacoctl agent run` / `hacoctl agent join <token>` by
+// exec'ing the actual agent binary in the foreground, inheriting stdio —
+// so a worker node never needs to know the agent binary exists
+// separately, the same way `hacoctl start` hides the controlplane binary.
+func agentCmd(args []string) error {
+	if len(args) == 0 || (args[0] != "run" && args[0] != "join") {
+		return fmt.Errorf("usage: hacoctl agent run | hacoctl agent join <token>")
+	}
+	bin, err := agentBinary()
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(bin, args...)
+	cmd.Stdout, cmd.Stderr, cmd.Stdin = os.Stdout, os.Stderr, os.Stdin
+	return cmd.Run()
 }
 
 func homeDir() string {

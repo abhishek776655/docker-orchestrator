@@ -25,12 +25,22 @@ echo "Installed to $GOBIN"
 
 case ":$PATH:" in
 *":$GOBIN:"*)
-	echo "Done. Try: hacoctl start"
 	;;
 *)
 	echo
 	echo "$GOBIN is not on your PATH yet. Add it, e.g.:"
 	echo "  echo 'export PATH=\"\$PATH:$GOBIN\"' >> ~/.zshrc && source ~/.zshrc"
-	echo "Then try: hacoctl start"
 	;;
 esac
+
+cat <<'EOF'
+
+Next steps:
+  On this machine (runs the control plane and its own node):
+    hacoctl start
+
+  On every OTHER machine you want as a worker node, once the control
+  plane above is running (it prints a one-time join command/token too):
+    hacoctl agent join '<token-from-hacoctl-start-output>'   # first time only
+    hacoctl agent run                                        # later restarts (reuses the saved credential, no token needed)
+EOF
