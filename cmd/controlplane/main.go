@@ -25,17 +25,21 @@ import (
 func main() {
 	addr := envOr("HACO_LISTEN_ADDR", "127.0.0.1:8099")
 	agentAddr := envOr("HACO_AGENT_LISTEN_ADDR", ":8443")
-	dsn := envOr("HACO_POSTGRES_DSN", "postgres://postgres:haco@localhost:55432/haco?sslmode=disable")
 	registry := resolveRegistryAddr()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	s, err := store.Open(ctx, dsn)
+	dbPath := envOr("HACO_DB_PATH", filepath.Join(defaultDataDir(), "control-plane.db"))
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
+		log.Fatalf("create db directory: %v", err)
+	}
+	s, err := store.Open(ctx, dbPath)
 	if err != nil {
 		log.Fatalf("open store: %v", err)
 	}
 	defer s.Close()
+	log.Printf("metadata stored at %s", dbPath)
 
 	svc := controlplane.New(s)
 	dataDir := envOr("HACO_DATA_DIR", defaultDataDir())

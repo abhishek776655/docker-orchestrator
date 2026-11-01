@@ -4,28 +4,45 @@ Documented per SRS NFR-011: backups and restore procedures must exist before
 any non-disposable environment is used, even though automated backup is out
 of MVP scope (SRS §10.2).
 
-## Control-plane metadata (PostgreSQL)
+## Control-plane metadata (embedded SQLite)
 
-The control plane's entire desired-state view (nodes, workloads, events) is
-in one PostgreSQL database. There is no in-process state that isn't also in
-this database (SRS NFR-001), so backing it up is sufficient to recover the
-control plane after loss.
+The control plane's entire desired-state view (nodes, workloads, events,
+agent join tokens/credentials) is in one SQLite file — only the control
+plane process ever touches it, so there's no separate database service to
+back up. There is no in-process state that isn't also in this file (SRS
+NFR-001), so backing it up is sufficient to recover the control plane
+after loss.
 
-**Backup:**
+Default path: `~/.haco/control-plane.db` (override with `HACO_DB_PATH`).
+WAL mode is enabled, so a backup must also capture the `-wal` and `-shm`
+sidecar files if they exist alongside it at backup time.
+
+**Backup** (stop the control plane first, or use SQLite's own backup
+command for a consistent copy of a live database):
 
 ```bash
-docker exec haco-postgres pg_dump -U postgres -Fc haco > haco-$(date +%Y%m%d-%H%M%S).dump
+# simplest, control plane stopped:
+cp ~/.haco/control-plane.db{,-wal,-shm} /path/to/backups/ 2>/dev/null
+
+# or, live, via SQLite's own atomic backup (needs the sqlite3 CLI):
+sqlite3 ~/.haco/control-plane.db ".backup /path/to/backups/control-plane-$(date +%Y%m%d-%H%M%S).db"
 ```
 
-**Restore** (to a fresh or emptied database):
+**Restore**:
 
 ```bash
-docker exec -i haco-postgres pg_restore -U postgres -d haco --clean --if-exists < haco-20261019-225300.dump
+pkill -f bin/controlplane
+cp /path/to/backups/control-plane-20261019-225300.db ~/.haco/control-plane.db
+rm -f ~/.haco/control-plane.db-wal ~/.haco/control-plane.db-shm
 ```
 
 After restoring, restart the control plane and every agent so agents
 re-register against the restored node list (SRS NFR-001: "recover its
-desired-state view from persistent metadata after restart").
+desired-state view from persistent metadata after restart"). Agent
+credentials in the restored file must match what's on disk at
+`~/.haco/agent-credentials/`; a credential issued after the backup was
+taken will fail to authenticate until the agent rejoins with a fresh
+token.
 
 ## Node-local persistent volumes (application data)
 
@@ -59,7 +76,7 @@ access", §6.3).
 ## What is not automated
 
 - Scheduled/periodic backups of either the database or volumes.
-- Point-in-time recovery for PostgreSQL (only `pg_dump`/`pg_restore` snapshots).
+- Point-in-time recovery (only whole-file snapshots).
 - Cross-node volume replication or migration.
 
 These are explicitly out of MVP scope (SRS §3.2, §10.2) but the above gives

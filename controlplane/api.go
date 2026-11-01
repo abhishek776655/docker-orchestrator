@@ -11,7 +11,7 @@ import (
 	"strings"
 
 	"github.com/abhishek/hardware-aware-container-orchestrator/model"
-	"github.com/jackc/pgx/v5"
+	"github.com/abhishek/hardware-aware-container-orchestrator/store"
 )
 
 // NewHandler builds the control-plane HTTP API (SRS 5.1 "Control Plane
@@ -405,7 +405,7 @@ func (svc *Service) handleReportStatus(w http.ResponseWriter, r *http.Request) {
 func (svc *Service) handleGetWorkloadLogs(w http.ResponseWriter, r *http.Request) {
 	key := strings.Join([]string{r.PathValue("project"), r.PathValue("service"), r.PathValue("revision")}, "/")
 	logs, err := svc.GetWorkloadLogs(r.Context(), key)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, fmt.Errorf("no container logs found for workload %q", key))
 		return
 	}

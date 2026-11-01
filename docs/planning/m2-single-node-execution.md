@@ -1,5 +1,13 @@
 # M2 — Single-Node Execution
 
+> **Superseded (post-M7 roadmap item 1):** the PostgreSQL metadata store
+> described below was replaced with an embedded SQLite database — only the
+> control plane ever touched it, a single process with no concurrent
+> writers, so Postgres's concurrency strength was never exercised. See
+> [docs/operations/backup-and-restore.md](../operations/backup-and-restore.md)
+> for the current backup procedure. This doc is kept for its historical
+> record of M2's acceptance proof.
+
 ## Goal
 
 Submit a workload through a real control-plane API and have it actually run as a

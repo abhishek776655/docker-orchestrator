@@ -4,7 +4,9 @@ Captured from discussion on 2026-10-20, not yet built. Nothing here changes
 the M0-M7 delivery path or its acceptance criteria — this is what comes
 after, prioritized loosely in the order discussed.
 
-## 1. Storage: Postgres → embedded SQLite
+## 1. Storage: Postgres → embedded SQLite — ✅ done
+
+See [sqlite-migration.md](sqlite-migration.md) for what actually shipped.
 
 Only the control plane ever touches the metadata store — it's a single
 process, no concurrent writers — so Postgres's main strength (multi-writer

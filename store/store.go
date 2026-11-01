@@ -1,37 +1,47 @@
-// Package store persists control-plane state in PostgreSQL (SRS 5.1
-// "Metadata Store", NFR-001: recover desired state after restart). M1's
-// in-memory scheduler state has no equivalent here; reservations are
-// derived by summing non-terminal workloads per node, not stored
-// separately, so there is one source of truth.
+// Package store persists control-plane state in an embedded SQLite
+// database (SRS 5.1 "Metadata Store", NFR-001: recover desired state after
+// restart). Only the control plane ever touches it — a single process, no
+// concurrent writers — so Postgres's main strength (multi-writer
+// concurrency) was never actually exercised here; SQLite removes the
+// separate-database bootstrap step entirely. M1's in-memory scheduler
+// state has no equivalent here; reservations are derived by summing
+// non-terminal workloads per node, not stored separately, so there is one
+// source of truth.
 package store
 
 import (
 	"context"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
+	_ "modernc.org/sqlite"
 
 	"github.com/abhishek/hardware-aware-container-orchestrator/model"
 )
+
+// ErrNotFound is returned (wrapped) by any lookup that found nothing,
+// instead of the caller needing to know which SQL driver's not-found
+// sentinel to check for.
+var ErrNotFound = errors.New("not found")
 
 const schema = `
 CREATE TABLE IF NOT EXISTS nodes (
 	id            text PRIMARY KEY,
 	address       text NOT NULL DEFAULT '',
 	architecture  text NOT NULL,
-	labels        jsonb NOT NULL DEFAULT '{}',
-	capabilities  jsonb NOT NULL DEFAULT '{}',
-	cpu_millis    bigint NOT NULL,
-	memory_bytes  bigint NOT NULL,
+	labels        text NOT NULL DEFAULT '{}',
+	capabilities  text NOT NULL DEFAULT '{}',
+	cpu_millis    integer NOT NULL,
+	memory_bytes  integer NOT NULL,
 	availability  text NOT NULL,
-	heartbeat_at  timestamptz NOT NULL,
-	gpus          jsonb NOT NULL DEFAULT '[]',
-	thermal       jsonb NOT NULL DEFAULT '{"Known": false}',
-	cached_images jsonb NOT NULL DEFAULT '[]'
+	heartbeat_at  text NOT NULL,
+	gpus          text NOT NULL DEFAULT '[]',
+	thermal       text NOT NULL DEFAULT '{"Known": false}',
+	cached_images text NOT NULL DEFAULT '[]'
 );
 
 CREATE TABLE IF NOT EXISTS workloads (
@@ -40,81 +50,96 @@ CREATE TABLE IF NOT EXISTS workloads (
 	service              text NOT NULL,
 	revision             text NOT NULL,
 	image                text NOT NULL,
-	command              jsonb NOT NULL DEFAULT '[]',
-	env                  jsonb NOT NULL DEFAULT '{}',
-	cpu_millis           bigint NOT NULL,
-	memory_bytes         bigint NOT NULL,
+	command              text NOT NULL DEFAULT '[]',
+	env                  text NOT NULL DEFAULT '{}',
+	cpu_millis           integer NOT NULL,
+	memory_bytes         integer NOT NULL,
 	architecture         text NOT NULL DEFAULT '',
-	host_ports           jsonb NOT NULL DEFAULT '[]',
-	container_ports      jsonb NOT NULL DEFAULT '[]',
+	host_ports           text NOT NULL DEFAULT '[]',
+	container_ports      text NOT NULL DEFAULT '[]',
 	storage_class        text NOT NULL,
 	storage_pinned_node  text NOT NULL DEFAULT '',
-	volumes              jsonb NOT NULL DEFAULT '[]',
-	depends_on           jsonb NOT NULL DEFAULT '[]',
+	volumes              text NOT NULL DEFAULT '[]',
+	depends_on           text NOT NULL DEFAULT '[]',
 	desired_state        text NOT NULL,
 	status               text NOT NULL,
 	status_reason        text NOT NULL DEFAULT '',
 	node_id              text NOT NULL DEFAULT '',
 	container_id         text NOT NULL DEFAULT '',
-	created_at           timestamptz NOT NULL DEFAULT now(),
-	updated_at           timestamptz NOT NULL DEFAULT now()
+	created_at           text NOT NULL,
+	updated_at           text NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS events (
-	id           bigserial PRIMARY KEY,
+	id           integer PRIMARY KEY AUTOINCREMENT,
 	workload_key text NOT NULL,
 	node_id      text NOT NULL DEFAULT '',
 	type         text NOT NULL,
 	message      text NOT NULL,
-	created_at   timestamptz NOT NULL DEFAULT now()
+	created_at   text NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS agent_join_tokens (
 	secret_hash text PRIMARY KEY,
-	expires_at   timestamptz NOT NULL,
-	consumed_at  timestamptz
+	expires_at  text NOT NULL,
+	consumed_at text
 );
 
 CREATE TABLE IF NOT EXISTS agent_credentials (
 	node_id     text PRIMARY KEY,
 	secret_hash text NOT NULL,
-	revoked_at  timestamptz
+	revoked_at  text
 );
-
 `
 
-// Store wraps a PostgreSQL connection pool.
+// Store wraps an embedded SQLite database.
 type Store struct {
-	pool *pgxpool.Pool
+	db *sql.DB
 }
 
-// Open connects to Postgres and ensures the schema exists.
-func Open(ctx context.Context, dsn string) (*Store, error) {
-	pool, err := pgxpool.New(ctx, dsn)
+// Open opens (creating if needed) the SQLite database at path and ensures
+// the schema exists. path may be ":memory:" for tests.
+func Open(ctx context.Context, path string) (*Store, error) {
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
-		return nil, fmt.Errorf("connect postgres: %w", err)
+		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
-	if _, err := pool.Exec(ctx, schema); err != nil {
-		pool.Close()
+	// A single connection sidesteps SQLite's single-writer model entirely —
+	// this control plane is low-throughput enough that serializing every
+	// call costs nothing, and it avoids "database is locked" errors that
+	// busy_timeout alone doesn't fully eliminate under concurrent access.
+	db.SetMaxOpenConns(1)
+
+	if _, err := db.ExecContext(ctx, `PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure sqlite: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, schema); err != nil {
+		db.Close()
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
-	return &Store{pool: pool}, nil
+	return &Store{db: db}, nil
 }
 
-// Close releases the connection pool.
-func (s *Store) Close() { s.pool.Close() }
+// Close releases the database connection.
+func (s *Store) Close() error { return s.db.Close() }
+
+func formatTime(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
+
+func parseTime(s string) (time.Time, error) { return time.Parse(time.RFC3339Nano, s) }
 
 func (s *Store) CreateJoinToken(ctx context.Context, secretHash string, expiresAt time.Time) error {
-	_, err := s.pool.Exec(ctx, `INSERT INTO agent_join_tokens (secret_hash, expires_at) VALUES ($1, $2)`, secretHash, expiresAt)
+	_, err := s.db.ExecContext(ctx, `INSERT INTO agent_join_tokens (secret_hash, expires_at) VALUES (?, ?)`, secretHash, formatTime(expiresAt))
 	return err
 }
 
 // ConsumeJoinToken atomically accepts a live token at most once.
 func (s *Store) ConsumeJoinToken(ctx context.Context, secretHash string, now time.Time) (bool, error) {
 	var consumed string
-	err := s.pool.QueryRow(ctx, `UPDATE agent_join_tokens SET consumed_at = $2 WHERE secret_hash = $1 AND consumed_at IS NULL AND expires_at > $2 RETURNING secret_hash`, secretHash, now).Scan(&consumed)
+	nowStr := formatTime(now)
+	err := s.db.QueryRowContext(ctx, `UPDATE agent_join_tokens SET consumed_at = ? WHERE secret_hash = ? AND consumed_at IS NULL AND expires_at > ? RETURNING secret_hash`, nowStr, secretHash, nowStr).Scan(&consumed)
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
 		}
 		return false, err
@@ -123,11 +148,18 @@ func (s *Store) ConsumeJoinToken(ctx context.Context, secretHash string, now tim
 }
 
 func (s *Store) CreateAgentCredential(ctx context.Context, nodeID, secretHash string) error {
-	tag, err := s.pool.Exec(ctx, `INSERT INTO agent_credentials (node_id, secret_hash, revoked_at) VALUES ($1, $2, NULL) ON CONFLICT (node_id) DO UPDATE SET secret_hash = EXCLUDED.secret_hash, revoked_at = NULL WHERE agent_credentials.revoked_at IS NOT NULL`, nodeID, secretHash)
+	res, err := s.db.ExecContext(ctx, `
+		INSERT INTO agent_credentials (node_id, secret_hash, revoked_at) VALUES (?, ?, NULL)
+		ON CONFLICT (node_id) DO UPDATE SET secret_hash = excluded.secret_hash, revoked_at = NULL WHERE agent_credentials.revoked_at IS NOT NULL
+	`, nodeID, secretHash)
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
 		return fmt.Errorf("node %q already has an active agent credential; revoke it before joining again", nodeID)
 	}
 	return nil
@@ -135,9 +167,9 @@ func (s *Store) CreateAgentCredential(ctx context.Context, nodeID, secretHash st
 
 func (s *Store) VerifyAgentCredential(ctx context.Context, nodeID, secretHash string) (bool, error) {
 	var found string
-	err := s.pool.QueryRow(ctx, `SELECT secret_hash FROM agent_credentials WHERE node_id = $1 AND revoked_at IS NULL`, nodeID).Scan(&found)
+	err := s.db.QueryRowContext(ctx, `SELECT secret_hash FROM agent_credentials WHERE node_id = ? AND revoked_at IS NULL`, nodeID).Scan(&found)
 	if err != nil {
-		if err == pgx.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
 		}
 		return false, err
@@ -146,11 +178,15 @@ func (s *Store) VerifyAgentCredential(ctx context.Context, nodeID, secretHash st
 }
 
 func (s *Store) RevokeAgentCredential(ctx context.Context, nodeID string) error {
-	tag, err := s.pool.Exec(ctx, `UPDATE agent_credentials SET revoked_at = now() WHERE node_id = $1`, nodeID)
+	res, err := s.db.ExecContext(ctx, `UPDATE agent_credentials SET revoked_at = ? WHERE node_id = ?`, formatTime(time.Now()), nodeID)
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
 		return fmt.Errorf("no agent credential for node %q", nodeID)
 	}
 	return nil
@@ -164,22 +200,22 @@ func (s *Store) UpsertNode(ctx context.Context, n model.Node) error {
 	gpus, _ := json.Marshal(n.GPUs)
 	thermal, _ := json.Marshal(n.Thermal)
 	cachedImages, _ := json.Marshal(n.CachedImages)
-	_, err := s.pool.Exec(ctx, `
+	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO nodes (id, address, architecture, labels, capabilities, cpu_millis, memory_bytes, availability, heartbeat_at, gpus, thermal, cached_images)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT (id) DO UPDATE SET
-			address = EXCLUDED.address,
-			architecture = EXCLUDED.architecture,
-			labels = EXCLUDED.labels,
-			capabilities = EXCLUDED.capabilities,
-			cpu_millis = EXCLUDED.cpu_millis,
-			memory_bytes = EXCLUDED.memory_bytes,
-			availability = EXCLUDED.availability,
-			heartbeat_at = EXCLUDED.heartbeat_at,
-			gpus = EXCLUDED.gpus,
-			thermal = EXCLUDED.thermal,
-			cached_images = EXCLUDED.cached_images
-	`, n.ID, n.Address, n.Architecture, labels, caps, n.Allocatable.CPUMillis, n.Allocatable.MemoryBytes, string(n.Availability), n.HeartbeatAt, gpus, thermal, cachedImages)
+			address = excluded.address,
+			architecture = excluded.architecture,
+			labels = excluded.labels,
+			capabilities = excluded.capabilities,
+			cpu_millis = excluded.cpu_millis,
+			memory_bytes = excluded.memory_bytes,
+			availability = excluded.availability,
+			heartbeat_at = excluded.heartbeat_at,
+			gpus = excluded.gpus,
+			thermal = excluded.thermal,
+			cached_images = excluded.cached_images
+	`, n.ID, n.Address, n.Architecture, labels, caps, n.Allocatable.CPUMillis, n.Allocatable.MemoryBytes, string(n.Availability), formatTime(n.HeartbeatAt), gpus, thermal, cachedImages)
 	return err
 }
 
@@ -188,14 +224,18 @@ func (s *Store) UpsertNode(ctx context.Context, n model.Node) error {
 func (s *Store) Heartbeat(ctx context.Context, nodeID string, thermal model.Thermal, cachedImages []string) error {
 	thermalJSON, _ := json.Marshal(thermal)
 	cachedJSON, _ := json.Marshal(cachedImages)
-	tag, err := s.pool.Exec(ctx, `
-		UPDATE nodes SET heartbeat_at = now(), availability = 'available', thermal = $2, cached_images = $3
-		WHERE id = $1
-	`, nodeID, thermalJSON, cachedJSON)
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE nodes SET heartbeat_at = ?, availability = 'available', thermal = ?, cached_images = ?
+		WHERE id = ?
+	`, formatTime(time.Now()), thermalJSON, cachedJSON, nodeID)
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
 		return fmt.Errorf("unknown node %q", nodeID)
 	}
 	return nil
@@ -204,10 +244,11 @@ func (s *Store) Heartbeat(ctx context.Context, nodeID string, thermal model.Ther
 // MarkStaleNodesUnavailable excludes nodes from new placements once their
 // heartbeat is older than timeout (SRS FR-015).
 func (s *Store) MarkStaleNodesUnavailable(ctx context.Context, timeout time.Duration) error {
-	_, err := s.pool.Exec(ctx, `
+	cutoff := formatTime(time.Now().Add(-timeout))
+	_, err := s.db.ExecContext(ctx, `
 		UPDATE nodes SET availability = 'unavailable'
-		WHERE availability = 'available' AND heartbeat_at < now() - $1::interval
-	`, timeout.String())
+		WHERE availability = 'available' AND heartbeat_at < ?
+	`, cutoff)
 	return err
 }
 
@@ -216,7 +257,7 @@ func (s *Store) MarkStaleNodesUnavailable(ctx context.Context, timeout time.Dura
 // reconciler's input for deciding what to reschedule or fail (SRS §6.3,
 // FR-015).
 func (s *Store) WorkloadsOnUnavailableNodes(ctx context.Context) ([]WorkloadRecord, error) {
-	rows, err := s.pool.Query(ctx, `
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT w.project, w.service, w.revision, w.image, w.command, w.env, w.cpu_millis, w.memory_bytes, w.architecture, w.host_ports, w.container_ports, w.storage_class, w.storage_pinned_node, w.volumes, w.depends_on, w.desired_state, w.status, w.status_reason, w.node_id, w.container_id
 		FROM workloads w
 		JOIN nodes n ON n.id = w.node_id
@@ -242,12 +283,13 @@ func (s *Store) WorkloadsOnUnavailableNodes(ctx context.Context) ([]WorkloadReco
 // "assigned" so the new node's agent picks it up fresh (SRS §6.3
 // reconciliation: "issue safe corrective actions").
 func (s *Store) Reassign(ctx context.Context, key, newNodeID string) error {
-	_, err := s.pool.Exec(ctx, `
-		UPDATE workloads SET node_id = $2, status = 'assigned', status_reason = '', container_id = '', updated_at = now()
-		WHERE key = $1
-	`, key, newNodeID)
+	now := formatTime(time.Now())
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE workloads SET node_id = ?, status = 'assigned', status_reason = '', container_id = '', updated_at = ?
+		WHERE key = ?
+	`, newNodeID, now, key)
 	if err == nil {
-		_, _ = s.pool.Exec(ctx, `INSERT INTO events (workload_key, node_id, type, message) VALUES ($1, $2, 'reassigned', 'rescheduled after node loss')`, key, newNodeID)
+		_, _ = s.db.ExecContext(ctx, `INSERT INTO events (workload_key, node_id, type, message, created_at) VALUES (?, ?, 'reassigned', 'rescheduled after node loss', ?)`, key, newNodeID, now)
 	}
 	return err
 }
@@ -264,9 +306,9 @@ type Event struct {
 
 // ListEvents returns the most recent events, newest first (SRS §13, FR-024).
 func (s *Store) ListEvents(ctx context.Context, limit int) ([]Event, error) {
-	rows, err := s.pool.Query(ctx, `
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, workload_key, node_id, type, message, created_at
-		FROM events ORDER BY id DESC LIMIT $1
+		FROM events ORDER BY id DESC LIMIT ?
 	`, limit)
 	if err != nil {
 		return nil, err
@@ -276,7 +318,12 @@ func (s *Store) ListEvents(ctx context.Context, limit int) ([]Event, error) {
 	var out []Event
 	for rows.Next() {
 		var e Event
-		if err := rows.Scan(&e.ID, &e.WorkloadKey, &e.NodeID, &e.Type, &e.Message, &e.CreatedAt); err != nil {
+		var createdAt string
+		if err := rows.Scan(&e.ID, &e.WorkloadKey, &e.NodeID, &e.Type, &e.Message, &createdAt); err != nil {
+			return nil, err
+		}
+		e.CreatedAt, err = parseTime(createdAt)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, e)
@@ -286,20 +333,23 @@ func (s *Store) ListEvents(ctx context.Context, limit int) ([]Event, error) {
 
 // AppendWorkloadLogs persists a bounded container log tail as a workload event.
 func (s *Store) AppendWorkloadLogs(ctx context.Context, key, logs string) error {
-	_, err := s.pool.Exec(ctx, `
-		INSERT INTO events (workload_key, type, message) VALUES ($1, 'container_logs', $2)
-	`, key, logs)
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO events (workload_key, type, message, created_at) VALUES (?, 'container_logs', ?, ?)
+	`, key, logs, formatTime(time.Now()))
 	return err
 }
 
 // GetWorkloadLogs returns the most recently captured container log tail.
 func (s *Store) GetWorkloadLogs(ctx context.Context, key string) (string, error) {
 	var logs string
-	err := s.pool.QueryRow(ctx, `
+	err := s.db.QueryRowContext(ctx, `
 		SELECT message FROM events
-		WHERE workload_key = $1 AND type = 'container_logs'
+		WHERE workload_key = ? AND type = 'container_logs'
 		ORDER BY id DESC LIMIT 1
 	`, key).Scan(&logs)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("%w: no container logs for workload %q", ErrNotFound, key)
+	}
 	return logs, err
 }
 
@@ -313,7 +363,7 @@ type Metrics struct {
 func (s *Store) Metrics(ctx context.Context) (*Metrics, error) {
 	m := &Metrics{NodesByAvailability: map[string]int{}, WorkloadsByStatus: map[string]int{}}
 
-	rows, err := s.pool.Query(ctx, `SELECT availability, count(*) FROM nodes GROUP BY availability`)
+	rows, err := s.db.QueryContext(ctx, `SELECT availability, count(*) FROM nodes GROUP BY availability`)
 	if err != nil {
 		return nil, err
 	}
@@ -328,7 +378,7 @@ func (s *Store) Metrics(ctx context.Context) (*Metrics, error) {
 	}
 	rows.Close()
 
-	rows, err = s.pool.Query(ctx, `SELECT status, count(*) FROM workloads GROUP BY status`)
+	rows, err = s.db.QueryContext(ctx, `SELECT status, count(*) FROM workloads GROUP BY status`)
 	if err != nil {
 		return nil, err
 	}
@@ -348,7 +398,7 @@ func (s *Store) Metrics(ctx context.Context) (*Metrics, error) {
 
 // ListNodes returns every known node.
 func (s *Store) ListNodes(ctx context.Context) ([]model.Node, error) {
-	rows, err := s.pool.Query(ctx, `SELECT id, address, architecture, labels, capabilities, cpu_millis, memory_bytes, availability, heartbeat_at, gpus, thermal, cached_images FROM nodes`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, address, architecture, labels, capabilities, cpu_millis, memory_bytes, availability, heartbeat_at, gpus, thermal, cached_images FROM nodes`)
 	if err != nil {
 		return nil, err
 	}
@@ -358,11 +408,15 @@ func (s *Store) ListNodes(ctx context.Context) ([]model.Node, error) {
 	for rows.Next() {
 		var n model.Node
 		var labels, caps, gpus, thermal, cachedImages []byte
-		var availability string
-		if err := rows.Scan(&n.ID, &n.Address, &n.Architecture, &labels, &caps, &n.Allocatable.CPUMillis, &n.Allocatable.MemoryBytes, &availability, &n.HeartbeatAt, &gpus, &thermal, &cachedImages); err != nil {
+		var availability, heartbeatAt string
+		if err := rows.Scan(&n.ID, &n.Address, &n.Architecture, &labels, &caps, &n.Allocatable.CPUMillis, &n.Allocatable.MemoryBytes, &availability, &heartbeatAt, &gpus, &thermal, &cachedImages); err != nil {
 			return nil, err
 		}
 		n.Availability = model.Availability(availability)
+		n.HeartbeatAt, err = parseTime(heartbeatAt)
+		if err != nil {
+			return nil, err
+		}
 		n.Labels = map[string]string{}
 		_ = json.Unmarshal(labels, &n.Labels)
 		capBools := map[string]bool{}
@@ -384,9 +438,9 @@ func (s *Store) ListNodes(ctx context.Context) ([]model.Node, error) {
 // since that attempt is about to be replaced, not added to (see
 // CreateWorkload's ON CONFLICT). Pass "" to exclude nothing.
 func (s *Store) ActiveReservations(ctx context.Context, excludeKey string) (map[string]model.Resources, map[string][]int, error) {
-	rows, err := s.pool.Query(ctx, `
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT node_id, cpu_millis, memory_bytes, host_ports FROM workloads
-		WHERE node_id != '' AND status NOT IN ('failed', 'stopped') AND key != $1
+		WHERE node_id != '' AND status NOT IN ('failed', 'stopped') AND key != ?
 	`, excludeKey)
 	if err != nil {
 		return nil, nil, err
@@ -432,58 +486,64 @@ func (s *Store) CreateWorkload(ctx context.Context, w WorkloadRecord) error {
 	containerPorts, _ := json.Marshal(w.ContainerPorts)
 	volumes, _ := json.Marshal(w.Volumes)
 	dependsOn, _ := json.Marshal(w.DependsOn)
+	now := formatTime(time.Now())
 	// ON CONFLICT: redeploying the same project/service/revision (the
 	// common case — rerunning `hacoctl deploy`, or retrying after a
 	// previous attempt got stuck) must replace that workload's spec and
 	// restart its lifecycle, not fail with a duplicate-key error or leave
 	// stale fields behind. container_id is reset so the agent doesn't
 	// mistake a new spec for an already-running old container.
-	_, err := s.pool.Exec(ctx, `
-		INSERT INTO workloads (key, project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, storage_class, storage_pinned_node, volumes, depends_on, desired_state, status, status_reason, node_id, container_id)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO workloads (key, project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, storage_class, storage_pinned_node, volumes, depends_on, desired_state, status, status_reason, node_id, container_id, created_at, updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT (key) DO UPDATE SET
-			image = EXCLUDED.image,
-			command = EXCLUDED.command,
-			env = EXCLUDED.env,
-			cpu_millis = EXCLUDED.cpu_millis,
-			memory_bytes = EXCLUDED.memory_bytes,
-			architecture = EXCLUDED.architecture,
-			host_ports = EXCLUDED.host_ports,
-			container_ports = EXCLUDED.container_ports,
-			storage_class = EXCLUDED.storage_class,
-			storage_pinned_node = EXCLUDED.storage_pinned_node,
-			volumes = EXCLUDED.volumes,
-			depends_on = EXCLUDED.depends_on,
-			desired_state = EXCLUDED.desired_state,
-			status = EXCLUDED.status,
-			status_reason = EXCLUDED.status_reason,
-			node_id = EXCLUDED.node_id,
+			image = excluded.image,
+			command = excluded.command,
+			env = excluded.env,
+			cpu_millis = excluded.cpu_millis,
+			memory_bytes = excluded.memory_bytes,
+			architecture = excluded.architecture,
+			host_ports = excluded.host_ports,
+			container_ports = excluded.container_ports,
+			storage_class = excluded.storage_class,
+			storage_pinned_node = excluded.storage_pinned_node,
+			volumes = excluded.volumes,
+			depends_on = excluded.depends_on,
+			desired_state = excluded.desired_state,
+			status = excluded.status,
+			status_reason = excluded.status_reason,
+			node_id = excluded.node_id,
 			container_id = '',
-			updated_at = now()
-	`, w.Key(), w.Project, w.Service, w.Revision, w.Image, command, env, w.Resources.CPUMillis, w.Resources.MemoryBytes, w.Constraints.Architecture, hostPorts, containerPorts, string(w.Storage.Class), w.Storage.PinnedNodeID, volumes, dependsOn, string(w.DesiredState), string(w.Status), w.StatusReason, w.NodeID, w.ContainerID)
+			updated_at = excluded.updated_at
+	`, w.Key(), w.Project, w.Service, w.Revision, w.Image, command, env, w.Resources.CPUMillis, w.Resources.MemoryBytes, w.Constraints.Architecture, hostPorts, containerPorts, string(w.Storage.Class), w.Storage.PinnedNodeID, volumes, dependsOn, string(w.DesiredState), string(w.Status), w.StatusReason, w.NodeID, w.ContainerID, now, now)
 	return err
 }
 
 // UpdateStatus transitions a workload's observed status (SRS 12.1
 // "Runtime state"; FR-008, FR-009).
 func (s *Store) UpdateStatus(ctx context.Context, key string, status model.Status, reason, containerID string) error {
-	_, err := s.pool.Exec(ctx, `
-		UPDATE workloads SET status = $2, status_reason = $3, container_id = COALESCE(NULLIF($4, ''), container_id), updated_at = now()
-		WHERE key = $1
-	`, key, string(status), reason, containerID)
+	now := formatTime(time.Now())
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE workloads SET status = ?, status_reason = ?, container_id = COALESCE(NULLIF(?, ''), container_id), updated_at = ?
+		WHERE key = ?
+	`, string(status), reason, containerID, now, key)
 	if err == nil {
-		_, _ = s.pool.Exec(ctx, `INSERT INTO events (workload_key, type, message) VALUES ($1, 'status', $2)`, key, string(status)+": "+reason)
+		_, _ = s.db.ExecContext(ctx, `INSERT INTO events (workload_key, type, message, created_at) VALUES (?, 'status', ?, ?)`, key, string(status)+": "+reason, now)
 	}
 	return err
 }
 
 // GetWorkload returns one workload by key.
 func (s *Store) GetWorkload(ctx context.Context, key string) (*WorkloadRecord, error) {
-	row := s.pool.QueryRow(ctx, `
+	row := s.db.QueryRowContext(ctx, `
 		SELECT project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, storage_class, storage_pinned_node, volumes, depends_on, desired_state, status, status_reason, node_id, container_id
-		FROM workloads WHERE key = $1
+		FROM workloads WHERE key = ?
 	`, key)
-	return scanWorkload(row)
+	rec, err := scanWorkload(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: workload %q", ErrNotFound, key)
+	}
+	return rec, err
 }
 
 // AssignedWorkloads returns workloads assigned to a node, including failed
@@ -491,9 +551,9 @@ func (s *Store) GetWorkload(ctx context.Context, key string) (*WorkloadRecord, e
 // Stopped workloads are excluded because their containers should be cleaned
 // up. This is the agent's pull-based assignment feed (SRS 6.2).
 func (s *Store) AssignedWorkloads(ctx context.Context, nodeID string) ([]WorkloadRecord, error) {
-	rows, err := s.pool.Query(ctx, `
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, storage_class, storage_pinned_node, volumes, depends_on, desired_state, status, status_reason, node_id, container_id
-		FROM workloads WHERE node_id = $1 AND status <> 'stopped'
+		FROM workloads WHERE node_id = ? AND status <> 'stopped'
 	`, nodeID)
 	if err != nil {
 		return nil, err
@@ -516,14 +576,14 @@ func (s *Store) AssignedWorkloads(ctx context.Context, nodeID string) ([]Workloa
 // (SRS 8.1-8.2: "The registry maps service identity to one or more actual
 // endpoints"). There is no separate registry table — a ready workload row
 // plus its node's address *is* the registry entry. Only the internal
-// container port is returned: DNS-based service discovery (M7) resolves to
-// this port regardless of whether the workload also publishes a host port.
+// container port is returned: service discovery resolves to this port
+// regardless of whether the workload also publishes a host port.
 func (s *Store) ListReadyServiceInstances(ctx context.Context, project, service string) ([]model.ServiceInstance, error) {
-	rows, err := s.pool.Query(ctx, `
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT w.node_id, n.address, w.container_ports, w.status
 		FROM workloads w
 		JOIN nodes n ON n.id = w.node_id
-		WHERE w.project = $1 AND w.service = $2 AND w.status IN ('running', 'ready')
+		WHERE w.project = ? AND w.service = ? AND w.status IN ('running', 'ready')
 	`, project, service)
 	if err != nil {
 		return nil, err
@@ -559,12 +619,12 @@ func (s *Store) ListReadyServiceInstances(ctx context.Context, project, service 
 // includes assigned/starting workloads so containers can get names for all
 // Compose services at creation time, independent of depends_on.
 func (s *Store) ListProjectServiceTargets(ctx context.Context, project string) ([]model.ServiceInstance, error) {
-	rows, err := s.pool.Query(ctx, `
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT w.service, w.node_id, n.address, w.container_ports, w.status
 		FROM workloads w
 		JOIN nodes n ON n.id = w.node_id
-		WHERE w.project = $1 AND w.desired_state = 'running'
-		  AND w.node_id IS NOT NULL AND w.status NOT IN ('failed', 'stopped')
+		WHERE w.project = ? AND w.desired_state = 'running'
+		  AND w.node_id IS NOT NULL AND w.node_id != '' AND w.status NOT IN ('failed', 'stopped')
 		ORDER BY w.service,
 		         CASE WHEN w.status IN ('running', 'ready') THEN 0 ELSE 1 END,
 		         w.node_id

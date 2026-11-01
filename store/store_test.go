@@ -2,7 +2,7 @@ package store_test
 
 import (
 	"context"
-	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -10,20 +10,19 @@ import (
 	"github.com/abhishek/hardware-aware-container-orchestrator/store"
 )
 
-// openTestStore connects to a disposable PostgreSQL instance named by
-// HACO_TEST_POSTGRES_DSN and skips the test if it isn't set — these are
-// integration tests against the real schema, not unit tests.
+// openTestStore opens a fresh SQLite database in a temp directory — a
+// real file-backed database exercising the actual schema and driver, not
+// an in-memory stand-in, but needing no external service to run. Each
+// test gets its own file, so these can run in parallel or repeatedly
+// without ever needing to be skipped.
 func openTestStore(t *testing.T) *store.Store {
 	t.Helper()
-	dsn := os.Getenv("HACO_TEST_POSTGRES_DSN")
-	if dsn == "" {
-		t.Skip("HACO_TEST_POSTGRES_DSN not set; skipping store integration test")
-	}
-	s, err := store.Open(context.Background(), dsn)
+	path := filepath.Join(t.TempDir(), "test.db")
+	s, err := store.Open(context.Background(), path)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	t.Cleanup(s.Close)
+	t.Cleanup(func() { _ = s.Close() })
 	return s
 }
 

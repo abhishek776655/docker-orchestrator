@@ -1,9 +1,10 @@
 services:
   cache:
     image: redis:7-alpine
+    platform: linux/arm64
     command: ["redis-server", "--port", "6380", "--protected-mode", "no"]
-    expose:
-      - "6380"
+    ports:
+      - "6380:6380"
     volumes:
       - cache-data:/data
     x-haco-pin-node: node-a
@@ -11,6 +12,7 @@ services:
     mem_limit: "134217728"
 
   api:
+    platform: linux/arm64
     build:
       context: ./api
     ports:

@@ -28,6 +28,7 @@ The first delivery is a deterministic scheduler simulator. It establishes placem
 - [Service-name DNS plan](docs/superpowers/plans/2026-10-19-service-name-dns.md) · [testing notes](docs/testing/service-name-dns.md)
 - [M7 hardware-aware scheduling](docs/planning/m7-hardware-aware-scheduling.md)
 - [Roadmap (post-M7)](docs/planning/roadmap.md)
+- [SQLite migration](docs/planning/sqlite-migration.md) (roadmap item 1, done)
 
 ## Running the MVP
 
@@ -50,9 +51,11 @@ Compose file used below.
 ### 1. Dependencies
 
 ```bash
-docker run -d --name haco-postgres -e POSTGRES_PASSWORD=haco -e POSTGRES_DB=haco -p 55432:5432 postgres:16-alpine
 docker run -d --name haco-registry -p 5050:5000 registry:2
 ```
+
+Metadata storage is an embedded SQLite file (`~/.haco/control-plane.db` by
+default, override with `HACO_DB_PATH`) — no separate database container.
 
 ### 2. Build the binaries
 
@@ -65,24 +68,35 @@ go build -o bin/hacoctl ./cmd/hacoctl   # thin CLI over the control-plane API, u
 ### 3. Start the control plane
 
 ```bash
-HACO_LISTEN_ADDR=:8099 \
-HACO_REGISTRY_ADDR=localhost:5050 \
-./bin/controlplane &
+HACO_REGISTRY_ADDR=localhost:5050 ./bin/controlplane &
 ```
 
-Logs confirm the build service, reconciler, and DNS resolver all started.
+Logs confirm the build service and reconciler started, and print a
+one-time agent join command — copy it, it's needed in the next step (it
+expires after 10 minutes).
 
-### 4. Register two nodes
+### 4. Join a node
+
+Agents authenticate via a one-time join token (mTLS after that) rather
+than a bare URL — paste the command the control plane printed:
 
 ```bash
-HACO_CONTROLPLANE_URL=http://localhost:8099 HACO_NODE_ID=node-a HACO_NODE_ADDRESS=host.docker.internal ./bin/agent &
-HACO_CONTROLPLANE_URL=http://localhost:8099 HACO_NODE_ID=node-b HACO_NODE_ADDRESS=127.0.0.2         ./bin/agent &
+./bin/agent join '<token the control plane printed>'
+```
 
+For a second simulated node on this same machine, give it a distinct ID
+(the credential is saved per node ID under `~/.haco/agent-credentials/`):
+
+```bash
+HACO_NODE_ID=node-b ./bin/agent join '<a fresh token — run hacoctl join-token>'
+```
+
+```bash
 ./bin/hacoctl nodes
 ```
 
-(On real hosts, each command runs on its own machine, no `DOCKER_HOST`
-override needed, and `HACO_NODE_ADDRESS` is that host's real IP.)
+(On real hosts, the agent runs on its own machine with no `DOCKER_HOST`
+override needed, and auto-detects its own LAN address.)
 
 ### 5. Validate the Compose project (dry run, no side effects)
 
@@ -134,7 +148,8 @@ duplicated — while any ephemeral workload on it gets rescheduled to
 
 ```bash
 pkill -f bin/controlplane; pkill -f bin/agent
-docker rm -f haco-mvpdemo-cache-latest haco-mvpdemo-api-latest haco-postgres haco-registry
+docker rm -f haco-mvpdemo-cache-latest haco-mvpdemo-api-latest haco-registry
+rm -rf ~/.haco   # metadata db, agent credentials, TLS identity, node-local volumes
 ```
 
 ### Two real machines
