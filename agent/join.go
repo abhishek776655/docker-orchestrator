@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -85,15 +84,11 @@ func joinWithClient(ctx context.Context, bundle agentjoin.Bundle, nodeID, creden
 	if err := os.Chmod(credentialPath, 0600); err != nil {
 		return Config{}, err
 	}
-	u, err := url.Parse(bundle.Endpoint)
-	if err != nil {
-		return Config{}, err
-	}
 	address, err := detectAgentAddress()
 	if err != nil {
 		return Config{}, err
 	}
-	return Config{NodeID: nodeID, Address: address, ControlPlaneURL: bundle.Endpoint, DNSAddress: net.JoinHostPort(u.Hostname(), "53"), DNSSuffix: suffix, Credential: result.Credential, TLSFingerprint: bundle.Fingerprint}, nil
+	return Config{NodeID: nodeID, Address: address, ControlPlaneURL: bundle.Endpoint, Credential: result.Credential, TLSFingerprint: bundle.Fingerprint}, nil
 }
 
 func LoadCredential(path string) (Config, error) {
@@ -108,10 +103,6 @@ func LoadCredential(path string) (Config, error) {
 	if saved.NodeID == "" || saved.Credential == "" || saved.Endpoint == "" || saved.Fingerprint == "" {
 		return Config{}, fmt.Errorf("credential file is incomplete")
 	}
-	u, err := url.Parse(saved.Endpoint)
-	if err != nil {
-		return Config{}, err
-	}
 	address, err := detectAgentAddress()
 	if err != nil {
 		return Config{}, err
@@ -120,7 +111,7 @@ func LoadCredential(path string) (Config, error) {
 	if suffix == "" {
 		suffix = "haco"
 	}
-	return Config{NodeID: saved.NodeID, Address: address, ControlPlaneURL: saved.Endpoint, DNSAddress: net.JoinHostPort(u.Hostname(), "53"), DNSSuffix: suffix, Credential: saved.Credential, TLSFingerprint: saved.Fingerprint}, nil
+	return Config{NodeID: saved.NodeID, Address: address, ControlPlaneURL: saved.Endpoint, Credential: saved.Credential, TLSFingerprint: saved.Fingerprint}, nil
 }
 
 func detectAgentAddress() (string, error) {

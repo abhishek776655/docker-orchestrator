@@ -554,6 +554,46 @@ func (s *Store) ListReadyServiceInstances(ctx context.Context, project, service 
 	return out, rows.Err()
 }
 
+// ListProjectServiceTargets returns reachable service targets for workloads
+// assigned to a node in a project. Unlike ListReadyServiceInstances, it
+// includes assigned/starting workloads so containers can get names for all
+// Compose services at creation time, independent of depends_on.
+func (s *Store) ListProjectServiceTargets(ctx context.Context, project string) ([]model.ServiceInstance, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT w.service, w.node_id, n.address, w.container_ports, w.status
+		FROM workloads w
+		JOIN nodes n ON n.id = w.node_id
+		WHERE w.project = $1 AND w.desired_state = 'running'
+		  AND w.node_id IS NOT NULL AND w.status NOT IN ('failed', 'stopped')
+		ORDER BY w.service,
+		         CASE WHEN w.status IN ('running', 'ready') THEN 0 ELSE 1 END,
+		         w.node_id
+	`, project)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []model.ServiceInstance
+	for rows.Next() {
+		var service, nodeID, address, status string
+		var containerPortsJSON []byte
+		if err := rows.Scan(&service, &nodeID, &address, &containerPortsJSON, &status); err != nil {
+			return nil, err
+		}
+		var ports []int
+		_ = json.Unmarshal(containerPortsJSON, &ports)
+		if len(ports) == 0 {
+			continue
+		}
+		out = append(out, model.ServiceInstance{
+			Project: project, Service: service, NodeID: nodeID,
+			Address: address, ContainerPort: ports[0], Status: model.Status(status),
+		})
+	}
+	return out, rows.Err()
+}
+
 type scannable interface {
 	Scan(dest ...any) error
 }

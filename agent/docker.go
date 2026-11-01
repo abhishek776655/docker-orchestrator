@@ -4,10 +4,9 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
-	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -38,11 +37,9 @@ const (
 // Agents talk to Docker exclusively over this local client; the socket
 // itself is never exposed to the LAN (SRS §11).
 type Docker struct {
-	cli       *client.Client
-	nodeID    string // scopes managed-container labels/filters (see ManagedContainers)
-	dataDir   string // root for node-local persistent volumes (SRS §10)
-	dnsIP     string // control plane's service-name resolver; "" disables it
-	dnsSuffix string // e.g. "haco"; search domain becomes "<project>.<suffix>"
+	cli     *client.Client
+	nodeID  string // scopes managed-container labels/filters (see ManagedContainers)
+	dataDir string // root for node-local persistent volumes (SRS §10)
 }
 
 // NewDocker builds a Docker client. nodeID scopes every container this
@@ -51,32 +48,12 @@ type Docker struct {
 // one Docker daemon (this project's local dev/test setup, documented in
 // the M3-M7 docs): without it, one node's orphan-cleanup pass can remove
 // another node's live container, since labels without a node scope look
-// identical regardless of which agent created them. dnsAddr is the
-// control plane's service-name resolver address (host:port, e.g.
-// "10.0.0.1:53"); pass "" to disable container DNS configuration.
-// Docker's container-level DNS setting (HostConfig.DNS) always queries
-// port 53 — there is no way to point it at a custom port — so a dnsAddr
-// whose port isn't "53" is accepted but has no effect on containers, only
-// a logged warning: see the M7 doc for why a local dev machine usually
-// can't bind 53 itself.
-func NewDocker(nodeID, dataDir, dnsAddr, dnsSuffix string) (*Docker, error) {
+func NewDocker(nodeID, dataDir string) (*Docker, error) {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return nil, fmt.Errorf("docker client: %w", err)
 	}
-	d := &Docker{cli: cli, nodeID: nodeID, dataDir: dataDir, dnsSuffix: dnsSuffix}
-	if dnsAddr != "" {
-		host, port, err := net.SplitHostPort(dnsAddr)
-		if err != nil {
-			return nil, fmt.Errorf("dns address %q: %w", dnsAddr, err)
-		}
-		if port == "53" {
-			d.dnsIP = host
-		} else {
-			log.Printf("dns address %s does not use port 53; container-native DNS resolution needs port 53 and will not be configured (M7 known limitation)", dnsAddr)
-		}
-	}
-	return d, nil
+	return &Docker{cli: cli, nodeID: nodeID, dataDir: dataDir}, nil
 }
 
 // VolumeHostPath derives the on-disk directory for one of a workload's
@@ -88,26 +65,6 @@ func NewDocker(nodeID, dataDir, dnsAddr, dnsSuffix string) (*Docker, error) {
 func (d *Docker) VolumeHostPath(workloadKey, containerPath string) string {
 	sanitize := strings.NewReplacer("/", "_", ":", "_")
 	return filepath.Join(d.dataDir, sanitize.Replace(workloadKey), sanitize.Replace(containerPath))
-}
-
-// dnsServers returns the container-level nameserver list, or nil when no
-// usable (port-53) resolver is configured.
-func (d *Docker) dnsServers() []string {
-	if d.dnsIP == "" {
-		return nil
-	}
-	return []string{d.dnsIP}
-}
-
-// dnsSearchDomains returns the project-scoped search domain so a workload
-// can look up a dependency by its bare service name (e.g. `metaapi`
-// resolves via the search domain to `metaapi.<project>.<suffix>`), matching
-// the registry's project-scoped namespacing (SRS 8.3).
-func (d *Docker) dnsSearchDomains(project string) []string {
-	if d.dnsIP == "" || d.dnsSuffix == "" {
-		return nil
-	}
-	return []string{project + "." + d.dnsSuffix}
 }
 
 // prepareVolumes ensures each node-local persistent mount's host
@@ -219,7 +176,7 @@ func ContainerName(key string) string {
 // Host ports are bound 1:1 to the same container port; the model has no
 // separate container-port field yet, so this is an M2 simplification to
 // revisit once the Compose importer (M4) supplies real port mappings.
-func (d *Docker) EnsureRunning(ctx context.Context, w model.Workload) (containerID string, warnings []string, err error) {
+func (d *Docker) EnsureRunning(ctx context.Context, w model.Workload, extraHosts ...string) (containerID string, warnings []string, err error) {
 	name := ContainerName(w.Key())
 
 	mounts, warnings, err := d.prepareVolumes(w)
@@ -233,7 +190,7 @@ func (d *Docker) EnsureRunning(ctx context.Context, w model.Workload) (container
 		if err != nil {
 			return "", warnings, fmt.Errorf("inspect workload image %s: %w", w.Image, err)
 		}
-		if !containerImageMatches(existing.Image, image.ID) {
+		if !containerImageMatches(existing.Image, image.ID) || !containerHostsMatch(existing.HostConfig, extraHosts) {
 			// The workload key (and therefore its container name) stays the
 			// same across redeploys. A mutable tag such as :latest can now
 			// point at a different image, so remove the old container before
@@ -285,8 +242,7 @@ func (d *Docker) EnsureRunning(ctx context.Context, w model.Workload) (container
 		&container.HostConfig{
 			PortBindings: bindings,
 			Mounts:       mounts,
-			DNS:          d.dnsServers(),
-			DNSSearch:    d.dnsSearchDomains(w.Project),
+			ExtraHosts:   extraHosts,
 			Resources: container.Resources{
 				NanoCPUs: w.Resources.CPUMillis * 1_000_000,
 				Memory:   w.Resources.MemoryBytes,
@@ -307,6 +263,13 @@ func (d *Docker) EnsureRunning(ctx context.Context, w model.Workload) (container
 
 func containerImageMatches(containerImageID, desiredImageID string) bool {
 	return containerImageID != "" && containerImageID == desiredImageID
+}
+
+func containerHostsMatch(hostConfig *container.HostConfig, expected []string) bool {
+	if hostConfig == nil {
+		return len(expected) == 0
+	}
+	return len(hostConfig.DNS) == 0 && len(hostConfig.DNSSearch) == 0 && slices.Equal(hostConfig.ExtraHosts, expected)
 }
 
 // ManagedContainer is one container this agent created, identified by the

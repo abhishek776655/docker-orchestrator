@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -80,6 +81,20 @@ func TestContainerImageMatchesDetectsUpdatedImageBehindSameTag(t *testing.T) {
 	}
 	if !containerImageMatches("sha256:same-image", "sha256:same-image") {
 		t.Fatal("container with the desired image ID should be reusable")
+	}
+}
+
+func TestProjectServiceHostEntriesIncludeServicesWithoutDependsOn(t *testing.T) {
+	got, err := projectServiceHostEntries([]model.ServiceInstance{
+		{Service: "metaapi", Address: "192.168.1.11", ContainerPort: 5001, Status: model.StatusAssigned},
+		{Service: "worker", Address: "192.168.1.12", ContainerPort: 9000, Status: model.StatusReady},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"metaapi:192.168.1.11", "worker:192.168.1.12"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("projectServiceHostEntries() = %v, want %v", got, want)
 	}
 }
 

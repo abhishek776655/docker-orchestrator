@@ -15,7 +15,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -29,14 +31,8 @@ type Config struct {
 	ControlPlaneURL string
 	HeartbeatPeriod time.Duration
 	PollPeriod      time.Duration
-	// DNSAddress and DNSSuffix point containers at the control plane's
-	// service-name resolver (SRS 8.3) instead of injecting endpoint
-	// variables: a workload's own environment is never mutated by
-	// dependency resolution (M7).
-	DNSAddress     string
-	DNSSuffix      string
-	Credential     string
-	TLSFingerprint string
+	Credential      string
+	TLSFingerprint  string
 }
 
 // Agent is one running node agent instance.
@@ -221,18 +217,13 @@ func (a *Agent) cleanupOrphans(ctx context.Context, assignedHere map[string]bool
 }
 
 // execute drives one workload through pulling -> starting -> running ->
-// ready, reporting each transition (SRS 6.2, contracts "Runtime state").
-// DependsOn is gated first (SRS 7.1 depends_on, FR-014, UC-05): the
-// workload is only started once every dependency has a ready instance in
-// the registry. Unlike the M3 mechanism this replaces, dependency
-// resolution never mutates the workload's environment — a dependency's
-// actual address is resolved by the container's own DNS query against the
-// control plane's service-name resolver (SRS 8.3, UC-06), configured once
-// at container creation, not injected per-dependency here.
+// ready, reporting each transition. Dependencies are gated on registry
+// state and mapped to node addresses in the container's /etc/hosts; the
+// Compose environment itself stays unchanged.
 func (a *Agent) execute(ctx context.Context, rec store.WorkloadRecord) {
 	key := rec.Key()
 
-	ready, err := a.dependenciesReady(ctx, rec.Project, rec.DependsOn)
+	extraHosts, ready, err := a.resolveDependencies(ctx, rec.Project, rec.DependsOn)
 	if err != nil {
 		a.report(ctx, key, model.StatusFailed, "dependency resolution failed: "+err.Error(), "")
 		return
@@ -249,7 +240,7 @@ func (a *Agent) execute(ctx context.Context, rec store.WorkloadRecord) {
 	}
 
 	a.report(ctx, key, model.StatusStarting, "", "")
-	containerID, volWarnings, err := a.docker.EnsureRunning(ctx, rec.Workload)
+	containerID, volWarnings, err := a.docker.EnsureRunning(ctx, rec.Workload, extraHosts...)
 	if err != nil {
 		a.report(ctx, key, model.StatusFailed, "start failed: "+err.Error(), "")
 		return
@@ -273,22 +264,52 @@ func (a *Agent) execute(ctx context.Context, rec store.WorkloadRecord) {
 	a.report(ctx, key, model.StatusReady, "", containerID)
 }
 
-// dependenciesReady checks the control plane's service registry for every
-// entry in deps and reports whether all of them currently have at least
-// one ready instance (SRS UC-05, FR-014). It resolves nothing and mutates
-// no workload state — actual address resolution happens via DNS once the
-// container is running, not here.
-func (a *Agent) dependenciesReady(ctx context.Context, project string, deps []string) (bool, error) {
-	for _, dep := range deps {
-		var instances []model.ServiceInstance
-		if err := a.get(ctx, "/v1/services/"+project+"/"+dep, &instances); err != nil {
-			return false, err
-		}
-		if len(instances) == 0 {
-			return false, nil
+// resolveDependencies returns Docker extra-host entries for all assigned
+// project services, while preserving depends_on readiness gating.
+func (a *Agent) resolveDependencies(ctx context.Context, project string, deps []string) ([]string, bool, error) {
+	var instances []model.ServiceInstance
+	if err := a.get(ctx, "/v1/services/"+project, &instances); err != nil {
+		return nil, false, err
+	}
+	entries, err := projectServiceHostEntries(instances)
+	if err != nil {
+		return nil, false, err
+	}
+	readyServices := make(map[string]bool, len(instances))
+	for _, instance := range instances {
+		if instance.Status == model.StatusReady || instance.Status == model.StatusRunning {
+			readyServices[instance.Service] = true
 		}
 	}
-	return true, nil
+	for _, dep := range deps {
+		if !readyServices[dep] {
+			return nil, false, nil
+		}
+	}
+	return entries, true, nil
+}
+
+func projectServiceHostEntries(instances []model.ServiceInstance) ([]string, error) {
+	addresses := make(map[string]string, len(instances))
+	for _, instance := range instances {
+		if _, exists := addresses[instance.Service]; exists {
+			continue // use one instance per name in this simple LAN implementation
+		}
+		if net.ParseIP(instance.Address) == nil {
+			return nil, fmt.Errorf("service %q has invalid node address %q", instance.Service, instance.Address)
+		}
+		addresses[instance.Service] = instance.Address
+	}
+	services := make([]string, 0, len(addresses))
+	for service := range addresses {
+		services = append(services, service)
+	}
+	sort.Strings(services)
+	entries := make([]string, 0, len(services))
+	for _, service := range services {
+		entries = append(entries, service+":"+addresses[service])
+	}
+	return entries, nil
 }
 
 func (a *Agent) report(ctx context.Context, key string, status model.Status, reason, containerID string) {

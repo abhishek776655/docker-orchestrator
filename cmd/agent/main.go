@@ -46,17 +46,13 @@ func main() {
 	if address := os.Getenv("HACO_NODE_ADDRESS"); address != "" {
 		cfg.Address = address
 	}
-	if dns := os.Getenv("HACO_DNS_ADDRESS"); dns != "" {
-		cfg.DNSAddress = dns
-	}
-	cfg.DNSSuffix = envOr("HACO_DNS_SUFFIX", cfg.DNSSuffix)
 	run(cfg)
 }
 
 func run(cfg agent.Config) {
 	home, _ := os.UserHomeDir()
 	dataDir := envOr("HACO_DATA_DIR", filepath.Join(home, ".haco", "volumes", cfg.NodeID))
-	docker, err := agent.NewDocker(cfg.NodeID, dataDir, cfg.DNSAddress, cfg.DNSSuffix)
+	docker, err := agent.NewDocker(cfg.NodeID, dataDir)
 	if err != nil {
 		log.Fatalf("docker client: %v", err)
 	}

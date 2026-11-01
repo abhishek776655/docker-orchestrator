@@ -32,6 +32,7 @@ func NewHandler(svc *Service) http.Handler {
 	mux.HandleFunc("POST /v1/agent/status", svc.handleReportStatus)
 
 	mux.HandleFunc("GET /v1/services/{project}/{service}", svc.handleListServiceInstances)
+	mux.HandleFunc("GET /v1/services/{project}", svc.handleListProjectServices)
 
 	mux.HandleFunc("POST /v1/compose/plan", svc.handleComposePlan)
 	mux.HandleFunc("POST /v1/compose/deploy", svc.handleComposeDeploy)
@@ -54,6 +55,7 @@ func NewAgentHandler(svc *Service) http.Handler {
 	mux.Handle("GET /v1/agent/{node}/assignments", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleAssignments)))
 	mux.Handle("POST /v1/agent/status", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleReportStatus)))
 	mux.Handle("GET /v1/services/{project}/{service}", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleListServiceInstances)))
+	mux.Handle("GET /v1/services/{project}", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleListProjectServices)))
 	return logRequests(mux)
 }
 
@@ -283,6 +285,15 @@ type reportStatusRequest struct {
 
 func (svc *Service) handleListServiceInstances(w http.ResponseWriter, r *http.Request) {
 	instances, err := svc.ListServiceInstances(r.Context(), r.PathValue("project"), r.PathValue("service"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, instances)
+}
+
+func (svc *Service) handleListProjectServices(w http.ResponseWriter, r *http.Request) {
+	instances, err := svc.ListProjectServices(r.Context(), r.PathValue("project"))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return

@@ -190,3 +190,8 @@ func (svc *Service) Metrics(ctx context.Context) (*store.Metrics, error) {
 func (svc *Service) ListServiceInstances(ctx context.Context, project, service string) ([]model.ServiceInstance, error) {
 	return svc.store.ListReadyServiceInstances(ctx, project, service)
 }
+
+// ListProjectServices returns endpoint records for assigned, active services in a project.
+func (svc *Service) ListProjectServices(ctx context.Context, project string) ([]model.ServiceInstance, error) {
+	return svc.store.ListProjectServiceTargets(ctx, project)
+}
