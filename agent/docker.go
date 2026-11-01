@@ -14,12 +14,12 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
 	"golang.org/x/sys/unix"
 
+	"github.com/abhishek/hardware-aware-container-orchestrator/dockerutil"
 	"github.com/abhishek/hardware-aware-container-orchestrator/model"
 )
 
@@ -49,7 +49,7 @@ type Docker struct {
 // the M3-M7 docs): without it, one node's orphan-cleanup pass can remove
 // another node's live container, since labels without a node scope look
 func NewDocker(nodeID, dataDir string) (*Docker, error) {
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := dockerutil.NewClient()
 	if err != nil {
 		return nil, fmt.Errorf("docker client: %w", err)
 	}
@@ -70,8 +70,14 @@ func (d *Docker) VolumeHostPath(workloadKey, containerPath string) string {
 // prepareVolumes ensures each node-local persistent mount's host
 // directory exists and reports a warning if the filesystem backing it is
 // nearly full (SRS §10.2: "Storage capacity, mount permissions... must be
-// validated where possible").
-func (d *Docker) prepareVolumes(w model.Workload) ([]mount.Mount, []string, error) {
+// validated where possible"). It returns legacy `-v`-style bind strings
+// (HostConfig.Binds), not the newer HostConfig.Mounts API: Docker
+// Desktop's Mounts path has a documented bug where its bind-source
+// existence check sometimes doesn't see a directory created moments
+// earlier (surfaced by this exact workflow — create the volume dir, then
+// immediately start a container into it), even though the same path
+// mounts fine via `-v`/Binds.
+func (d *Docker) prepareVolumes(w model.Workload) ([]string, []string, error) {
 	if w.Storage.Class != model.NodeLocalPersistent {
 		if len(w.Volumes) > 0 {
 			return nil, nil, fmt.Errorf("volumes declared but storage class is %q, not node_local_persistent", w.Storage.Class)
@@ -79,7 +85,7 @@ func (d *Docker) prepareVolumes(w model.Workload) ([]mount.Mount, []string, erro
 		return nil, nil, nil
 	}
 
-	var mounts []mount.Mount
+	var binds []string
 	var warnings []string
 	for _, v := range w.Volumes {
 		hostPath := d.VolumeHostPath(w.Key(), v.ContainerPath)
@@ -89,14 +95,13 @@ func (d *Docker) prepareVolumes(w model.Workload) ([]mount.Mount, []string, erro
 		if pct, err := diskUsedPercent(hostPath); err == nil && pct > 90 {
 			warnings = append(warnings, fmt.Sprintf("volume %s is %.0f%% full", hostPath, pct))
 		}
-		mounts = append(mounts, mount.Mount{
-			Type:     mount.TypeBind,
-			Source:   hostPath,
-			Target:   v.ContainerPath,
-			ReadOnly: v.ReadOnly,
-		})
+		bind := hostPath + ":" + v.ContainerPath
+		if v.ReadOnly {
+			bind += ":ro"
+		}
+		binds = append(binds, bind)
 	}
-	return mounts, warnings, nil
+	return binds, warnings, nil
 }
 
 func diskUsedPercent(path string) (float64, error) {
@@ -179,7 +184,7 @@ func ContainerName(key string) string {
 func (d *Docker) EnsureRunning(ctx context.Context, w model.Workload, extraHosts ...string) (containerID string, warnings []string, err error) {
 	name := ContainerName(w.Key())
 
-	mounts, warnings, err := d.prepareVolumes(w)
+	binds, warnings, err := d.prepareVolumes(w)
 	if err != nil {
 		return "", nil, fmt.Errorf("prepare volumes: %w", err)
 	}
@@ -241,7 +246,7 @@ func (d *Docker) EnsureRunning(ctx context.Context, w model.Workload, extraHosts
 		},
 		&container.HostConfig{
 			PortBindings: bindings,
-			Mounts:       mounts,
+			Binds:        binds,
 			ExtraHosts:   extraHosts,
 			Resources: container.Resources{
 				NanoCPUs: w.Resources.CPUMillis * 1_000_000,

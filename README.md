@@ -29,6 +29,7 @@ The first delivery is a deterministic scheduler simulator. It establishes placem
 - [M7 hardware-aware scheduling](docs/planning/m7-hardware-aware-scheduling.md)
 - [Roadmap (post-M7)](docs/planning/roadmap.md)
 - [SQLite migration](docs/planning/sqlite-migration.md) (roadmap item 1, done)
+- [Bootstrap/CLI ergonomics](docs/planning/bootstrap-ergonomics.md) (roadmap item 2, done)
 
 ## Running the MVP
 
@@ -48,16 +49,7 @@ Compose file used below.
 > like the 1:1 host/container port binding and service-name DNS needing a
 > free port 53) are documented in the `docs/planning/m2`...`m7` files.
 
-### 1. Dependencies
-
-```bash
-docker run -d --name haco-registry -p 5050:5000 registry:2
-```
-
-Metadata storage is an embedded SQLite file (`~/.haco/control-plane.db` by
-default, override with `HACO_DB_PATH`) — no separate database container.
-
-### 2. Build the binaries
+### 1. Build the binaries
 
 ```bash
 go build -o bin/controlplane ./cmd/controlplane
@@ -65,17 +57,25 @@ go build -o bin/agent ./cmd/agent
 go build -o bin/hacoctl ./cmd/hacoctl   # thin CLI over the control-plane API, used below
 ```
 
-### 3. Start the control plane
+There are no other dependencies to install by hand: metadata storage is an
+embedded SQLite file (`~/.haco/control-plane.db` by default, override with
+`HACO_DB_PATH`), the Docker socket is auto-detected (plain Linux, Docker
+Desktop, Rancher Desktop, Colima, rootless Docker all work without setting
+`DOCKER_HOST` — only needed for a nonstandard setup), and the local
+registry container is started automatically, below.
+
+### 2. Start the control plane
 
 ```bash
 HACO_REGISTRY_ADDR=localhost:5050 ./bin/controlplane &
 ```
 
-Logs confirm the build service and reconciler started, and print a
-one-time agent join command — copy it, it's needed in the next step (it
+This one command starts a local `registry:2` container for you (reused on
+later runs), the build service, and the reconciler — then prints a
+one-time agent join command; copy it, it's needed in the next step (it
 expires after 10 minutes).
 
-### 4. Join a node
+### 3. Join a node
 
 Agents authenticate via a one-time join token (mTLS after that) rather
 than a bare URL — paste the command the control plane printed:
@@ -98,7 +98,7 @@ HACO_NODE_ID=node-b ./bin/agent join '<a fresh token — run hacoctl join-token>
 (On real hosts, the agent runs on its own machine with no `DOCKER_HOST`
 override needed, and auto-detects its own LAN address.)
 
-### 5. Validate the Compose project (dry run, no side effects)
+### 4. Validate the Compose project (dry run, no side effects)
 
 ```bash
 ./bin/hacoctl plan mvpdemo examples/mvp-demo/docker-compose.yml
@@ -108,7 +108,7 @@ Check `Rejections` is empty before continuing — a non-empty list means
 something in the Compose file isn't supported yet (see
 [compose-compatibility-matrix.md](docs/compose-compatibility-matrix.md)).
 
-### 6. Deploy it
+### 5. Deploy it
 
 ```bash
 ./bin/hacoctl deploy mvpdemo examples/mvp-demo/docker-compose.yml
@@ -121,7 +121,7 @@ ready). Redeploying the same project+service+revision later is safe — it
 replaces the previous attempt rather than conflicting with it, even if
 that attempt never finished.
 
-### 7. Check it's running
+### 6. Check it's running
 
 ```bash
 ./bin/hacoctl status mvpdemo cache latest
@@ -130,21 +130,21 @@ curl -s http://localhost:8099/v1/services/mvpdemo/cache   # the service registry
 curl -s http://localhost:9090/                            # the deployed api, directly
 ```
 
-### 8. Try the operational endpoints
+### 7. Try the operational endpoints
 
 ```bash
 ./bin/hacoctl events    # audit trail
 ./bin/hacoctl metrics   # node/workload counts
 ```
 
-### 9. Prove reconciliation (optional)
+### 8. Prove reconciliation (optional)
 
 Kill `node-a`'s agent process, wait ~15s past the heartbeat timeout, and
 watch `cache` (pinned, stateful) get marked `failed` — never silently
 duplicated — while any ephemeral workload on it gets rescheduled to
 `node-b` automatically. `GET /v1/events` shows the whole sequence.
 
-### 10. Clean up
+### 9. Clean up
 
 ```bash
 pkill -f bin/controlplane; pkill -f bin/agent

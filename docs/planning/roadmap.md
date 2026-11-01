@@ -28,7 +28,11 @@ with no loss of correctness at this scale.
   out of scope for now, and not part of this project's design (single
   control plane is itself a documented MVP assumption, §18).
 
-## 2. Bootstrap/CLI ergonomics
+## 2. Bootstrap/CLI ergonomics — ✅ done
+
+See [bootstrap-ergonomics.md](bootstrap-ergonomics.md) for what actually
+shipped (including a real Docker Desktop volume-mount bug found and fixed
+along the way).
 
 - **Auto-detect the Docker socket** in both `agent` and `controlplane`
   binaries, instead of requiring `DOCKER_HOST` to be set manually

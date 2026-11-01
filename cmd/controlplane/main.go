@@ -17,15 +17,26 @@ import (
 	"github.com/abhishek/hardware-aware-container-orchestrator/agentjoin"
 	"github.com/abhishek/hardware-aware-container-orchestrator/build"
 	"github.com/abhishek/hardware-aware-container-orchestrator/controlplane"
+	"github.com/abhishek/hardware-aware-container-orchestrator/dockerutil"
 	"github.com/abhishek/hardware-aware-container-orchestrator/netutil"
 	"github.com/abhishek/hardware-aware-container-orchestrator/store"
-	"github.com/docker/docker/client"
 )
 
 func main() {
 	addr := envOr("HACO_LISTEN_ADDR", "127.0.0.1:8099")
 	agentAddr := envOr("HACO_AGENT_LISTEN_ADDR", ":8443")
-	registry := resolveRegistryAddr()
+
+	advertiseHost := os.Getenv("HACO_AGENT_ADVERTISE_HOST")
+	if advertiseHost == "" {
+		var err error
+		advertiseHost, err = netutil.DetectLocalIP()
+		if err != nil {
+			log.Fatalf("detect control-plane LAN address: %v (set HACO_AGENT_ADVERTISE_HOST)", err)
+		}
+	}
+
+	registryPort := envOr("HACO_REGISTRY_PORT", "5050")
+	registry := resolveRegistryAddr(advertiseHost, registryPort)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -43,14 +54,6 @@ func main() {
 
 	svc := controlplane.New(s)
 	dataDir := envOr("HACO_DATA_DIR", defaultDataDir())
-	advertiseHost := os.Getenv("HACO_AGENT_ADVERTISE_HOST")
-	if advertiseHost == "" {
-		var err error
-		advertiseHost, err = netutil.DetectLocalIP()
-		if err != nil {
-			log.Fatalf("detect control-plane LAN address: %v (set HACO_AGENT_ADVERTISE_HOST)", err)
-		}
-	}
 	port := 8443
 	if _, p, err := net.SplitHostPort(agentAddr); err == nil {
 		if _, scanErr := fmt.Sscanf(p, "%d", &port); scanErr != nil {
@@ -65,9 +68,15 @@ func main() {
 	joinManager := controlplane.NewJoinManager(s, fmt.Sprintf("https://%s", net.JoinHostPort(advertiseHost, fmt.Sprint(port))), fingerprint, dnsSuffix)
 	svc = svc.WithJoinManager(joinManager)
 	if registry != "" {
-		dockerCli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+		dockerCli, err := dockerutil.NewClient()
 		if err != nil {
 			log.Fatalf("docker client for build service: %v", err)
+		}
+		if host, port, splitErr := net.SplitHostPort(registry); splitErr == nil && isLocalRegistryHost(host, advertiseHost) {
+			if err := ensureLocalRegistry(ctx, dockerCli, port); err != nil {
+				log.Fatalf("auto-start local registry: %v", err)
+			}
+			log.Printf("local registry container %s running on port %s", localRegistryContainerName, port)
 		}
 		svc = svc.WithBuilder(build.New(dockerCli, registry))
 		log.Printf("compose build service enabled, pushing to %s", registry)
@@ -145,20 +154,24 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 // resolveRegistryAddr returns the registry address to advertise to agents
 // (used both to tag pushed images and to push them). An empty
 // HACO_REGISTRY_ADDR disables the build service entirely — that default
-// is unchanged. Setting it to "auto" auto-detects this host's own LAN IP
-// and appends HACO_REGISTRY_PORT (default 5050), so a two-machine
+// is unchanged. Setting it to "auto" uses advertiseHost (this host's own
+// LAN IP, already detected for the agent API) and port — a two-machine
 // deployment needs no manual IP lookup on the control-plane side either.
-func resolveRegistryAddr() string {
+func resolveRegistryAddr(advertiseHost, port string) string {
 	addr := os.Getenv("HACO_REGISTRY_ADDR")
 	if addr != "auto" {
 		return addr
 	}
-	ip, err := netutil.DetectLocalIP()
-	if err != nil {
-		log.Fatalf("HACO_REGISTRY_ADDR=auto but IP auto-detection failed: %v; set it explicitly", err)
-	}
-	port := envOr("HACO_REGISTRY_PORT", "5050")
-	resolved := ip + ":" + port
+	resolved := advertiseHost + ":" + port
 	log.Printf("HACO_REGISTRY_ADDR=auto resolved to %s", resolved)
 	return resolved
+}
+
+// isLocalRegistryHost reports whether a registry address points at this
+// same machine — "localhost"/"127.0.0.1" always does, as does the
+// control plane's own detected LAN address (the "auto" case). Only then
+// does ensureLocalRegistry manage it; a genuinely remote, operator-owned
+// registry (e.g. registry.example.com) is never touched.
+func isLocalRegistryHost(host, advertiseHost string) bool {
+	return host == "localhost" || host == "127.0.0.1" || host == advertiseHost
 }
