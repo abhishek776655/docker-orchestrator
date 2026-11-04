@@ -174,8 +174,19 @@ func (d *Docker) CachedImages(ctx context.Context) ([]string, error) {
 }
 
 // PullImage pulls an image reference, draining the progress stream.
-func (d *Docker) PullImage(ctx context.Context, ref string) error {
-	rc, err := d.cli.ImagePull(ctx, ref, types.ImagePullOptions{})
+// architecture, when non-empty ("amd64"/"arm64"), requests that platform's
+// manifest explicitly instead of letting Docker default to this daemon's
+// own native platform — needed for a workload scheduled here via emulation
+// (an arm64 node running an amd64-only image under Rosetta/qemu): without
+// it, Docker silently pulls nothing for an image with no native-arch
+// manifest, and container creation later fails with a confusing "no such
+// image" instead of a clear pull error.
+func (d *Docker) PullImage(ctx context.Context, ref, architecture string) error {
+	opts := types.ImagePullOptions{}
+	if architecture != "" {
+		opts.Platform = "linux/" + architecture
+	}
+	rc, err := d.cli.ImagePull(ctx, ref, opts)
 	if err != nil {
 		return fmt.Errorf("pull %s: %w", ref, err)
 	}
@@ -219,8 +230,17 @@ func (d *Docker) BuildImage(ctx context.Context, tarball io.Reader, ref, dockerf
 	}
 	defer resp.Body.Close()
 	decoder := json.NewDecoder(resp.Body)
+	// tail keeps the last few lines of Docker's own build log stream (what
+	// `docker build` prints to the terminal) so a failure's error message
+	// can show the actual command output — e.g. git/ssh's real stderr
+	// ("Permission denied (publickey)", "Host key verification failed") —
+	// instead of just "returned a non-zero code: N", which says nothing
+	// about *why* the command failed.
+	const tailLines = 20
+	var tail []string
 	for {
 		var message struct {
+			Stream      string `json:"stream"`
 			Error       string `json:"error"`
 			ErrorDetail struct {
 				Message string `json:"message"`
@@ -232,11 +252,25 @@ func (d *Docker) BuildImage(ctx context.Context, tarball io.Reader, ref, dockerf
 			}
 			return fmt.Errorf("read build %s output: %w", ref, err)
 		}
-		if message.ErrorDetail.Message != "" {
-			return fmt.Errorf("build %s: %s", ref, message.ErrorDetail.Message)
+		if message.Stream != "" {
+			for _, line := range strings.Split(message.Stream, "\n") {
+				if line = strings.TrimSpace(line); line != "" {
+					tail = append(tail, line)
+					if len(tail) > tailLines {
+						tail = tail[1:]
+					}
+				}
+			}
 		}
-		if message.Error != "" {
-			return fmt.Errorf("build %s: %s", ref, message.Error)
+		detail := message.ErrorDetail.Message
+		if detail == "" {
+			detail = message.Error
+		}
+		if detail != "" {
+			if len(tail) > 0 {
+				return fmt.Errorf("build %s: %s\n--- last build output ---\n%s", ref, detail, strings.Join(tail, "\n"))
+			}
+			return fmt.Errorf("build %s: %s", ref, detail)
 		}
 	}
 	built, _, err := d.cli.ImageInspectWithRaw(ctx, ref)

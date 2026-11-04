@@ -289,7 +289,7 @@ func (a *Agent) execute(ctx context.Context, rec store.WorkloadRecord) {
 		}
 	} else if !rec.SkipPull {
 		a.report(ctx, key, model.StatusPulling, "", "")
-		if err := a.docker.PullImage(ctx, rec.Image); err != nil {
+		if err := a.docker.PullImage(ctx, rec.Image, rec.Constraints.Architecture); err != nil {
 			a.report(ctx, key, model.StatusFailed, "pull failed: "+err.Error(), "")
 			return
 		}

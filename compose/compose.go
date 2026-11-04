@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/compose-spec/compose-go/v2/dotenv"
 	"github.com/compose-spec/compose-go/v2/loader"
 	"github.com/compose-spec/compose-go/v2/types"
 
@@ -77,7 +78,7 @@ func Load(ctx context.Context, project, workingDir string, yaml []byte) (*Plan, 
 	details := types.ConfigDetails{
 		WorkingDir:  workingDir,
 		ConfigFiles: []types.ConfigFile{{Filename: "docker-compose.yml", Content: yaml}},
-		Environment: types.Mapping{},
+		Environment: interpolationEnvironment(workingDir),
 	}
 
 	proj, err := loader.LoadWithContext(ctx, details, loader.WithSkipValidation)
@@ -85,6 +86,7 @@ func Load(ctx context.Context, project, workingDir string, yaml []byte) (*Plan, 
 		return nil, fmt.Errorf("parse compose file: %w", err)
 	}
 	proj.Name = project
+
 
 	plan := &Plan{
 		Project: project,
@@ -155,6 +157,31 @@ func Load(ctx context.Context, project, workingDir string, yaml []byte) (*Plan, 
 
 	plan.Rejections = append(plan.Rejections, ValidateGraph(plan.Workloads)...)
 	return plan, nil
+}
+
+// interpolationEnvironment builds the variable set compose-go uses to
+// resolve every ${VAR} reference in the Compose file (env_file paths
+// aside — those are resolved later, in convertService). Real `docker
+// compose` sources this from two places: a .env file next to the Compose
+// file in the project directory, and the calling shell's own environment,
+// with the shell taking precedence — Load previously passed an always-
+// empty map here, so every such reference silently resolved to "" instead
+// (visible as compose-go's own "variable is not set" warnings), which is
+// how a real secret like SSH_PRIVATE_KEY ended up blank in a build arg
+// even when it was genuinely exported before starting the control plane.
+func interpolationEnvironment(workingDir string) types.Mapping {
+	env := types.Mapping{}
+	if dotEnv, err := dotenv.Read(filepath.Join(workingDir, ".env")); err == nil {
+		for k, v := range dotEnv {
+			env[k] = v
+		}
+	}
+	for _, kv := range os.Environ() {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			env[k] = v
+		}
+	}
+	return env
 }
 
 func analyzeServicePorts(networking *NetworkRecommendation, unpublishedPortIssues map[string][]string, hasPublishedPort map[string]bool, service string, svc types.ServiceConfig) {

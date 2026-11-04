@@ -387,3 +387,39 @@ volumes:
 		t.Fatalf("frontendapi: expected its literal bind-mount host path cleared once unpinned, got %+v", byService["frontendapi"].Volumes)
 	}
 }
+
+// TestLoadInterpolatesFromDotEnvAndProcessEnvironment covers a real bug: a
+// $-referenced build arg (e.g. an SSH deploy key) must resolve from the
+// project's own .env file and the calling process's environment, exactly
+// like real `docker compose` — not silently blank out, which is what an
+// always-empty interpolation environment did before.
+func TestLoadInterpolatesFromDotEnvAndProcessEnvironment(t *testing.T) {
+	workingDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workingDir, ".env"), []byte("FROM_DOTENV=dotenv-value\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FROM_PROCESS_ENV", "process-value")
+
+	yaml := []byte(`
+services:
+  app:
+    image: app:latest
+    environment:
+      - A=${FROM_DOTENV}
+      - B=${FROM_PROCESS_ENV}
+`)
+	plan, err := compose.Load(context.Background(), "demo", workingDir, yaml)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(plan.Workloads) != 1 {
+		t.Fatalf("workloads = %d, want 1", len(plan.Workloads))
+	}
+	env := plan.Workloads[0].Env
+	if env["A"] != "dotenv-value" {
+		t.Fatalf("A = %q, want value from .env file", env["A"])
+	}
+	if env["B"] != "process-value" {
+		t.Fatalf("B = %q, want value from process environment", env["B"])
+	}
+}

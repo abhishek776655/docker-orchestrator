@@ -112,8 +112,16 @@ func (s *Service) Build(ctx context.Context, project, revision string, spec comp
 
 func consumeDockerStream(r io.Reader, operation string) error {
 	decoder := json.NewDecoder(r)
+	// tail keeps the last few lines of Docker's own log stream (what
+	// `docker build`/`docker push` prints to the terminal) so a failure's
+	// error can show the actual command output — e.g. git/ssh's real
+	// stderr ("Permission denied (publickey)") — instead of just
+	// "returned a non-zero code: N", which says nothing about why.
+	const tailLines = 20
+	var tail []string
 	for {
 		var message struct {
+			Stream      string `json:"stream"`
 			Error       string `json:"error"`
 			ErrorDetail struct {
 				Message string `json:"message"`
@@ -125,11 +133,25 @@ func consumeDockerStream(r io.Reader, operation string) error {
 			}
 			return fmt.Errorf("read %s output: %w", operation, err)
 		}
-		if message.ErrorDetail.Message != "" {
-			return fmt.Errorf("%s: %s", operation, message.ErrorDetail.Message)
+		if message.Stream != "" {
+			for _, line := range strings.Split(message.Stream, "\n") {
+				if line = strings.TrimSpace(line); line != "" {
+					tail = append(tail, line)
+					if len(tail) > tailLines {
+						tail = tail[1:]
+					}
+				}
+			}
 		}
-		if message.Error != "" {
-			return fmt.Errorf("%s: %s", operation, message.Error)
+		detail := message.ErrorDetail.Message
+		if detail == "" {
+			detail = message.Error
+		}
+		if detail != "" {
+			if len(tail) > 0 {
+				return fmt.Errorf("%s: %s\n--- last build output ---\n%s", operation, detail, strings.Join(tail, "\n"))
+			}
+			return fmt.Errorf("%s: %s", operation, detail)
 		}
 	}
 }
