@@ -116,6 +116,13 @@ type StoragePolicy struct {
 }
 
 // Constraints are the hard eligibility requirements for a workload
+// PortBinding pairs one published container port with the host port it's
+// bound to — see Workload.PortBindings.
+type PortBinding struct {
+	ContainerPort int
+	HostPort      int
+}
+
 // (SRS 9.1 step 2). Any node failing one of these is rejected before
 // scoring, regardless of score.
 type Constraints struct {
@@ -158,9 +165,8 @@ type Workload struct {
 	// same Docker daemon that built it).
 	RemoteBuild *RemoteBuildSpec
 	// Command overrides the image's default entrypoint arguments when
-	// non-empty (e.g. telling an app to listen on the specific host port
-	// this workload was assigned, given the M2/M3 1:1 host-port
-	// simplification in agent/docker.go).
+	// non-empty (e.g. telling an app to listen on a specific container
+	// port it was assigned).
 	Command     []string
 	Env         map[string]string
 	Resources   Resources
@@ -168,13 +174,49 @@ type Workload struct {
 	// ContainerPorts are service listening ports for internal, name-based
 	// communication. They are independent of optional host-published ports.
 	ContainerPorts []int
-	Storage        StoragePolicy
+	// PortBindings is the explicit container-port -> host-port pair for
+	// every published port — independent host/container remapping (e.g.
+	// publish 5600 for a container listening on 5000). Constraints.
+	// HostPorts (just the host port numbers) is what the scheduler
+	// reserves/conflict-checks; PortBindings is what the agent needs to
+	// actually bind each one to the right container port, since they can
+	// differ. A workload with no entry here for an otherwise-published
+	// port (e.g. built directly via the raw submit API rather than
+	// Compose) falls back to binding host port == container port, the
+	// original M2 simplification.
+	PortBindings []PortBinding
+	Storage      StoragePolicy
 	Volumes        []VolumeMount
 	DesiredState   DesiredState
 	// DependsOn lists logical service names (another workload's Service
 	// field) that must have at least one ready instance before this
 	// workload is started (SRS 7.1 depends_on, FR-014, UC-05).
 	DependsOn []string
+	// DependsOnHealthy is the subset of DependsOn declared with
+	// `condition: service_healthy` rather than the default
+	// service_started — those require an instance to have actually passed
+	// its own Docker healthcheck (status ready), not merely be running;
+	// every other entry in DependsOn is satisfied by running or ready.
+	DependsOnHealthy []string
+	// HealthCheck is this workload's own Docker healthcheck, when its
+	// Compose service declares one and it isn't disabled — nil otherwise.
+	// When set, the agent waits for Docker to report it healthy before
+	// transitioning the workload to StatusReady, instead of doing so
+	// immediately after the container starts running; that's also what
+	// lets DependsOnHealthy mean something for whatever depends on this
+	// workload.
+	HealthCheck *HealthCheck
+}
+
+// HealthCheck is the Docker-native subset of a Compose healthcheck: block
+// the control plane actually needs to pass to the container on creation
+// and to interpret `docker inspect`'s reported status afterward.
+type HealthCheck struct {
+	Test        []string
+	Interval    time.Duration
+	Timeout     time.Duration
+	Retries     int
+	StartPeriod time.Duration
 }
 
 // VolumeMount is one node-local persistent mount for a workload with

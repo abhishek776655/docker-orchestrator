@@ -26,9 +26,12 @@ func NewHandler(svc *Service) http.Handler {
 
 	mux.HandleFunc("POST /v1/workloads", svc.handleSubmit)
 	mux.HandleFunc("GET /v1/workloads", svc.handleListWorkloads)
+	mux.HandleFunc("GET /v1/projects", svc.handleListProjects)
 	mux.HandleFunc("GET /v1/workloads/{key...}", svc.handleGetWorkload)
 	mux.HandleFunc("GET /v1/workloads/{project}/{service}/{revision}/logs", svc.handleGetWorkloadLogs)
 	mux.HandleFunc("POST /v1/workloads/{project}/{service}/{revision}/stop", svc.handleStopWorkload)
+	mux.HandleFunc("DELETE /v1/workloads/{project}/{service}/{revision}", svc.handleDeleteWorkload)
+	mux.HandleFunc("DELETE /v1/workloads", svc.handleDeleteWorkloads)
 
 	mux.HandleFunc("GET /v1/agent/{node}/assignments", svc.handleAssignments)
 	mux.HandleFunc("POST /v1/agent/status", svc.handleReportStatus)
@@ -109,7 +112,13 @@ func (svc *Service) handleRevokeAgent(w http.ResponseWriter, r *http.Request) {
 }
 
 func (svc *Service) handleDeleteNode(w http.ResponseWriter, r *http.Request) {
-	if err := svc.DeleteNode(r.Context(), r.PathValue("id")); err != nil {
+	force := r.URL.Query().Get("force") == "true"
+	err := svc.DeleteNode(r.Context(), r.PathValue("id"), force)
+	if errors.Is(err, ErrNodeHasActiveWorkloads) {
+		writeError(w, http.StatusConflict, err)
+		return
+	}
+	if err != nil {
 		writeError(w, http.StatusNotFound, err)
 		return
 	}
@@ -291,6 +300,15 @@ func (svc *Service) handleListWorkloads(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, workloads)
 }
 
+func (svc *Service) handleListProjects(w http.ResponseWriter, r *http.Request) {
+	projects, err := svc.ListProjects(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, projects)
+}
+
 func (svc *Service) handleGetWorkload(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 	rec, err := svc.GetWorkload(r.Context(), key)
@@ -379,6 +397,10 @@ type composeRequest struct {
 	Yaml        string `json:"yaml"`
 	NoCache     bool   `json:"no_cache"`
 	OnlyService string `json:"only_service"`
+	// PinHost, when non-nil (including an empty, non-null list), overrides
+	// storage affinity for the whole plan — see
+	// compose.ApplyHostPinOverride. Omitted/null means "no override".
+	PinHost *[]string `json:"pin_host"`
 }
 
 func (svc *Service) handleComposePlan(w http.ResponseWriter, r *http.Request) {
@@ -387,7 +409,7 @@ func (svc *Service) handleComposePlan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	plan, decisions, err := svc.ComposePlan(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), req.OnlyService)
+	plan, decisions, err := svc.ComposePlan(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), req.OnlyService, req.PinHost)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -405,7 +427,7 @@ func (svc *Service) handleComposeBuild(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	plan, results, err := svc.ComposeBuild(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), DeployOptions{NoCache: req.NoCache, OnlyService: req.OnlyService})
+	plan, results, err := svc.ComposeBuild(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), DeployOptions{NoCache: req.NoCache, OnlyService: req.OnlyService, PinHost: req.PinHost})
 	if err != nil {
 		status := http.StatusInternalServerError
 		if plan != nil && !plan.Valid() {
@@ -423,7 +445,7 @@ func (svc *Service) handleComposeDeploy(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	plan, results, err := svc.ComposeDeploy(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), DeployOptions{NoCache: req.NoCache, OnlyService: req.OnlyService})
+	plan, results, err := svc.ComposeDeploy(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), DeployOptions{NoCache: req.NoCache, OnlyService: req.OnlyService, PinHost: req.PinHost})
 	if err != nil {
 		status := http.StatusInternalServerError
 		if plan != nil && !plan.CanDeploy() {
@@ -442,7 +464,7 @@ func (svc *Service) handleListEvents(w http.ResponseWriter, r *http.Request) {
 			limit = n
 		}
 	}
-	events, err := svc.ListEvents(r.Context(), limit)
+	events, err := svc.ListEvents(r.Context(), limit, r.URL.Query().Get("project"))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -451,7 +473,7 @@ func (svc *Service) handleListEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 func (svc *Service) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	m, err := svc.Metrics(r.Context())
+	m, err := svc.Metrics(r.Context(), r.URL.Query().Get("project"))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -521,4 +543,27 @@ func (svc *Service) handleStopWorkload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "stopped"})
+}
+
+func (svc *Service) handleDeleteWorkload(w http.ResponseWriter, r *http.Request) {
+	key := strings.Join([]string{r.PathValue("project"), r.PathValue("service"), r.PathValue("revision")}, "/")
+	err := svc.DeleteWorkload(r.Context(), key)
+	if errors.Is(err, store.ErrNotFound) {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+func (svc *Service) handleDeleteWorkloads(w http.ResponseWriter, r *http.Request) {
+	n, err := svc.DeleteWorkloads(r.Context(), r.URL.Query().Get("project"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "deleted", "count": n})
 }

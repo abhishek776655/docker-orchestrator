@@ -170,6 +170,7 @@ func runHostAgent(ctx context.Context, jm *controlplane.JoinManager, advertiseHo
 	} else {
 		cfg.Address = advertiseHost
 	}
+	cfg.Role = "host"
 
 	docker, err := agent.NewDocker(nodeID, filepath.Join(dataDir, "volumes", nodeID))
 	if err != nil {

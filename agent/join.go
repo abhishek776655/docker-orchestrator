@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -87,6 +88,13 @@ func joinWithClient(ctx context.Context, bundle agentjoin.Bundle, nodeID, creden
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
+		var errBody struct {
+			Error string `json:"error"`
+		}
+		data, readErr := io.ReadAll(resp.Body)
+		if readErr == nil && json.Unmarshal(data, &errBody) == nil && errBody.Error != "" {
+			return Config{}, fmt.Errorf("join rejected: %s", errBody.Error)
+		}
 		return Config{}, fmt.Errorf("join rejected: HTTP %d", resp.StatusCode)
 	}
 	var result struct {

@@ -16,8 +16,11 @@ project across the two-node cluster (SRS milestone M4, §7).
       ([compose-compatibility-matrix.md](../compose-compatibility-matrix.md)):
       `image`, `build.context/dockerfile/args` (SSH/secrets flagged
       unsupported, not silently dropped), `ports`, `environment`/`env_file`,
-      `depends_on`, `healthcheck` (placeholder detection), `volumes` (bind →
-      reject, named → require `x-haco-pin-node`), `cpus`/`mem_limit`,
+      `depends_on` (including `service_healthy` vs `service_started`
+      gating — see compat matrix), `healthcheck` (translated into the
+      container's real Docker health config, not just placeholder
+      detection — see compat matrix), `volumes` (bind/named, see compat
+      matrix for the full policy), `cpus`/`mem_limit`,
       `platform`, `restart` (recorded, not enforced), `secrets` (flagged,
       not delivered), `extra_hosts` (reject). Unsupported or ambiguous
       configuration is reported, never dropped (FR-003).

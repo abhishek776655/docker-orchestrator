@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/compose-spec/compose-go/v2/loader"
 	"github.com/compose-spec/compose-go/v2/types"
@@ -114,9 +115,20 @@ func Load(ctx context.Context, project, workingDir string, yaml []byte) (*Plan, 
 		}
 	}
 
+	// unpublishedPortIssues holds each service's unpublished-port problems
+	// without committing them to the plan yet — a service with at least one
+	// other published port is presumed reachable through that one (its
+	// unpublished port is almost always something internal-only, like a
+	// database's cluster/gossip port, that no dependent actually calls
+	// cross-host); only a service with NO published ports at all, that some
+	// other service actually depends_on, is a real cross-host reachability
+	// concern worth forcing the whole plan into an unprovisioned Swarm
+	// overlay for.
+	unpublishedPortIssues := map[string][]string{}
+	hasPublishedPort := map[string]bool{}
 	for _, name := range names {
 		svc := proj.Services[name]
-		analyzeServicePorts(&plan.Networking, name, svc)
+		analyzeServicePorts(&plan.Networking, unpublishedPortIssues, hasPublishedPort, name, svc)
 		wl, build, warnings, rejections := convertService(project, workingDir, name, svc, buildContexts)
 		plan.Warnings = append(plan.Warnings, warnings...)
 		plan.Rejections = append(plan.Rejections, rejections...)
@@ -126,11 +138,26 @@ func Load(ctx context.Context, project, workingDir string, yaml []byte) (*Plan, 
 		}
 	}
 
-	plan.Rejections = append(plan.Rejections, validateGraph(plan.Workloads)...)
+	neededByDependent := map[string]bool{}
+	for _, wl := range plan.Workloads {
+		for _, dep := range wl.DependsOn {
+			neededByDependent[dep] = true
+		}
+	}
+	for _, name := range names {
+		if !neededByDependent[name] || hasPublishedPort[name] {
+			continue
+		}
+		for _, reason := range unpublishedPortIssues[name] {
+			recommendOverlay(&plan.Networking, reason)
+		}
+	}
+
+	plan.Rejections = append(plan.Rejections, ValidateGraph(plan.Workloads)...)
 	return plan, nil
 }
 
-func analyzeServicePorts(networking *NetworkRecommendation, service string, svc types.ServiceConfig) {
+func analyzeServicePorts(networking *NetworkRecommendation, unpublishedPortIssues map[string][]string, hasPublishedPort map[string]bool, service string, svc types.ServiceConfig) {
 	publishedTargets := map[uint32]bool{}
 	for _, p := range svc.Ports {
 		target := int(p.Target)
@@ -138,26 +165,26 @@ func analyzeServicePorts(networking *NetworkRecommendation, service string, svc 
 			continue
 		}
 		if p.Published == "" {
-			recommendOverlay(networking, fmt.Sprintf("%s: container port %d is not published; LAN routing needs host port %d", service, target, target))
+			unpublishedPortIssues[service] = append(unpublishedPortIssues[service], fmt.Sprintf("%s: container port %d is not published; LAN routing needs host port %d", service, target, target))
 			continue
 		}
-		published, err := strconv.Atoi(p.Published)
-		if err != nil {
+		if _, err := strconv.Atoi(p.Published); err != nil {
 			recommendOverlay(networking, fmt.Sprintf("%s: published port %q cannot be used for direct LAN routing", service, p.Published))
 			continue
 		}
-		if published != target {
-			recommendOverlay(networking, fmt.Sprintf("%s: port mapping %d:%d changes the port in the service URL; use a Swarm overlay to preserve the container port", service, published, target))
-			continue
-		}
+		// A remapped host port (published != target) is fully supported:
+		// the agent binds the real host port to the real container port
+		// independently (model.Workload.PortBindings), so this no longer
+		// needs a Swarm overlay recommendation the way it used to.
 		publishedTargets[p.Target] = true
+		hasPublishedPort[service] = true
 	}
 	for _, exposed := range svc.Expose {
 		target, err := strconv.ParseUint(exposed, 10, 32)
 		if err != nil || target == 0 || publishedTargets[uint32(target)] {
 			continue
 		}
-		recommendOverlay(networking, fmt.Sprintf("%s: exposed container port %d is not published; LAN routing needs host port %d", service, target, target))
+		unpublishedPortIssues[service] = append(unpublishedPortIssues[service], fmt.Sprintf("%s: exposed container port %d is not published; LAN routing needs host port %d", service, target, target))
 	}
 }
 
@@ -232,7 +259,16 @@ func convertService(project, workingDir, name string, svc types.ServiceConfig, b
 
 	wl.Env = map[string]string{}
 	for _, ef := range svc.EnvFiles {
-		fileEnv, err := parseEnvFile(filepath.Join(workingDir, ef.Path))
+		// compose-go already resolves env_file paths to absolute (the same
+		// way it resolves build.context), so joining workingDir again here
+		// would double it up — only join for the (defensive) case of a
+		// still-relative path, which shouldn't happen in practice but costs
+		// nothing to handle correctly.
+		path := ef.Path
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(workingDir, path)
+		}
+		fileEnv, err := parseEnvFile(path)
 		if err != nil {
 			if ef.Required {
 				rejections = append(rejections, fmt.Sprintf("%s: required env_file %s: %v", name, ef.Path, err))
@@ -261,6 +297,7 @@ func convertService(project, workingDir, name string, svc types.ServiceConfig, b
 	// bare `ports: ["5000"]` or `expose:` is internal-only, not an
 	// implicit host exposure.
 	var hostPorts, containerPorts []int
+	var portBindings []model.PortBinding
 	for _, p := range svc.Ports {
 		target := int(p.Target)
 		if target == 0 {
@@ -270,10 +307,20 @@ func convertService(project, workingDir, name string, svc types.ServiceConfig, b
 		if p.Published == "" {
 			continue
 		}
-		if pub, err := strconv.Atoi(p.Published); err == nil && pub != target {
-			warnings = append(warnings, fmt.Sprintf("%s: published port %d differs from container port %d; Compose plan recommends Swarm overlay networking", name, pub, target))
+		pub, err := strconv.Atoi(p.Published)
+		if err != nil {
+			continue
 		}
-		hostPorts = append(hostPorts, target)
+		// Published can legitimately differ from the container's own
+		// listening port (e.g. publish 5600 for a container listening on
+		// 5000) — the host port is what the scheduler reserves/conflict-
+		// checks and what the agent binds externally; the container port
+		// is what the container (and service-name DNS discovery) actually
+		// uses internally. They're tracked as an explicit pair
+		// (PortBinding) so the agent can bind them independently instead
+		// of assuming they're the same number.
+		hostPorts = append(hostPorts, pub)
+		portBindings = append(portBindings, model.PortBinding{ContainerPort: target, HostPort: pub})
 	}
 	for _, e := range svc.Expose {
 		if p, err := strconv.Atoi(e); err == nil {
@@ -282,14 +329,38 @@ func convertService(project, workingDir, name string, svc types.ServiceConfig, b
 	}
 	wl.Constraints.HostPorts = hostPorts
 	wl.ContainerPorts = containerPorts
+	wl.PortBindings = portBindings
 
-	for dep := range svc.DependsOn {
+	for dep, cfg := range svc.DependsOn {
 		wl.DependsOn = append(wl.DependsOn, dep)
+		if cfg.Condition == types.ServiceConditionHealthy {
+			wl.DependsOnHealthy = append(wl.DependsOnHealthy, dep)
+		}
 	}
 	sort.Strings(wl.DependsOn)
+	sort.Strings(wl.DependsOnHealthy)
 
-	if svc.HealthCheck != nil && !svc.HealthCheck.Disable && isPlaceholderHealthCheck(svc.HealthCheck.Test) {
-		warnings = append(warnings, fmt.Sprintf("%s: healthcheck %v looks like a placeholder and does not validate real readiness", name, []string(svc.HealthCheck.Test)))
+	if svc.HealthCheck != nil && !svc.HealthCheck.Disable {
+		if isPlaceholderHealthCheck(svc.HealthCheck.Test) {
+			warnings = append(warnings, fmt.Sprintf("%s: healthcheck %v looks like a placeholder and does not validate real readiness", name, []string(svc.HealthCheck.Test)))
+		}
+		// Carried through regardless of the placeholder warning above —
+		// even a trivial check is a real Docker healthcheck that
+		// DependsOnHealthy can wait on; it just won't catch much.
+		hc := &model.HealthCheck{Test: []string(svc.HealthCheck.Test)}
+		if svc.HealthCheck.Interval != nil {
+			hc.Interval = time.Duration(*svc.HealthCheck.Interval)
+		}
+		if svc.HealthCheck.Timeout != nil {
+			hc.Timeout = time.Duration(*svc.HealthCheck.Timeout)
+		}
+		if svc.HealthCheck.Retries != nil {
+			hc.Retries = int(*svc.HealthCheck.Retries)
+		}
+		if svc.HealthCheck.StartPeriod != nil {
+			hc.StartPeriod = time.Duration(*svc.HealthCheck.StartPeriod)
+		}
+		wl.HealthCheck = hc
 	}
 
 	pinHost, _ := svc.Extensions["x-haco-pin-host"].(bool)
@@ -317,17 +388,30 @@ func convertService(project, workingDir, name string, svc types.ServiceConfig, b
 				//      directory that isn't anyone's build context, like a
 				//      one-off init-scripts directory).
 				// Anything else falls through to the managed-volume default.
+				//
+				// x-haco-place-anywhere opts a service entirely out of this
+				// detection: a compose file commonly bind-mounts every
+				// service's own source by convention (devcontainer
+				// boilerplate) even though only one or two are actually
+				// being live-edited at a time — forcing every such service
+				// onto one fixed host would defeat scheduling across the
+				// fleet. With it set, the bind mount's host path is ignored
+				// like any other data volume and the service is free to
+				// land (and then stay pinned to) whichever node it's
+				// actually scheduled on.
 				reason := ""
-				switch {
-				case isRegularFile(v.Source):
-					reason = "a bind mount whose source is a single file"
-				case matchesAnyBuildContext(v.Source, buildContexts):
-					reason = "a bind mount whose source is a service's build context"
-				case bindHostPath:
-					reason = "x-haco-bind-host-path"
+				if !placeAnywhere {
+					switch {
+					case isRegularFile(v.Source):
+						reason = "a bind mount whose source is a single file"
+					case matchesAnyBuildContext(v.Source, buildContexts):
+						reason = "a bind mount whose source is a service's build context"
+					case bindHostPath:
+						reason = "x-haco-bind-host-path"
+					}
 				}
 				if reason != "" {
-					storage, mount, probs := bindLiteralHostPath(name, reason, v, svc, placeAnywhere)
+					storage, mount, probs := bindLiteralHostPath(name, reason, v, svc)
 					if len(probs) > 0 {
 						rejections = append(rejections, probs...)
 						continue
@@ -386,12 +470,15 @@ func convertService(project, workingDir, name string, svc types.ServiceConfig, b
 		wl.Resources.MemoryBytes = int64(svc.MemLimit)
 	}
 
-	wl.Constraints.Architecture = "amd64"
+	// No explicit platform: leave Architecture unset (no hard constraint) so
+	// the workload can schedule onto whatever node is available, rather than
+	// assuming amd64 — wrong on an arm64-only fleet (e.g. Apple Silicon
+	// nodes) and needlessly restrictive everywhere else.
 	if svc.Platform != "" {
 		if arch, ok := platformArch(svc.Platform); ok {
 			wl.Constraints.Architecture = arch
 		} else {
-			warnings = append(warnings, fmt.Sprintf("%s: platform %q not recognized, defaulting architecture constraint to amd64", name, svc.Platform))
+			warnings = append(warnings, fmt.Sprintf("%s: platform %q not recognized; no architecture constraint applied", name, svc.Platform))
 		}
 	}
 
@@ -447,15 +534,11 @@ func matchesAnyBuildContext(path string, contexts []string) bool {
 // above it in precedence. reason names which one fired, for the rejection
 // messages below. Only correct when the workload actually runs on this
 // control plane's own machine (the filesystem that path was resolved on),
-// so the pin is forced, not defaulted, and a conflicting x-haco-pin-node
-// or x-haco-place-anywhere is a plan-time rejection rather than silently
-// overridden.
-func bindLiteralHostPath(name, reason string, v types.ServiceVolumeConfig, svc types.ServiceConfig, placeAnywhere bool) (model.StoragePolicy, model.VolumeMount, []string) {
-	if placeAnywhere {
-		return model.StoragePolicy{}, model.VolumeMount{}, []string{
-			fmt.Sprintf("%s: %s requires a literal host path, which only works on one specific machine, but x-haco-place-anywhere is also set", name, reason),
-		}
-	}
+// so the pin is forced, not defaulted; a conflicting x-haco-pin-node is a
+// plan-time rejection rather than silently overridden. The caller never
+// reaches this function at all when x-haco-place-anywhere is set — that
+// flag opts out of literal-host-path treatment entirely instead.
+func bindLiteralHostPath(name, reason string, v types.ServiceVolumeConfig, svc types.ServiceConfig) (model.StoragePolicy, model.VolumeMount, []string) {
 	pinned, _ := svc.Extensions["x-haco-pin-node"].(string)
 	host := agent.HostNodeID()
 	if pinned != "" && pinned != host {
@@ -519,7 +602,54 @@ func parseEnvFile(path string) (map[string]string, error) {
 // undefined dependency references, dependency cycles, and host-port
 // conflicts within the same project (compose-compatibility-matrix.md
 // "Required validation").
-func validateGraph(workloads []model.Workload) []string {
+// ApplyHostPinOverride replaces every workload's computed storage affinity
+// with a single, explicit CLI-level decision: only the named services (e.g.
+// the one actually being live-edited, plus stateful services like a
+// database) are pinned to this control-plane host; every other workload is
+// freed to schedule anywhere, even one compose.go's own bind-mount/data-
+// volume heuristics would otherwise have pinned to host (the common
+// devcontainer pattern where every service bind-mounts its own source, even
+// though only a few are actually being developed at once). This needs no
+// x-haco-* annotations in the Compose file itself — it's an override
+// supplied per `hacoctl deploy/plan/build --pin-host <service,...>` call.
+//
+// A workload not in pinHost loses any literal bind-mount HostPath too
+// (same as x-haco-place-anywhere): that path was only ever valid on this
+// one host, so once the workload is free to land elsewhere it must fall
+// back to a normal agent-managed volume instead.
+func ApplyHostPinOverride(plan *Plan, pinHost []string) {
+	keep := make(map[string]bool, len(pinHost))
+	for _, s := range pinHost {
+		if s = strings.TrimSpace(s); s != "" {
+			keep[s] = true
+		}
+	}
+	host := agent.HostNodeID()
+	for i := range plan.Workloads {
+		wl := &plan.Workloads[i]
+		if keep[wl.Service] {
+			wl.Constraints.PinnedNodeID = host
+			if wl.Storage.Class == model.NodeLocalPersistent {
+				wl.Storage.PinnedNodeID = host
+			}
+			continue
+		}
+		if wl.Storage.Class == model.NodeLocalPersistent {
+			wl.Storage.PinnedNodeID = ""
+		}
+		for j := range wl.Volumes {
+			wl.Volumes[j].HostPath = ""
+		}
+	}
+}
+
+// ValidateGraph checks cross-service concerns that only make sense across
+// the whole set being validated together: undefined depends_on references,
+// dependency cycles, and host-port conflicts. Exported so a caller that
+// filters down to a dependency closure (hacoctl deploy/plan --service) can
+// re-run it on just that subset — a port conflict between two services
+// that aren't both actually being deployed together isn't a real conflict.
+func ValidateGraph(workloads []model.Workload) []string {
 	var problems []string
 
 	byService := map[string]model.Workload{}

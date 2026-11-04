@@ -317,13 +317,29 @@ func (d *Docker) EnsureRunning(ctx context.Context, w model.Workload, extraHosts
 
 	exposed := nat.PortSet{}
 	bindings := nat.PortMap{}
-	for _, p := range w.Constraints.HostPorts {
-		port, err := nat.NewPort("tcp", strconv.Itoa(p))
-		if err != nil {
-			return "", warnings, fmt.Errorf("port %d: %w", p, err)
+	// PortBindings carries the real container-port -> host-port pair for
+	// every published port (independent remapping); a workload with none
+	// set (e.g. submitted directly via the raw API rather than Compose)
+	// falls back to the original host==container assumption using
+	// Constraints.HostPorts alone.
+	if len(w.PortBindings) > 0 {
+		for _, pb := range w.PortBindings {
+			containerPort, err := nat.NewPort("tcp", strconv.Itoa(pb.ContainerPort))
+			if err != nil {
+				return "", warnings, fmt.Errorf("container port %d: %w", pb.ContainerPort, err)
+			}
+			exposed[containerPort] = struct{}{}
+			bindings[containerPort] = []nat.PortBinding{{HostIP: "0.0.0.0", HostPort: strconv.Itoa(pb.HostPort)}}
 		}
-		exposed[port] = struct{}{}
-		bindings[port] = []nat.PortBinding{{HostIP: "0.0.0.0", HostPort: strconv.Itoa(p)}}
+	} else {
+		for _, p := range w.Constraints.HostPorts {
+			port, err := nat.NewPort("tcp", strconv.Itoa(p))
+			if err != nil {
+				return "", warnings, fmt.Errorf("port %d: %w", p, err)
+			}
+			exposed[port] = struct{}{}
+			bindings[port] = []nat.PortBinding{{HostIP: "0.0.0.0", HostPort: strconv.Itoa(p)}}
+		}
 	}
 
 	resp, err := d.cli.ContainerCreate(ctx,
@@ -337,6 +353,7 @@ func (d *Docker) EnsureRunning(ctx context.Context, w model.Workload, extraHosts
 				keyLabel:     w.Key(),
 				nodeLabel:    d.nodeID,
 			},
+			Healthcheck: healthConfigFor(w.HealthCheck),
 		},
 		&container.HostConfig{
 			PortBindings: bindings,
@@ -358,6 +375,44 @@ func (d *Docker) EnsureRunning(ctx context.Context, w model.Workload, extraHosts
 		return "", warnings, fmt.Errorf("start container: %w", err)
 	}
 	return resp.ID, warnings, nil
+}
+
+// healthConfigFor translates a workload's Compose-derived healthcheck into
+// the Docker Engine API's own HealthConfig. nil when the workload has no
+// compose-level healthcheck — ContainerCreate then inherits whatever
+// HEALTHCHECK the image itself declares (Docker's own default when
+// Config.Healthcheck is nil), so an image-baked-in healthcheck still
+// works exactly as it did before this field existed; it's only a compose
+// `healthcheck:` block that needs explicit translation.
+func healthConfigFor(hc *model.HealthCheck) *container.HealthConfig {
+	if hc == nil {
+		return nil
+	}
+	return &container.HealthConfig{
+		Test:        hc.Test,
+		Interval:    hc.Interval,
+		Timeout:     hc.Timeout,
+		Retries:     hc.Retries,
+		StartPeriod: hc.StartPeriod,
+	}
+}
+
+// HealthStatus returns the container's Docker-reported health status
+// (types.Starting, types.Healthy, or types.Unhealthy) and when it started,
+// or status "" if it has no healthcheck configured at all — a workload
+// with no model.Workload.HealthCheck and no image-baked-in one either.
+func (d *Docker) HealthStatus(ctx context.Context, containerID string) (status string, startedAt time.Time, err error) {
+	info, err := d.cli.ContainerInspect(ctx, containerID)
+	if err != nil {
+		return "", time.Time{}, err
+	}
+	if info.State != nil {
+		startedAt, _ = time.Parse(time.RFC3339Nano, info.State.StartedAt)
+	}
+	if info.State == nil || info.State.Health == nil {
+		return "", startedAt, nil
+	}
+	return info.State.Health.Status, startedAt, nil
 }
 
 func containerImageMatches(containerImageID, desiredImageID string) bool {

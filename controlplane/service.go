@@ -5,6 +5,7 @@ package controlplane
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -55,19 +56,22 @@ func (svc *Service) WithJoinManager(m *JoinManager) *Service {
 // anything (SRS UC-02, FR-023), and dry-run schedules every workload
 // against current node/reservation state so the plan shows where each
 // service would land without persisting or starting anything.
-func (svc *Service) ComposePlan(ctx context.Context, project, workingDir string, yaml []byte, onlyService string) (*compose.Plan, []*model.Decision, error) {
+func (svc *Service) ComposePlan(ctx context.Context, project, workingDir string, yaml []byte, onlyService string, pinHost *[]string) (*compose.Plan, []*model.Decision, error) {
 	plan, err := compose.Load(ctx, project, workingDir, yaml)
 	if err != nil {
 		return nil, nil, err
 	}
-	if !plan.Valid() {
-		return plan, nil, nil
+	if pinHost != nil {
+		compose.ApplyHostPinOverride(plan, *pinHost)
 	}
 	if onlyService != "" {
 		plan, err = filterToClosure(plan, onlyService)
 		if err != nil {
 			return nil, nil, err
 		}
+	}
+	if !plan.Valid() {
+		return plan, nil, nil
 	}
 
 	decisions, err := svc.dryRunSchedule(ctx, plan.Workloads)
@@ -114,7 +118,44 @@ func filterToClosure(plan *compose.Plan, onlyService string) (*compose.Plan, err
 			filtered.Builds = append(filtered.Builds, b)
 		}
 	}
+
+	// Rejections/warnings/networking reasons from compose.Load are
+	// computed over the WHOLE file; keep only what's actually relevant to
+	// the filtered subset — an unrelated, non-deployed service's env_file
+	// typo or port remap shouldn't block deploying just this one. A
+	// per-service message is prefixed "service: ..."; a cross-service
+	// graph message (host-port conflicts, cycles, undefined depends_on)
+	// has no such prefix and is dropped here, then recomputed fresh
+	// against just the filtered workloads below — a conflict with a
+	// service that isn't actually being deployed alongside this one isn't
+	// a real conflict.
+	filtered.Rejections = filterMessagesByService(plan.Rejections, keep)
+	filtered.Rejections = append(filtered.Rejections, compose.ValidateGraph(filtered.Workloads)...)
+	filtered.Warnings = filterMessagesByService(plan.Warnings, keep)
+	filtered.Networking.Reasons = filterMessagesByService(plan.Networking.Reasons, keep)
+	if len(filtered.Networking.Reasons) == 0 {
+		filtered.Networking.Mode = compose.NetworkModeLAN
+		filtered.Networking.Supported = true
+	}
+
 	return &filtered, nil
+}
+
+// filterMessagesByService keeps a "service: ..." prefixed message only
+// when that service is in keep. A message with no recognizable "name:"
+// prefix (every cross-service graph message, and the one global
+// configs/secrets warning) is dropped here rather than attributed to a
+// guess; callers that need the cross-service checks recompute them fresh
+// against the filtered workload set instead.
+func filterMessagesByService(messages []string, keep map[string]bool) []string {
+	var out []string
+	for _, msg := range messages {
+		name, _, ok := strings.Cut(msg, ":")
+		if ok && keep[name] {
+			out = append(out, msg)
+		}
+	}
+	return out
 }
 
 // dryRunSchedule schedules every workload in order against a single
@@ -174,6 +215,12 @@ type DeployOptions struct {
 	// transitively depends on (see filterToClosure) instead of the whole
 	// Compose file.
 	OnlyService string
+	// PinHost, when non-nil, overrides every workload's computed storage
+	// affinity (see compose.ApplyHostPinOverride): only the named services
+	// pin to this control-plane host, everything else schedules anywhere.
+	// nil means no override — the Compose file's own x-haco-* annotations
+	// (or their defaults) decide affinity as usual.
+	PinHost *[]string
 }
 
 // ComposeDeploy plans a Compose file, builds any services that need it,
@@ -185,17 +232,20 @@ func (svc *Service) ComposeDeploy(ctx context.Context, project, workingDir strin
 	if err != nil {
 		return nil, nil, err
 	}
-	if !plan.Valid() {
-		return plan, nil, fmt.Errorf("compose plan for %s has %d rejection(s)", project, len(plan.Rejections))
-	}
-	if !plan.Networking.Supported {
-		return plan, nil, fmt.Errorf("compose plan recommends %s networking, which is not provisioned yet: %s", plan.Networking.Mode, strings.Join(plan.Networking.Reasons, "; "))
+	if opts.PinHost != nil {
+		compose.ApplyHostPinOverride(plan, *opts.PinHost)
 	}
 	if opts.OnlyService != "" {
 		plan, err = filterToClosure(plan, opts.OnlyService)
 		if err != nil {
 			return nil, nil, err
 		}
+	}
+	if !plan.Valid() {
+		return plan, nil, fmt.Errorf("compose plan for %s has %d rejection(s)", project, len(plan.Rejections))
+	}
+	if !plan.Networking.Supported {
+		return plan, nil, fmt.Errorf("compose plan recommends %s networking, which is not provisioned yet: %s", plan.Networking.Mode, strings.Join(plan.Networking.Reasons, "; "))
 	}
 
 	images, remoteBuilds, err := svc.resolveBuilds(ctx, project, plan, opts.NoCache)
@@ -331,14 +381,17 @@ func (svc *Service) ComposeBuild(ctx context.Context, project, workingDir string
 	if err != nil {
 		return nil, nil, err
 	}
-	if !plan.Valid() {
-		return plan, nil, fmt.Errorf("compose plan for %s has %d rejection(s)", project, len(plan.Rejections))
+	if opts.PinHost != nil {
+		compose.ApplyHostPinOverride(plan, *opts.PinHost)
 	}
 	if opts.OnlyService != "" {
 		plan, err = filterToClosure(plan, opts.OnlyService)
 		if err != nil {
 			return nil, nil, err
 		}
+	}
+	if !plan.Valid() {
+		return plan, nil, fmt.Errorf("compose plan for %s has %d rejection(s)", project, len(plan.Rejections))
 	}
 
 	builtImages, err := svc.buildImages(ctx, project, plan, opts.NoCache)
@@ -356,9 +409,40 @@ func (svc *Service) ComposeBuild(ctx context.Context, project, workingDir string
 
 // DeleteNode hard-removes a node record (and its credential), unlike
 // revoke which only blocks future auth and leaves the row behind.
-func (svc *Service) DeleteNode(ctx context.Context, nodeID string) error {
+// DeleteNode refuses to hard-delete a node that still has a non-terminal
+// workload assigned to it, unless force is set: the reconciler finds
+// workloads needing rescue via an INNER JOIN against the nodes table
+// (WorkloadsOnUnavailableNodes), so a workload whose node_id points at a
+// row that no longer exists at all becomes invisible to it forever —
+// stuck in whatever status it was in, never rescheduled. force is for the
+// operator who's certain nothing there matters anymore (e.g. the node's
+// gone for good and its workloads are already known-dead); it does not
+// itself stop or reschedule anything, the orphaned rows just stay as they
+// are, same as any other already-terminal workload.
+func (svc *Service) DeleteNode(ctx context.Context, nodeID string, force bool) error {
+	if !force {
+		assigned, err := svc.store.AssignedWorkloads(ctx, nodeID)
+		if err != nil {
+			return fmt.Errorf("check assigned workloads: %w", err)
+		}
+		var active []string
+		for _, w := range assigned {
+			if w.Status != model.StatusFailed {
+				active = append(active, w.Key())
+			}
+		}
+		if len(active) > 0 {
+			return fmt.Errorf("%w: node %q still has %d non-terminal workload(s) assigned (%s); stop them first or pass force", ErrNodeHasActiveWorkloads, nodeID, len(active), strings.Join(active, ", "))
+		}
+	}
 	return svc.store.DeleteNode(ctx, nodeID)
 }
+
+// ErrNodeHasActiveWorkloads is DeleteNode's refusal when force isn't set
+// and the node still has a non-terminal workload assigned — distinct from
+// store.ErrNotFound (unknown node) so the API layer can map it to a
+// different status code.
+var ErrNodeHasActiveWorkloads = errors.New("node has active workloads")
 
 // CordonNode blocks a node from receiving any new workload placement
 // without touching what's already running there (see store.CordonNode).
@@ -468,6 +552,13 @@ func (svc *Service) ListWorkloads(ctx context.Context, project string) ([]store.
 	return svc.store.ListWorkloads(ctx, project)
 }
 
+// ListProjects lists every distinct project with a per-status workload
+// count, for `hacoctl projects` — there's no need to run `hacoctl
+// workloads` with no filter and eyeball the PROJECT column.
+func (svc *Service) ListProjects(ctx context.Context) ([]store.ProjectSummary, error) {
+	return svc.store.ListProjects(ctx)
+}
+
 // AssignedWorkloads is the agent's pull feed for one node.
 func (svc *Service) AssignedWorkloads(ctx context.Context, nodeID string) ([]store.WorkloadRecord, error) {
 	return svc.store.AssignedWorkloads(ctx, nodeID)
@@ -477,6 +568,19 @@ func (svc *Service) AssignedWorkloads(ctx context.Context, nodeID string) ([]sto
 // that owns it removes the container on its next assignment poll.
 func (svc *Service) StopWorkload(ctx context.Context, key string) error {
 	return svc.store.StopWorkload(ctx, key)
+}
+
+// DeleteWorkload hard-removes one workload's record (see
+// store.DeleteWorkload's doc comment for why this is safe even for an
+// actively-assigned workload, unlike DeleteNode).
+func (svc *Service) DeleteWorkload(ctx context.Context, key string) error {
+	return svc.store.DeleteWorkload(ctx, key)
+}
+
+// DeleteWorkloads hard-removes every workload record, or (project != "")
+// just those under that project, returning how many were deleted.
+func (svc *Service) DeleteWorkloads(ctx context.Context, project string) (int64, error) {
+	return svc.store.DeleteWorkloads(ctx, project)
 }
 
 // ReportStatus records an agent-observed status transition (SRS 6.2).
@@ -495,13 +599,13 @@ func (svc *Service) GetWorkloadLogs(ctx context.Context, key string) (string, er
 }
 
 // ListEvents returns the most recent audit/history records (SRS FR-024).
-func (svc *Service) ListEvents(ctx context.Context, limit int) ([]store.Event, error) {
-	return svc.store.ListEvents(ctx, limit)
+func (svc *Service) ListEvents(ctx context.Context, limit int, project string) ([]store.Event, error) {
+	return svc.store.ListEvents(ctx, limit, project)
 }
 
 // Metrics returns a minimal operational summary (SRS §13).
-func (svc *Service) Metrics(ctx context.Context) (*store.Metrics, error) {
-	return svc.store.Metrics(ctx)
+func (svc *Service) Metrics(ctx context.Context, project string) (*store.Metrics, error) {
+	return svc.store.Metrics(ctx, project)
 }
 
 // ListServiceInstances resolves a logical service name to its current

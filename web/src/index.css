@@ -1,0 +1,54 @@
+@import "tailwindcss";
+@import "@fontsource-variable/inter";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
+
+@theme {
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-background: #fafafa;
+  --color-foreground: #18181b;
+  --color-card: #ffffff;
+  --color-border: #e4e4e7;
+  --color-muted: #f4f4f5;
+  --color-muted-foreground: #63636b;
+  --color-primary: #18181b;
+  --color-primary-foreground: #fafafa;
+
+  --color-ok: #0b6b5d;
+  --color-ok-soft: #dcefea;
+  --color-ok-fg: #0b5b4f;
+  --color-warn: #b36b00;
+  --color-warn-soft: #fbebcb;
+  --color-warn-fg: #7a4600;
+  --color-bad: #b3261e;
+  --color-bad-soft: #fbe0dd;
+  --color-bad-fg: #9c1f18;
+  --color-off: #8a8a93;
+  --color-off-soft: #e4e4e7;
+  --color-off-fg: #3f3f46;
+  --color-info: #1f4a8a;
+  --color-info-soft: #e3eaf6;
+  --color-info-fg: #1f4a8a;
+}
+
+@layer base {
+  body {
+    margin: 0;
+    background: var(--color-background);
+    color: var(--color-foreground);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.45;
+  }
+  button {
+    cursor: pointer;
+  }
+}
+
+.dot-grid {
+  background-color: var(--color-background);
+  background-image: radial-gradient(#d4d4d8 1px, transparent 1px);
+  background-size: 20px 20px;
+}

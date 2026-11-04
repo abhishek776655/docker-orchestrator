@@ -40,9 +40,16 @@ func TestHardFilters(t *testing.T) {
 			wantReject: "unavailable",
 		},
 		{
-			name:       "architecture mismatch",
-			node:       node("n1", "arm64", 4000, 8_000_000_000),
-			workload:   testdata.SmallWorkload("p", "s"),
+			// amd64-on-arm64 is not a mismatch (arm64 nodes are assumed to
+			// run amd64 via emulation); only an arm64 workload on an amd64
+			// node has no such path.
+			name: "architecture mismatch",
+			node: node("n1", "amd64", 4000, 8_000_000_000),
+			workload: func() model.Workload {
+				w := testdata.SmallWorkload("p", "s")
+				w.Constraints.Architecture = "arm64"
+				return w
+			}(),
 			wantReject: "architecture mismatch",
 		},
 		{
@@ -221,29 +228,48 @@ func TestStoragePinningOverridesHeadroom(t *testing.T) {
 	}
 }
 
-// TestArchitectureMismatchAcrossTwoNodes mirrors the M1 backlog fixture:
-// a workload requiring amd64 must never land on an arm64 node even if
-// it is the only other candidate.
-func TestArchitectureMismatchAcrossTwoNodes(t *testing.T) {
+// TestArm64WorkloadNeverLandsOnAmd64Node: an arm64-only workload must never
+// land on an amd64 node — amd64 hosts have no general arm64 emulation, so
+// this direction of mismatch is still a hard rejection.
+func TestArm64WorkloadNeverLandsOnAmd64Node(t *testing.T) {
 	arm := node("node-arm", "arm64", 4000, 8_000_000_000)
 	amd := node("node-amd", "amd64", 4000, 8_000_000_000)
 	s := scheduler.New([]model.Node{arm, amd})
+
+	w := testdata.SmallWorkload("p", "s")
+	w.Constraints.Architecture = "arm64"
+	decision, err := s.Schedule(w)
+	if err != nil {
+		t.Fatalf("schedule failed: %v", err)
+	}
+	if decision.Selected != "node-arm" {
+		t.Fatalf("expected node-arm, got %s", decision.Selected)
+	}
+	found := false
+	for _, r := range decision.Rejections {
+		if r.NodeID == "node-amd" && strings.Contains(r.Reason, "architecture mismatch") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected architecture mismatch rejection for node-amd, got %+v", decision.Rejections)
+	}
+}
+
+// TestAmd64WorkloadCanLandOnArm64NodeViaEmulation: an arm64 node (Docker
+// Desktop on Apple Silicon) is assumed capable of running an amd64 workload
+// through its built-in emulation (Rosetta/qemu), so it must not be rejected
+// as an eligible candidate just because it's the only one available.
+func TestAmd64WorkloadCanLandOnArm64NodeViaEmulation(t *testing.T) {
+	arm := node("node-arm", "arm64", 4000, 8_000_000_000)
+	s := scheduler.New([]model.Node{arm})
 
 	decision, err := s.Schedule(testdata.SmallWorkload("p", "s"))
 	if err != nil {
 		t.Fatalf("schedule failed: %v", err)
 	}
-	if decision.Selected != "node-amd" {
-		t.Fatalf("expected node-amd, got %s", decision.Selected)
-	}
-	found := false
-	for _, r := range decision.Rejections {
-		if r.NodeID == "node-arm" && strings.Contains(r.Reason, "architecture mismatch") {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("expected architecture mismatch rejection for node-arm, got %+v", decision.Rejections)
+	if decision.Selected != "node-arm" {
+		t.Fatalf("expected node-arm (via emulation), got %s; rejections: %+v", decision.Selected, decision.Rejections)
 	}
 }
 

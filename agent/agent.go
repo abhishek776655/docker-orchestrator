@@ -18,6 +18,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -34,6 +35,22 @@ type Config struct {
 	PollPeriod      time.Duration
 	Credential      string
 	TLSFingerprint  string
+	// Role marks this agent as the one co-located with the control plane
+	// ("host"); empty for every ordinary worker. It is published as a node
+	// label so the web console can draw the host at the center.
+	Role string
+}
+
+// nodeLabels are the descriptive labels every agent registers with: the OS
+// it runs on (runtime.GOOS: darwin, linux, windows) and, for the
+// control-plane host agent, its role. Informational only: no scheduling
+// constraint reads them.
+func (c Config) nodeLabels() map[string]string {
+	labels := map[string]string{"os": runtime.GOOS}
+	if c.Role != "" {
+		labels["haco.io/role"] = c.Role
+	}
+	return labels
 }
 
 // Agent is one running node agent instance.
@@ -99,14 +116,27 @@ func (a *Agent) Run(ctx context.Context) error {
 	defer heartbeat.Stop()
 	defer poll.Stop()
 
+	// Heartbeats get their own goroutine. pollAndExecute can block for
+	// minutes on an image pull or build; if the heartbeat shared its loop, a
+	// busy but healthy node would go silent, be marked unavailable after the
+	// heartbeat timeout, and have its workloads rescheduled elsewhere.
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-heartbeat.C:
+				if err := a.heartbeat(ctx); err != nil {
+					log.Printf("heartbeat failed: %v", err)
+				}
+			}
+		}
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-heartbeat.C:
-			if err := a.heartbeat(ctx); err != nil {
-				log.Printf("heartbeat failed: %v", err)
-			}
 		case <-poll.C:
 			if err := a.pollAndExecute(ctx); err != nil {
 				log.Printf("poll/execute failed: %v", err)
@@ -128,7 +158,7 @@ func (a *Agent) register(ctx context.Context) error {
 		"id":            a.cfg.NodeID,
 		"address":       a.cfg.Address,
 		"architecture":  architecture,
-		"labels":        map[string]string{},
+		"labels":        a.cfg.nodeLabels(),
 		"capabilities":  map[string]bool{},
 		"cpu_millis":    capacity.CPUMillis,
 		"memory_bytes":  capacity.MemoryBytes,
@@ -166,6 +196,21 @@ func (a *Agent) pollAndExecute(ctx context.Context) error {
 				continue
 			}
 			if alive {
+				// Still waiting on its own healthcheck (StatusRunning, not
+				// yet Ready — covers both a Compose healthcheck and one
+				// baked into the image, since HealthStatus doesn't
+				// distinguish the two) — re-check every tick instead of
+				// treating "alive" as "nothing to do", the same as
+				// StatusWaitingDependencies already does for cross-
+				// workload gating. This calls checkHealth directly, not
+				// the full execute() pipeline: re-running execute() would
+				// also redo PullImage/EnsureRunning/WaitRunning every tick
+				// for as long as health is pending, uselessly re-pulling
+				// an unchanged image over and over. Once truly Ready,
+				// rec.Status stops matching StatusRunning and this stops.
+				if rec.Status == model.StatusRunning {
+					a.checkHealth(ctx, rec.Key(), rec.ContainerID)
+				}
 				continue
 			}
 			log.Printf("%s reported %s but its container is gone; re-executing (SRS safe retries)", rec.Key(), rec.Status)
@@ -224,7 +269,7 @@ func (a *Agent) cleanupOrphans(ctx context.Context, assignedHere map[string]bool
 func (a *Agent) execute(ctx context.Context, rec store.WorkloadRecord) {
 	key := rec.Key()
 
-	extraHosts, ready, err := a.resolveDependencies(ctx, rec.Project, rec.DependsOn)
+	extraHosts, ready, err := a.resolveDependencies(ctx, rec.Project, rec.DependsOn, rec.DependsOnHealthy)
 	if err != nil {
 		a.report(ctx, key, model.StatusFailed, "dependency resolution failed: "+err.Error(), "")
 		return
@@ -270,9 +315,45 @@ func (a *Agent) execute(ctx context.Context, rec store.WorkloadRecord) {
 	}
 
 	a.report(ctx, key, model.StatusRunning, "", containerID)
-	// M2 has no real readiness probe yet (healthcheck handling is part of
-	// the Compose importer, M4); a running container is immediately ready.
-	a.report(ctx, key, model.StatusReady, "", containerID)
+	a.checkHealth(ctx, key, containerID)
+}
+
+// checkHealth makes ONE non-blocking check of the container's Docker-
+// reported health status (from either a Compose healthcheck or one baked
+// into the image — HealthStatus doesn't distinguish) and reports Ready,
+// Failed, or neither accordingly. It deliberately does not loop/block
+// waiting for health to pass: execute() runs inside pollAndExecute's
+// single-threaded poll loop, so blocking here would stall every other
+// workload on this node for as long as the healthcheck takes. Instead,
+// pollAndExecute re-invokes execute() (and so this) on every tick for as
+// long as the workload stays StatusRunning with a HealthCheck configured —
+// the same non-blocking-retry pattern StatusWaitingDependencies already
+// uses for cross-workload gating. A container with no healthcheck at all
+// reports status "" and is treated as immediately ready, same as before
+// this existed; "still starting" (not yet healthy, not yet unhealthy) is
+// left exactly as is — reported Running stays Running, re-checked next
+// tick — and a check stuck past a generous safety bound past the
+// container's own start time is treated as failed rather than waiting
+// forever, as a backstop against a wedged check Docker's own
+// Retries-based unhealthy transition should normally already catch.
+func (a *Agent) checkHealth(ctx context.Context, key, containerID string) {
+	status, startedAt, err := a.docker.HealthStatus(ctx, containerID)
+	if err != nil {
+		log.Printf("check health for %s failed: %v", key, err)
+		return
+	}
+	switch status {
+	case "", "healthy":
+		a.report(ctx, key, model.StatusReady, "", containerID)
+	case "unhealthy":
+		a.report(ctx, key, model.StatusFailed, "container reported unhealthy", containerID)
+	default: // "starting", or any other in-progress value
+		if !startedAt.IsZero() && time.Since(startedAt) > 10*time.Minute {
+			a.report(ctx, key, model.StatusFailed, fmt.Sprintf("did not become healthy within 10m (last status: %s)", status), containerID)
+		}
+		// Otherwise: leave it at Running, already reported above; the next
+		// poll tick checks again.
+	}
 }
 
 // buildRemote fetches the build-context tarball the control plane stashed
@@ -298,7 +379,11 @@ func (a *Agent) buildRemote(ctx context.Context, rec store.WorkloadRecord) error
 
 // resolveDependencies returns Docker extra-host entries for all assigned
 // project services, while preserving depends_on readiness gating.
-func (a *Agent) resolveDependencies(ctx context.Context, project string, deps []string) ([]string, bool, error) {
+// healthyDeps is the subset of deps declared `condition: service_healthy`
+// — those need an instance that's actually StatusReady (passed its own
+// healthcheck, see waitHealthy), not merely StatusRunning; every other dep
+// is satisfied by either.
+func (a *Agent) resolveDependencies(ctx context.Context, project string, deps, healthyDeps []string) ([]string, bool, error) {
 	var instances []model.ServiceInstance
 	if err := a.get(ctx, "/v1/services/"+project, &instances); err != nil {
 		return nil, false, err
@@ -307,14 +392,25 @@ func (a *Agent) resolveDependencies(ctx context.Context, project string, deps []
 	if err != nil {
 		return nil, false, err
 	}
-	readyServices := make(map[string]bool, len(instances))
+	needsHealthy := make(map[string]bool, len(healthyDeps))
+	for _, d := range healthyDeps {
+		needsHealthy[d] = true
+	}
+	running, readyOnly := make(map[string]bool, len(instances)), make(map[string]bool, len(instances))
 	for _, instance := range instances {
-		if instance.Status == model.StatusReady || instance.Status == model.StatusRunning {
-			readyServices[instance.Service] = true
+		if instance.Status == model.StatusReady {
+			readyOnly[instance.Service] = true
+			running[instance.Service] = true
+		} else if instance.Status == model.StatusRunning {
+			running[instance.Service] = true
 		}
 	}
 	for _, dep := range deps {
-		if !readyServices[dep] {
+		if needsHealthy[dep] {
+			if !readyOnly[dep] {
+				return nil, false, nil
+			}
+		} else if !running[dep] {
 			return nil, false, nil
 		}
 	}

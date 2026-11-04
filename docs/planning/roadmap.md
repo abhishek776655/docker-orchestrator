@@ -56,12 +56,28 @@ along the way).
 
 ## 3. `hacoctl` command surface — ✅ done
 
-Built: `deploy`, `plan`, `status`, `nodes`, `node <id>`, `workloads`,
-`containers`, `services`, `stop`, `stop-containers`, `logs`, `events`,
-`metrics`, `teardown`, `start`/`stop-all` (control-plane lifecycle),
-`revoke-node`/`remove-node`.
+Built: `deploy`, `plan`, `build`, `status`, `nodes`, `node <id>`,
+`workloads`, `projects`, `containers [project]`, `services`, `stop`,
+`stop-containers [project]`, `logs`, `events [project]`,
+`metrics [project]`, `teardown`, `start`/`stop-all`/`agent run`/`agent
+join` (process lifecycle), `revoke-node`/`remove-node`.
+
+Project filtering is consistent across the board now: `containers`,
+`events`, and `metrics` all gained an optional `[project]` filter
+(matching `workloads`'s existing one) — `events`/`metrics` needed real
+store-layer filtering (`workload_key LIKE 'project/%'`), not just CLI
+plumbing. `projects` is new: lists every distinct project (derived from
+existing workload rows, no new storage) with a per-status workload
+count, so you don't have to run `hacoctl workloads` with no filter and
+eyeball the PROJECT column. `stop-containers [project]` can now target
+one project; `teardown` stays global/unscoped since node-credential
+revocation isn't a per-project concept either way.
 
 Also now built (§5): `hacoctl node cordon <id>` / `uncordon <id>`.
+
+Known gap, not yet addressed: `hacoctl logs` is a one-shot failure-tail
+snapshot, not a live follow/stream — streaming would need agent-initiated
+push, since agents never accept inbound connections today (M3 scope).
 
 ## 4. Registry-optional builds — ✅ done (both cases, unified)
 
@@ -178,3 +194,74 @@ intact. Pages, derived directly from what's discussed above:
 This is the largest single item here — everything above it is
 prerequisite groundwork (list endpoints, cordon API, preview-with-
 placement API) the UI would actually call.
+
+## 9. `hacoctl tui` — ✅ done (v1, read-only)
+
+Added ahead of item 8's full web UI, as a terminal equivalent: a
+Bubble Tea + Bubbles + Lipgloss (charmbracelet) dashboard,
+`cmd/hacoctl/tui.go`. `hacoctl tui [project]` — project scoping is a
+start-time argument only, not interactive filtering.
+
+- **Tabs** (tab/shift+tab or ←/→ to switch): Nodes, Workloads,
+  Containers, Events, Metrics, Services, Projects — mirrors the
+  existing CLI table commands, minus anything action-oriented
+  (deliberately **no** stop/cordon/deploy/revoke from inside the TUI
+  in v1 — that's an explicit, separate v2). Each tab reuses the same
+  view structs and `fetchJSON` helper the equivalent CLI command
+  already built (`nodeView`, `workloadRecordView`,
+  `serviceInstanceView`, `projectSummaryView`,
+  `intListOrDash`/`internalURLs` for the containers tab), plus two new
+  ones (`eventView`, `metricsView`) for the two commands that didn't
+  already have a view struct (`hacoctl events`/`metrics` just dump raw
+  JSON).
+- **Auto-refresh**: polls every 2s via `tea.Tick` + one `tea.Cmd` per
+  tab switch/refresh, off the UI goroutine — a slow or unreachable
+  control plane shows "disconnected, retrying..." in the status bar
+  instead of freezing keypresses or crashing (the same non-blocking-
+  poll principle already applied to the agent's dependency/health
+  checks in item 3's follow-up fixes).
+- **Keybinds**: ↑/↓ or j/k to move the table selection, `r` to force
+  an immediate refresh, `q`/ctrl+c to quit.
+- Smoke-tested (`cmd/hacoctl/tui_test.go`): model construction/Init/
+  Update/View don't panic, and `fetchTabData` shapes every tab's
+  columns/rows correctly against mocked JSON. A separate opt-in
+  integration test (`tui_live_test.go`, gated on
+  `HACO_TUI_LIVE_TEST=1`) exercises the same against a real running
+  control plane — not part of the normal `go test ./...` run.
+
+## 10. Real-file test fixes — ✅ done
+
+Found by actually running `hacoctl plan`/`deploy` against a real,
+39-service Compose file (not a synthetic one):
+
+- **`env_file` path doubling**: `compose.go` joined `workingDir` onto
+  `env_file` paths that compose-go had already resolved to absolute
+  (same as `build.context`), corrupting most of them. Fixed with an
+  `IsAbs` guard.
+- **`--service` scoping didn't narrow validation**: `ComposePlan`/
+  `ComposeDeploy`/`ComposeBuild` checked whole-file validity before
+  calling `filterToClosure`, so a globally-invalid file could never be
+  narrowed to a valid subset. Fixed by filtering first and having
+  `filterToClosure` recompute rejections/warnings/networking for just
+  the filtered subset (`compose.ValidateGraph`, newly exported).
+- **Host/container port remapping**: a `published:target` pair with
+  `published != target` (e.g. `5600:5000`) was silently treated as a
+  Swarm-overlay-only case, and worse, the scheduler's port-conflict
+  check was fed the *container* port instead of the real published
+  one — causing false positive "port conflict" rejections between
+  services whose real host ports never collided. Fixed with a new
+  `model.Workload.PortBindings []PortBinding` (container port ↔ host
+  port pairs), populated by `compose.go` and consumed by
+  `agent.Docker.EnsureRunning` to bind each port independently; falls
+  back to host==container when empty (e.g. the raw `/v1/workloads`
+  submit API, not updated to populate it). `networking.mode` no longer
+  recommends `swarm_overlay` for a remapped-but-published port — only
+  for a genuinely unpublished one.
+- **Architecture defaults/compatibility**: a service with no `platform:` no
+  longer gets a hardcoded `amd64` scheduling requirement — it schedules
+  onto whatever node is available. An arm64 node is also treated as able to
+  run an explicit amd64 workload (`scheduler.architectureCompatible`),
+  since Docker Desktop on Apple Silicon runs amd64 images via Rosetta/qemu
+  emulation; the reverse direction (arm64 workload, amd64 node) is still a
+  hard rejection. Found/fixed while live-testing `--service frontendapi`
+  against the real file on an arm64-only (Apple Silicon) two-node fleet.

@@ -150,7 +150,7 @@ func (s *Scheduler) reject(ns *nodeState, w model.Workload) (string, bool) {
 		return fmt.Sprintf("node %s is %s", n.ID, n.Availability), true
 	}
 
-	if w.Constraints.Architecture != "" && w.Constraints.Architecture != n.Architecture {
+	if w.Constraints.Architecture != "" && !architectureCompatible(n.Architecture, w.Constraints.Architecture) {
 		return fmt.Sprintf("architecture mismatch: node has %s, workload requires %s", n.Architecture, w.Constraints.Architecture), true
 	}
 
@@ -194,6 +194,19 @@ func (s *Scheduler) reject(ns *nodeState, w model.Workload) (string, bool) {
 	}
 
 	return "", false
+}
+
+// architectureCompatible reports whether a workload requiring arch can run
+// on a node whose own CPU architecture is nodeArch. Identical architectures
+// always match; an arm64 node (e.g. Apple Silicon, running Docker Desktop)
+// can additionally run an amd64 workload via that host's built-in emulation
+// (Rosetta/qemu) — the reverse is not assumed, since amd64 hosts generally
+// have no such emulation available.
+func architectureCompatible(nodeArch, arch string) bool {
+	if nodeArch == arch {
+		return true
+	}
+	return nodeArch == "arm64" && arch == "amd64"
 }
 
 // rejectGPU checks a workload's hard GPU requirement against a node's
