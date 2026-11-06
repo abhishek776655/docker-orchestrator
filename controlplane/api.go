@@ -473,8 +473,10 @@ type composeRequest struct {
 	// {"192-168-1-3": ["metaapi"]} to pin metaapi to that worker node
 	// specifically, rather than the control-plane host.
 	PinNodes map[string][]string `json:"pin_nodes"`
-	// Fresh, for /v1/compose/deploy only, skips reusing any currently-
-	// unpinned service's existing stored pin — see DeployOptions.Fresh.
+	// Fresh skips reusing any currently-unpinned service's existing stored
+	// pin — see DeployOptions.Fresh. For /v1/compose/plan, it previews
+	// exactly what /v1/compose/deploy --fresh would actually do, instead
+	// of showing the existing-pin reuse a plain deploy would use.
 	Fresh bool `json:"fresh"`
 }
 
@@ -484,7 +486,7 @@ func (svc *Service) handleComposePlan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	plan, decisions, err := svc.ComposePlan(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), req.OnlyService, req.PinHost, req.PinNodes)
+	plan, decisions, err := svc.ComposePlan(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), req.OnlyService, req.PinHost, req.PinNodes, req.Fresh)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return

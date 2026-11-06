@@ -66,7 +66,7 @@ func (svc *Service) WithJoinManager(m *JoinManager) *Service {
 // anything (SRS UC-02, FR-023), and dry-run schedules every workload
 // against current node/reservation state so the plan shows where each
 // service would land without persisting or starting anything.
-func (svc *Service) ComposePlan(ctx context.Context, project, workingDir string, yaml []byte, onlyService string, pinHost *[]string, pinNodes map[string][]string) (*compose.Plan, []*model.Decision, error) {
+func (svc *Service) ComposePlan(ctx context.Context, project, workingDir string, yaml []byte, onlyService string, pinHost *[]string, pinNodes map[string][]string, fresh bool) (*compose.Plan, []*model.Decision, error) {
 	plan, err := compose.Load(ctx, project, workingDir, yaml)
 	if err != nil {
 		return nil, nil, err
@@ -84,7 +84,7 @@ func (svc *Service) ComposePlan(ctx context.Context, project, workingDir string,
 		return plan, nil, nil
 	}
 
-	decisions, err := svc.dryRunSchedule(ctx, plan.Workloads)
+	decisions, err := svc.dryRunSchedule(ctx, plan.Workloads, fresh)
 	return plan, decisions, err
 }
 
@@ -172,7 +172,7 @@ func filterMessagesByService(messages []string, keep map[string]bool) []string {
 // in-memory Scheduler seeded from current reservations, without
 // persisting anything — each call's reservation feeds the next, the same
 // way sequential Submit calls would via the database.
-func (svc *Service) dryRunSchedule(ctx context.Context, workloads []model.Workload) ([]*model.Decision, error) {
+func (svc *Service) dryRunSchedule(ctx context.Context, workloads []model.Workload, fresh bool) ([]*model.Decision, error) {
 	nodes, err := svc.store.ListNodes(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list nodes: %w", err)
@@ -198,10 +198,12 @@ func (svc *Service) dryRunSchedule(ctx context.Context, workloads []model.Worklo
 
 	var decisions []*model.Decision
 	for _, w := range workloads {
-		if w.Storage.Class == model.NodeLocalPersistent && w.Storage.PinnedNodeID == "" {
+		if !fresh && w.Storage.Class == model.NodeLocalPersistent && w.Storage.PinnedNodeID == "" {
 			// Mirror Submit()'s existing-pin reuse so planning a redeploy of
-			// an x-haco-place-anywhere service shows where it would actually
-			// land (its existing volume's node), not a fresh pick.
+			// an unpinned service shows where it would actually land (its
+			// existing volume's node), not a fresh pick — unless --fresh
+			// is set, mirroring Submit's own fresh bypass, so `hacoctl plan
+			// --fresh` can preview what `deploy --fresh` would actually do.
 			if existing, err := svc.store.GetWorkload(ctx, w.Key()); err == nil {
 				w.Storage.PinnedNodeID = existing.Storage.PinnedNodeID
 			}
