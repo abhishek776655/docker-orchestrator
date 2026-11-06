@@ -79,6 +79,15 @@ func (d *Docker) VolumeHostPath(workloadKey, containerPath string) string {
 // way PullImage re-pulls on every execute() rather than assuming a local
 // copy is already current.
 func ExtractTar(dst string, r io.Reader) error {
+	// Self-heal a stale file left behind by an agent build that predates
+	// this field (a container path that used to be a single-file bind
+	// mount, say, now needs a directory) — os.MkdirAll fails if dst
+	// already exists as a regular file.
+	if info, err := os.Stat(dst); err == nil && !info.IsDir() {
+		if err := os.Remove(dst); err != nil {
+			return fmt.Errorf("remove stale file at %s: %w", dst, err)
+		}
+	}
 	if err := os.MkdirAll(dst, 0o755); err != nil {
 		return fmt.Errorf("create %s: %w", dst, err)
 	}
@@ -163,6 +172,15 @@ func (d *Docker) prepareVolumes(w model.Workload) ([]string, []string, error) {
 			// as any other part of the workload spec.
 			if err := os.MkdirAll(filepath.Dir(hostPath), 0o755); err != nil {
 				return nil, nil, fmt.Errorf("create directory for bind mount file %s: %w", hostPath, err)
+			}
+			// Self-heal a stale directory left behind by an agent build that
+			// predates this field (the old default path for this exact
+			// container path was an empty managed directory) — os.WriteFile
+			// can't write a file where a directory already exists.
+			if info, err := os.Stat(hostPath); err == nil && info.IsDir() {
+				if err := os.RemoveAll(hostPath); err != nil {
+					return nil, nil, fmt.Errorf("remove stale directory at bind mount file path %s: %w", hostPath, err)
+				}
 			}
 			if err := os.WriteFile(hostPath, v.FileContent, 0o644); err != nil {
 				return nil, nil, fmt.Errorf("write bind mount file %s: %w", hostPath, err)

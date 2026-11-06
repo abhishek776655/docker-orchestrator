@@ -157,3 +157,62 @@ func TestExtractTarRejectsPathEscape(t *testing.T) {
 		t.Fatalf("expected ExtractTar to reject a path-escaping tar entry")
 	}
 }
+
+// TestPrepareVolumesHealsStaleDirectoryAtFileContentPath covers the other
+// direction of the same real bug: an agent upgraded from a build that
+// predates VolumeMount.FileContent may have left an empty managed
+// directory at a container path that's now a single-file bind mount.
+// os.WriteFile fails when that path already exists as a directory;
+// prepareVolumes must remove it first rather than erroring out forever.
+func TestPrepareVolumesHealsStaleDirectoryAtFileContentPath(t *testing.T) {
+	d := &Docker{nodeID: "node-a", dataDir: t.TempDir()}
+	w := model.Workload{
+		Project: "demo", Service: "firebase", Revision: "latest",
+		Storage: model.StoragePolicy{Class: model.NodeLocalPersistent},
+		Volumes: []model.VolumeMount{{ContainerPath: "/app/firebase.json", FileContent: []byte("{}")}},
+	}
+	hostPath := d.VolumeHostPath(w.Key(), "/app/firebase.json")
+	if err := os.MkdirAll(hostPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := d.prepareVolumes(w); err != nil {
+		t.Fatalf("prepareVolumes: %v", err)
+	}
+
+	info, err := os.Stat(hostPath)
+	if err != nil || info.IsDir() {
+		t.Fatalf("hostPath = %+v, err = %v, want a regular file", info, err)
+	}
+	got, err := os.ReadFile(hostPath)
+	if err != nil || string(got) != "{}" {
+		t.Fatalf("content = %q, err = %v, want \"{}\"", got, err)
+	}
+}
+
+// TestExtractTarHealsStaleFileAtDestination covers a real bug: an agent
+// upgraded from a build that predates VolumeMount.RemoteDirKey/SeedDirKey
+// may have left a single-file bind mount (VolumeMount.FileContent) at a
+// container path that now needs a directory instead. os.MkdirAll alone
+// fails when dst already exists as a regular file; ExtractTar must remove
+// it first rather than erroring out forever.
+func TestExtractTarHealsStaleFileAtDestination(t *testing.T) {
+	dst := filepath.Join(t.TempDir(), "dst")
+	if err := os.WriteFile(dst, []byte("stale single-file content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tarball := tarballWithOneFile(t, "real.txt", "real content")
+	if err := ExtractTar(dst, bytes.NewReader(tarball)); err != nil {
+		t.Fatalf("ExtractTar: %v", err)
+	}
+
+	info, err := os.Stat(dst)
+	if err != nil || !info.IsDir() {
+		t.Fatalf("dst = %+v, err = %v, want a directory", info, err)
+	}
+	got, err := os.ReadFile(filepath.Join(dst, "real.txt"))
+	if err != nil || string(got) != "real content" {
+		t.Fatalf("real.txt = %q, err = %v, want \"real content\"", got, err)
+	}
+}
