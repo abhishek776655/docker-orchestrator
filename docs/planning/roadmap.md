@@ -265,3 +265,136 @@ Found by actually running `hacoctl plan`/`deploy` against a real,
   emulation; the reverse direction (arm64 workload, amd64 node) is still a
   hard rejection. Found/fixed while live-testing `--service frontendapi`
   against the real file on an arm64-only (Apple Silicon) two-node fleet.
+- **`--pin-host <service,...>`**: new `hacoctl deploy/plan/build` flag
+  (`compose.ApplyHostPinOverride`) that overrides storage affinity for one
+  invocation with no Compose file changes — only the named services pin to
+  the control-plane host, everything else schedules anywhere, even a
+  service whose own bind-mount would normally auto-pin it.
+- **Swarm-overlay false positive for an unused unpublished port**: any
+  `expose`-only or unpublished port anywhere in the plan forced
+  `swarm_overlay`, even one nothing else actually depends on reaching
+  (e.g. qdrant's internal 6335 cluster port alongside its published
+  6333/6334). Now only a service with *no* published ports at all, that
+  some other service actually `depends_on`, forces it.
+- **Agent heartbeat starvation**: heartbeat shared one goroutine/select
+  loop with `pollAndExecute`; a slow multi-service build/pull delayed it
+  past the control plane's timeout, falsely marking a perfectly healthy,
+  busy node "unavailable" and cascade-failing every other pinned workload
+  already running there. Heartbeat now runs on its own goroutine.
+- **Compose variable interpolation was always empty**: `compose.Load`
+  passed an always-empty `Environment` map to compose-go, so every
+  `${VAR}` reference in a Compose file silently resolved to `""` — not
+  read from the project's `.env` file or the control-plane process's own
+  environment the way real `docker compose` does. This is why a build arg
+  like `SSH_PRIVATE_KEY` came through blank even when genuinely exported
+  before starting the control plane.
+- **Build/push errors discarded the real log stream**: only Docker's
+  generic `"returned a non-zero code: N"` was kept; `agent.Docker.
+  BuildImage` and `build.consumeDockerStream` now also capture the last
+  lines of the actual build output (e.g. git/ssh's real stderr), making a
+  failed build diagnosable instead of a dead end.
+- **Image pulls ignored the workload's declared architecture**: an
+  amd64-only image scheduled onto an arm64 node (via the emulation-
+  compatibility fix above) silently pulled nothing, since Docker defaults
+  to the daemon's own native platform — surfacing later as a confusing
+  "no such image" at container-create time instead of a clear pull error.
+  `PullImage` now requests the declared platform explicitly.
+- **Single-file bind mounts couldn't actually run anywhere but the control
+  plane's host, and didn't even work there**: compose.go detected a
+  single-file bind mount (e.g. `./firebase.json:/app/firebase.json`) and
+  forced a hard host pin for it (`x-haco-place-anywhere` couldn't opt out,
+  correctly — an empty managed directory is the wrong type for a file
+  mount) — but the agent's own `prepareVolumes` never actually supported
+  binding anything but a directory, so even the pinned, "working" case
+  failed with "bind mount host path ... is not a directory". Fixed by
+  reading the file's content once at plan time and carrying it with the
+  workload (`model.VolumeMount.FileContent`, capped at 1MiB) — the same
+  idea as shipping a build context to whichever node builds it — so the
+  agent materializes the file locally before binding, and the service
+  needs no pin for this mount at all anymore.
+- **Removed the implicit "stateful means pin to host" default**: a
+  `node_local_persistent` service with a plain managed volume (no
+  bind-mount, no `x-haco-pin-node`/`x-haco-pin-host`) used to auto-pin to
+  the control-plane host unconditionally. It's now unpinned by default,
+  same as `x-haco-place-anywhere` — the scheduler places it freely on
+  first deploy and locks future redeploys to wherever it landed. Pinning
+  is now always an explicit choice: `x-haco-pin-host`/`x-haco-pin-node` in
+  the Compose file, or `--pin-host`/`--pin-node` at deploy time.
+  Removing the default exposed a real, pre-existing bug it had been
+  masking: each volume's loop iteration overwrote `wl.Storage` wholesale,
+  so a service's final affinity was whichever volume happened to be
+  declared *last* in the YAML — a service's own-source bind mount (forces
+  a host pin) could get silently undone by a later, unrelated managed
+  volume in the same service. Harmless before (every path pinned to the
+  same host by default anyway), but very real once default pinning no
+  longer masked it. Fixed by deciding each service's affinity once, after
+  seeing every volume, rather than per-volume.
+- **Shared bind-mount directory discarded its real content**: a directory
+  bind-mounted by several services but not anyone's build context (e.g.
+  `./protos:/protos` across six services, or `./DataChannelModels`,
+  `./DataChannelHelpers`) never matched the build-context heuristic, so it
+  always fell back to an empty agent-managed directory — silently
+  discarding real shared content (proto definitions, shared models) every
+  one of those services needed at runtime. Found live-testing
+  `data-explore-api`, which crashed on a missing `.proto` file that
+  genuinely existed on disk but was never actually mounted. Fixed with a
+  new heuristic: a directory bind-mounted by 2+ distinct services is
+  treated the same as a build-context match (literal host path honored);
+  a directory only one service mounts is unaffected, still the ordinary
+  managed-data-directory default.
+- **`hacoctl deploy --fresh`**: since removing the implicit stateful-pin
+  default means an unpinned service locks to wherever it first lands and
+  reuses that node on every later deploy, `--fresh` is the explicit escape
+  hatch — it skips that reuse for every currently-unpinned service in the
+  deploy, letting the scheduler re-pick each one from scratch (abandoning
+  whatever data is on its current node). Has no effect on anything
+  explicitly pinned (`x-haco-pin-node`/`x-haco-pin-host`, or `--pin-host`/
+  `--pin-node`) — only the "no pin at all" reuse path is skipped.
+  `Service.Submit` takes an explicit `fresh bool` now. Prompts for
+  confirmation first (`--yes` skips it), listing exactly which services
+  are affected.
+- **Directory bind-mount content now travels to wherever the workload
+  actually lands, instead of forcing a host pin**: a directory bind mount
+  needing its real content (build-context match, shared-across-services
+  match, or explicit `x-haco-bind-host-path`) used to force the whole
+  service onto this control-plane host unconditionally — true even for
+  `auth`/`credentials`/`data-explore-api`/`frontendapi`/`metaapi`/
+  `validation` in the real dockerize-localhost file, whose Dockerfiles
+  (confirmed by inspection) never `COPY` application source into the
+  image at all — `pip install -e .` just points at wherever `/app` ends
+  up, so the bind mount isn't a dev convenience there, it's the *only*
+  way the code exists in the container. Freeing such a service (clearing
+  its HostPath, the pre-existing `x-haco-place-anywhere`/`--pin-host`
+  path) would have left it with an empty `/app` and no code at all.
+  Fixed by extending the same transfer idea already used for build
+  contexts: the directory's content is tarred up once at deploy time
+  (`compose.go` keeps the literal HostPath available; `Service.
+  resolveVolumeSnapshots` tars it, stashes it, and replaces HostPath with
+  `model.VolumeMount.RemoteDirKey`) and the assigned node's agent fetches
+  and extracts it (`Agent.fetchVolumeSnapshots`, `agent.ExtractTar`) over
+  a new `GET /v1/agent/{node}/volume-context/{project}/{service}/
+  {revision}/{index}` endpoint, before the container starts — the same
+  pull-based pattern as a remote build context. A directory bind mount is
+  therefore unpinned by default now, like every other directory case;
+  only an explicit `x-haco-pin-host`/`--pin-host` (pinning it to this
+  specific control-plane host) gets a true, live, literal bind mount
+  instead of a frozen snapshot — the only case that can actually offer
+  live-reload, since only there is the literal path guaranteed to exist
+  where the workload runs.
+- **One-time seed for a plain managed data volume**: `./mysql-data:/var/
+  lib/mysql` (and any ordinary single-service data directory, not matching
+  the directory-transfer cases above) already has real content when the
+  stack was run outside the orchestrator before — that content is now
+  adopted as the managed volume's starting point, once, instead of always
+  starting empty. `compose.go`'s `candidateSeedPath` flags a bind mount's
+  host directory as worth seeding only when it genuinely has content;
+  `VolumeMount.SeedDirKey` momentarily holds the raw path, then
+  `Service.resolveVolumeSeeds` tars and stashes it (same transfer
+  mechanism as `RemoteDirKey`, distinct key namespace) before the workload
+  is ever persisted. `Agent.fetchVolumeSeeds` only fetches/extracts it the
+  very first time that workload's managed directory doesn't exist yet —
+  once created (seeded or not), the managed copy is the sole source of
+  truth forever after; a later change to the original directory is never
+  picked up again, and crucially, real data the service has since written
+  into the managed volume is never overwritten by a stale seed on a
+  later restart.

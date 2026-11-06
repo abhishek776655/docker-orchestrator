@@ -102,10 +102,11 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `hacoctl: a thin CLI over the control-plane API (HACO_CONTROLPLANE_URL, default http://localhost:8099)
 
 Usage:
-  hacoctl build  <project> <docker-compose.yml>   just build the build: service images, no scheduling or containers (--no-cache forces a full rebuild; --service <name> scopes to that service's dependencies; --pin-host <svc,...> below)
-  hacoctl deploy <project> <docker-compose.yml>   build, schedule, and run a Compose project, then show a live status table until every workload is ready/failed/stopped (like 'docker compose up -d'); prompts if a pinned service needs a fresh volume (--yes skips it); --no-cache forces a full rebuild; --service <name> deploys only that service and its dependencies; --pin-host <svc,...> below
-  hacoctl plan   <project> <docker-compose.yml>   dry-run the same, no side effects (table; add --json for raw; --service <name> to scope the same way; --pin-host <svc,...> below)
+  hacoctl build  <project> <docker-compose.yml>   just build the build: service images, no scheduling or containers (--no-cache forces a full rebuild; --service <name> scopes to that service's dependencies; --pin-host/--pin-node below)
+  hacoctl deploy <project> <docker-compose.yml>   build, schedule, and run a Compose project, then show a live status table until every workload is ready/failed/stopped (like 'docker compose up -d'); prompts if a pinned service needs a fresh volume (--yes skips it); --no-cache forces a full rebuild; --service <name> deploys only that service and its dependencies; --pin-host/--pin-node below; --fresh lets every currently-unpinned service reschedule freely instead of reusing its existing node (prompts first, abandons its current data; --yes skips it)
+  hacoctl plan   <project> <docker-compose.yml>   dry-run the same, no side effects (table; add --json for raw; --service <name> to scope the same way; --pin-host/--pin-node below)
                                                    --pin-host <service,...>: override storage affinity for this call only, no Compose file changes needed — only the named services (e.g. a database, and whichever service you're actively live-editing) pin to this control-plane host; every other service schedules anywhere, even one that bind-mounts its own source (overrides compose.go's own auto-pin heuristic)
+                                                   --pin-node <node-id>=<service,...>: same override, but pins the named services to that specific node instead of the control-plane host — repeatable for multiple nodes; combines with --pin-host in the same call
   hacoctl status [project] [service] [revision]   table of every workload (optionally filtered to one project), or one workload's full detail once service is named (revision defaults to "latest")
   hacoctl logs   <project> <service> <revision>   latest captured container log tail
   hacoctl stop   <project> <service> <revision>   stop the workload and remove its container
@@ -161,6 +162,7 @@ func plan(baseURL string, args []string) error {
 	jsonOut := false
 	onlyService := ""
 	var pinHost *[]string
+	pinNodes := map[string][]string{}
 	var rest []string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -179,12 +181,22 @@ func plan(baseURL string, args []string) error {
 			}
 			list := splitPinHost(args[i])
 			pinHost = &list
+		case "--pin-node":
+			i++
+			if i >= len(args) {
+				return fmt.Errorf("--pin-node requires a value")
+			}
+			node, services, err := parsePinNode(args[i])
+			if err != nil {
+				return err
+			}
+			pinNodes[node] = append(pinNodes[node], services...)
 		default:
 			rest = append(rest, args[i])
 		}
 	}
 	if len(rest) != 2 {
-		return fmt.Errorf("usage: hacoctl plan <project> <docker-compose.yml> [--json] [--service <name>] [--pin-host <service,...>]")
+		return fmt.Errorf("usage: hacoctl plan <project> <docker-compose.yml> [--json] [--service <name>] [--pin-host <service,...>] [--pin-node <node-id>=<service,...>]")
 	}
 	project, file := rest[0], rest[1]
 
@@ -203,11 +215,12 @@ func plan(baseURL string, args []string) error {
 			"yaml":         string(yaml),
 			"only_service": onlyService,
 			"pin_host":     pinHost,
+			"pin_nodes":    pinNodes,
 		})
 		return post(baseURL, "/v1/compose/plan", body)
 	}
 
-	out, err := fetchPlan(baseURL, project, workingDir, yaml, onlyService, pinHost)
+	out, err := fetchPlan(baseURL, project, workingDir, yaml, onlyService, pinHost, pinNodes)
 	if err != nil {
 		return err
 	}
@@ -229,6 +242,16 @@ func splitPinHost(raw string) []string {
 		}
 	}
 	return out
+}
+
+// parsePinNode parses --pin-node's "<node-id>=<service,...>" value.
+func parsePinNode(raw string) (node string, services []string, err error) {
+	node, list, ok := strings.Cut(raw, "=")
+	node = strings.TrimSpace(node)
+	if !ok || node == "" {
+		return "", nil, fmt.Errorf("--pin-node value %q must be <node-id>=<service,...>", raw)
+	}
+	return node, splitPinHost(list), nil
 }
 
 type planView struct {
@@ -269,13 +292,14 @@ type planView struct {
 
 // fetchPlan POSTs to /v1/compose/plan and returns the decoded response.
 // Shared by `plan` (display) and `deploy` (fresh-volume consent check).
-func fetchPlan(baseURL, project, workingDir string, yaml []byte, onlyService string, pinHost *[]string) (planView, error) {
+func fetchPlan(baseURL, project, workingDir string, yaml []byte, onlyService string, pinHost *[]string, pinNodes map[string][]string) (planView, error) {
 	body, _ := json.Marshal(map[string]any{
 		"project":      project,
 		"working_dir":  workingDir,
 		"yaml":         string(yaml),
 		"only_service": onlyService,
 		"pin_host":     pinHost,
+		"pin_nodes":    pinNodes,
 	})
 	resp, err := http.Post(baseURL+"/v1/compose/plan", "application/json", bytes.NewReader(body))
 	if err != nil {
@@ -350,6 +374,7 @@ func buildCmd(baseURL string, args []string) error {
 	noCache := false
 	onlyService := ""
 	var pinHost *[]string
+	pinNodes := map[string][]string{}
 	var rest []string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -368,12 +393,22 @@ func buildCmd(baseURL string, args []string) error {
 			}
 			list := splitPinHost(args[i])
 			pinHost = &list
+		case "--pin-node":
+			i++
+			if i >= len(args) {
+				return fmt.Errorf("--pin-node requires a value")
+			}
+			node, services, err := parsePinNode(args[i])
+			if err != nil {
+				return err
+			}
+			pinNodes[node] = append(pinNodes[node], services...)
 		default:
 			rest = append(rest, args[i])
 		}
 	}
 	if len(rest) != 2 {
-		return fmt.Errorf("usage: hacoctl build <project> <docker-compose.yml> [--no-cache] [--service <name>] [--pin-host <service,...>]")
+		return fmt.Errorf("usage: hacoctl build <project> <docker-compose.yml> [--no-cache] [--service <name>] [--pin-host <service,...>] [--pin-node <node-id>=<service,...>]")
 	}
 	project, file := rest[0], rest[1]
 
@@ -393,6 +428,7 @@ func buildCmd(baseURL string, args []string) error {
 		"no_cache":     noCache,
 		"only_service": onlyService,
 		"pin_host":     pinHost,
+		"pin_nodes":    pinNodes,
 	})
 	return post(baseURL, "/v1/compose/build", body)
 }
@@ -403,9 +439,10 @@ func buildCmd(baseURL string, args []string) error {
 // service into ahead of time, but it still deserves a live confirmation
 // at the moment it's actually about to happen, not just silent action.
 func deploy(baseURL string, args []string) error {
-	yes, noCache := false, false
+	yes, noCache, fresh := false, false, false
 	onlyService := ""
 	var pinHost *[]string
+	pinNodes := map[string][]string{}
 	var rest []string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -413,6 +450,8 @@ func deploy(baseURL string, args []string) error {
 			yes = true
 		case "--no-cache":
 			noCache = true
+		case "--fresh":
+			fresh = true
 		case "--service":
 			i++
 			if i >= len(args) {
@@ -426,12 +465,22 @@ func deploy(baseURL string, args []string) error {
 			}
 			list := splitPinHost(args[i])
 			pinHost = &list
+		case "--pin-node":
+			i++
+			if i >= len(args) {
+				return fmt.Errorf("--pin-node requires a value")
+			}
+			node, services, err := parsePinNode(args[i])
+			if err != nil {
+				return err
+			}
+			pinNodes[node] = append(pinNodes[node], services...)
 		default:
 			rest = append(rest, args[i])
 		}
 	}
 	if len(rest) != 2 {
-		return fmt.Errorf("usage: hacoctl deploy <project> <docker-compose.yml> [--yes] [--no-cache] [--service <name>] [--pin-host <service,...>]")
+		return fmt.Errorf("usage: hacoctl deploy <project> <docker-compose.yml> [--yes] [--no-cache] [--fresh] [--service <name>] [--pin-host <service,...>] [--pin-node <node-id>=<service,...>]")
 	}
 	project, file := rest[0], rest[1]
 
@@ -444,7 +493,7 @@ func deploy(baseURL string, args []string) error {
 		return err
 	}
 
-	if planned, err := fetchPlan(baseURL, project, workingDir, yaml, onlyService, pinHost); err == nil {
+	if planned, err := fetchPlan(baseURL, project, workingDir, yaml, onlyService, pinHost, pinNodes); err == nil {
 		if warnings := freshVolumeWarnings(planned); len(warnings) > 0 {
 			fmt.Println("WARNING: the following pinned services will get a brand-new, empty volume — data on their current node will NOT be migrated:")
 			for service, msgs := range warnings {
@@ -454,6 +503,17 @@ func deploy(baseURL string, args []string) error {
 			}
 			if !yes && !confirm("Continue and accept the data loss?") {
 				return fmt.Errorf("deploy aborted: fresh-volume consent declined")
+			}
+		}
+		if fresh {
+			if services := unpinnedPersistentServices(planned); len(services) > 0 {
+				fmt.Println("WARNING: --fresh will let the scheduler freely re-pick a node for each of these currently-unpinned services, abandoning whatever data is on their current node:")
+				for _, s := range services {
+					fmt.Printf("  - %s\n", s)
+				}
+				if !yes && !confirm("Continue and accept the data loss?") {
+					return fmt.Errorf("deploy aborted: fresh-deploy consent declined")
+				}
 			}
 		}
 	}
@@ -468,8 +528,24 @@ func deploy(baseURL string, args []string) error {
 		"no_cache":     noCache,
 		"only_service": onlyService,
 		"pin_host":     pinHost,
+		"pin_nodes":    pinNodes,
+		"fresh":        fresh,
 	})
 	return deployAndWatch(baseURL, project, body)
+}
+
+// unpinnedPersistentServices lists every node_local_persistent workload in
+// planned that carries no pin of its own — exactly the set --fresh would
+// affect, since a pinned workload (explicit extension or --pin-host/
+// --pin-node) ignores --fresh entirely.
+func unpinnedPersistentServices(planned planView) []string {
+	var out []string
+	for _, w := range planned.Plan.Workloads {
+		if w.Storage.Class == "node_local_persistent" && w.Storage.PinnedNodeID == "" {
+			out = append(out, w.Service)
+		}
+	}
+	return out
 }
 
 // deployResponse is the shape of POST /v1/compose/deploy's body, enough to

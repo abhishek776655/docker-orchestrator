@@ -24,6 +24,15 @@ import (
 	"github.com/abhishek/hardware-aware-container-orchestrator/model"
 )
 
+// maxInlineBindFileBytes caps how large a single-file bind mount
+// (compose.go's case 1) can be before it's embedded directly into the
+// workload (VolumeMount.FileContent) and carried to whichever node runs
+// it. Generous for what this case actually covers — small config/
+// credential files — while still refusing something that would bloat the
+// workload record (stored in SQLite, sent on every assignments poll) if a
+// large file were mistakenly bind-mounted as a single file.
+const maxInlineBindFileBytes = 1 << 20 // 1 MiB
+
 // BuildSpec is the build work one service needs before it can be
 // scheduled, when it has a `build:` block instead of a pre-built `image:`
 // (SRS 7.1 build.context/dockerfile/args/platform).
@@ -111,6 +120,32 @@ func Load(ctx context.Context, project, workingDir string, yaml []byte) (*Plan, 
 	// own — a cross-service shared-library mount (service A bind-mounting
 	// service B's source tree) is still a build context, just not A's own.
 	var buildContexts []string
+	// bindSourceUsers counts, across every service, how many distinct
+	// services bind-mount each directory source — a directory referenced
+	// by 2+ services (e.g. ./protos:/protos in six different services)
+	// is almost certainly shared real content someone actually maintains,
+	// the same signal a build-context match is for a live-reload source
+	// tree, just independent of anyone building from it. A source used by
+	// only one service doesn't get this treatment: that's the ordinary
+	// single-service managed-data-directory case.
+	bindSourceUsers := map[string]map[string]bool{}
+	for _, name := range names {
+		for _, v := range proj.Services[name].Volumes {
+			if v.Type != "bind" {
+				continue
+			}
+			if bindSourceUsers[v.Source] == nil {
+				bindSourceUsers[v.Source] = map[string]bool{}
+			}
+			bindSourceUsers[v.Source][name] = true
+		}
+	}
+	sharedBindDirs := map[string]bool{}
+	for source, users := range bindSourceUsers {
+		if len(users) >= 2 {
+			sharedBindDirs[source] = true
+		}
+	}
 	for _, name := range names {
 		if b := proj.Services[name].Build; b != nil && b.Context != "" {
 			buildContexts = append(buildContexts, b.Context)
@@ -131,7 +166,7 @@ func Load(ctx context.Context, project, workingDir string, yaml []byte) (*Plan, 
 	for _, name := range names {
 		svc := proj.Services[name]
 		analyzeServicePorts(&plan.Networking, unpublishedPortIssues, hasPublishedPort, name, svc)
-		wl, build, warnings, rejections := convertService(project, workingDir, name, svc, buildContexts)
+		wl, build, warnings, rejections := convertService(project, workingDir, name, svc, buildContexts, sharedBindDirs)
 		plan.Warnings = append(plan.Warnings, warnings...)
 		plan.Rejections = append(plan.Rejections, rejections...)
 		plan.Workloads = append(plan.Workloads, wl)
@@ -226,7 +261,7 @@ func recommendOverlay(networking *NetworkRecommendation, reason string) {
 	networking.Reasons = append(networking.Reasons, reason)
 }
 
-func convertService(project, workingDir, name string, svc types.ServiceConfig, buildContexts []string) (model.Workload, *BuildSpec, []string, []string) {
+func convertService(project, workingDir, name string, svc types.ServiceConfig, buildContexts []string, sharedBindDirs map[string]bool) (model.Workload, *BuildSpec, []string, []string) {
 	var warnings, rejections []string
 	buildPlatform := "linux/amd64"
 	if _, ok := platformArch(svc.Platform); ok {
@@ -394,90 +429,172 @@ func convertService(project, workingDir, name string, svc types.ServiceConfig, b
 	placeAnywhere, _ := svc.Extensions["x-haco-place-anywhere"].(bool)
 	bindHostPath, _ := svc.Extensions["x-haco-bind-host-path"].(bool)
 
+	// forcedPinNode accumulates across every volume this service declares
+	// — a service's final storage affinity must be one coherent decision
+	// for the whole workload, not whichever volume happens to be declared
+	// last in the YAML. Only an explicit x-haco-pin-host forces a pin
+	// here (always to this same control-plane host, so multiple such
+	// volumes on one service can never actually disagree) — a directory
+	// bind mount's literal content alone no longer forces anything; see
+	// the comment below on cases 2-4 for why.
 	wl.Storage.Class = model.Ephemeral
+	hasVolume := false
+	var forcedPinNode string
 	for _, v := range svc.Volumes {
 		switch v.Type {
 		case "bind", "volume":
+			hasVolume = true
 			if v.Type == "bind" {
-				// Honoring the literal host path, in detection order —
-				// each check only applies when earlier ones didn't match:
+				// Honoring the bind mount's real content, in detection
+				// order — each check only applies when earlier ones didn't
+				// match:
 				//   1. Source is a single file: there's no sensible "managed
 				//      empty file" substitute, so this is never ambiguous and
-				//      needs no flag at all.
+				//      needs no flag at all — its content travels with the
+				//      workload (below) rather than needing a host pin.
 				//   2. Source is a directory that IS (or is inside) some
 				//      service's build context — anywhere in the compose
 				//      file, not just this service's own — which is almost
 				//      always a source-code live-mount, including a
 				//      cross-service shared-library mount (service A
 				//      bind-mounting service B's source tree).
-				//   3. Explicit x-haco-bind-host-path: true — the manual
-				//      escape hatch for anything 1 and 2 don't catch (e.g. a
-				//      directory that isn't anyone's build context, like a
-				//      one-off init-scripts directory).
+				//   3. Source is a directory bind-mounted by 2+ distinct
+				//      services — real shared content someone maintains
+				//      (e.g. a shared proto/models directory several
+				//      services read from), not anyone's build context,
+				//      but just as clearly not a throwaway data directory
+				//      either. A source only one service mounts doesn't
+				//      get this treatment — see case 4 below for that.
+				//   4. Explicit x-haco-bind-host-path: true — the manual
+				//      escape hatch for anything 1-3 don't catch (e.g. a
+				//      directory that isn't anyone's build context or
+				//      shared by multiple services, like a one-off
+				//      init-scripts directory).
 				// Anything else falls through to the managed-volume default.
 				//
-				// x-haco-place-anywhere opts a service entirely out of this
-				// detection: a compose file commonly bind-mounts every
-				// service's own source by convention (devcontainer
-				// boilerplate) even though only one or two are actually
-				// being live-edited at a time — forcing every such service
-				// onto one fixed host would defeat scheduling across the
-				// fleet. With it set, the bind mount's host path is ignored
-				// like any other data volume and the service is free to
-				// land (and then stay pinned to) whichever node it's
-				// actually scheduled on.
-				reason := ""
-				if !placeAnywhere {
-					switch {
-					case isRegularFile(v.Source):
-						reason = "a bind mount whose source is a single file"
-					case matchesAnyBuildContext(v.Source, buildContexts):
-						reason = "a bind mount whose source is a service's build context"
-					case bindHostPath:
-						reason = "x-haco-bind-host-path"
+				// x-haco-place-anywhere opts a service out of cases 2-4:
+				// a compose file commonly bind-mounts every service's own
+				// source by convention (devcontainer boilerplate) even
+				// though only one or two are actually being live-edited at
+				// a time — forcing every such service onto one fixed host
+				// would defeat scheduling across the fleet. With it set,
+				// that bind mount's host path is ignored like any other
+				// data volume and the service is free to land (and then
+				// stay pinned to) whichever node it's actually scheduled
+				// on.
+				//
+				// Cases 2-4 keep the real content either way — but only as
+				// a literal, truly-live bind mount when this service is
+				// explicitly pinned to this control-plane host
+				// (x-haco-pin-host/--pin-host), since that's the only case
+				// where the literal path is guaranteed to exist where the
+				// workload actually runs. Otherwise (no pin, or pinned to
+				// a different node) the directory's current content is
+				// tarred up once at deploy time and shipped to wherever
+				// it lands instead (resolveVolumeSnapshots in
+				// controlplane/service.go, VolumeMount.RemoteDirKey) — the
+				// same idea as a remote build context, just for a
+				// directory mount. That trades true live-reload for free
+				// scheduling: a further host edit after deploy needs a
+				// redeploy to show up, since it's a snapshot, not a
+				// continuous sync.
+				//
+				// Case 1 (single-file source, e.g. ./config.json) doesn't
+				// need any of that: the file is small enough to read once
+				// here and carry its content with the workload itself
+				// (VolumeMount.FileContent) — like transferring a build
+				// context to whichever node actually builds it — so the
+				// agent that ends up running this workload, wherever that
+				// is, materializes the same file locally before binding.
+				// No pin needed at all for this mount.
+				if isRegularFile(v.Source) {
+					data, err := os.ReadFile(v.Source)
+					if err != nil {
+						rejections = append(rejections, fmt.Sprintf("%s: read bind mount file %q: %v", name, v.Source, err))
+						continue
 					}
+					if len(data) > maxInlineBindFileBytes {
+						rejections = append(rejections, fmt.Sprintf("%s: bind mount file %q is %d bytes, over the %d-byte limit for traveling with the workload — use x-haco-bind-host-path and pin this service to a host instead", name, v.Source, len(data), maxInlineBindFileBytes))
+						continue
+					}
+					wl.Volumes = append(wl.Volumes, model.VolumeMount{ContainerPath: v.Target, ReadOnly: v.ReadOnly, FileContent: data})
+					continue
+				}
+
+				reason := ""
+				switch {
+				case placeAnywhere:
+					// skip cases 2-4 below
+				case matchesAnyBuildContext(v.Source, buildContexts):
+					reason = "a bind mount whose source is a service's build context"
+				case sharedBindDirs[v.Source]:
+					reason = "a bind mount whose source directory is shared by multiple services"
+				case bindHostPath:
+					reason = "x-haco-bind-host-path"
 				}
 				if reason != "" {
-					storage, mount, probs := bindLiteralHostPath(name, reason, v, svc)
+					hostPath, probs := validateDirSource(name, v.Source)
 					if len(probs) > 0 {
 						rejections = append(rejections, probs...)
 						continue
 					}
-					wl.Storage = storage
-					wl.Volumes = append(wl.Volumes, mount)
+					wl.Volumes = append(wl.Volumes, model.VolumeMount{ContainerPath: v.Target, ReadOnly: v.ReadOnly, HostPath: hostPath})
+					if pinHost {
+						forcedPinNode = agent.HostNodeID()
+					}
 					continue
 				}
 			}
 			// Otherwise, a bind mount's host path (v.Source) is
-			// intentionally ignored and it's treated exactly like a named
-			// volume: only v.Target (the container path) matters, and
-			// prepareVolumes creates and manages its own directory per
-			// (workload key, container path) regardless of how that path
-			// was declared in compose. Correct for a data directory
-			// (mysql/postgres/redis/etc. are meant to start empty);
-			// x-haco-bind-host-path above is the escape hatch when the
-			// literal path matters instead (a source-code live-mount).
+			// intentionally ignored going forward and it's treated exactly
+			// like a named volume: only v.Target (the container path)
+			// matters, and prepareVolumes creates and manages its own
+			// directory per (workload key, container path) regardless of
+			// how that path was declared in compose. Correct for a data
+			// directory (mysql/postgres/redis/etc. are meant to start
+			// empty); x-haco-bind-host-path above is the escape hatch when
+			// the literal path matters instead (a source-code live-mount).
 			//
-			// Node affinity, in priority order:
-			//   1. x-haco-pin-node: <id>      — explicit node, as before.
-			//   2. x-haco-place-anywhere: true — opt out of any default; the
-			//      scheduler picks freely on first deploy, then the control
-			//      plane locks the pin to wherever it landed (service.go
-			//      Submit), so later redeploys stay on that same data.
-			//   3. default (nothing set, or x-haco-pin-host: true) — pin to
-			//      this control plane's own host machine. A stateful
-			//      service's volume living on a predictable, always-on node
-			//      is a safer default than an arbitrary worker.
-			pinned, _ := svc.Extensions["x-haco-pin-node"].(string)
-			if pinned == "" && !placeAnywhere {
-				pinned = agent.HostNodeID()
-			}
-			allowFresh, _ := svc.Extensions["x-haco-allow-fresh-volume"].(bool)
-			wl.Storage = model.StoragePolicy{Class: model.NodeLocalPersistent, PinnedNodeID: pinned, AllowFreshVolumeOnReschedule: allowFresh}
-			wl.Volumes = append(wl.Volumes, model.VolumeMount{ContainerPath: v.Target, ReadOnly: v.ReadOnly})
+			// It's still worth adopting as a one-time seed, though: if
+			// this exact host directory already has real content (the
+			// stack was run outside the orchestrator before — e.g. a
+			// plain `docker compose up` left real data in ./mysql-data),
+			// starting the managed volume from that instead of empty
+			// means the orchestrator doesn't silently lose pre-existing
+			// data on its first-ever deploy. SeedDirKey momentarily holds
+			// the raw candidate path here — service.go's
+			// resolveVolumeSeeds converts it to an actual stash key (or
+			// clears it, if there's nothing worth seeding) before the
+			// workload is ever persisted or sent to an agent.
+			wl.Volumes = append(wl.Volumes, model.VolumeMount{ContainerPath: v.Target, ReadOnly: v.ReadOnly, SeedDirKey: candidateSeedPath(v)})
 		default:
 			warnings = append(warnings, fmt.Sprintf("%s: volume type %q is not evaluated for storage affinity", name, v.Type))
 		}
+	}
+	if hasVolume {
+		// Node affinity, in priority order, decided once for the whole
+		// service regardless of how many volumes it declares:
+		//   1. A case-2/3 directory bind mount above — always this
+		//      control-plane host, forced, not a default.
+		//   2. x-haco-pin-node: <id>    — explicit node.
+		//   3. x-haco-pin-host: true    — explicit control-plane host.
+		//   4. default (nothing set, same as x-haco-place-anywhere) — no
+		//      affinity at all: the scheduler picks freely on first
+		//      deploy, then the control plane locks the pin to wherever
+		//      it landed (service.go Submit), so later redeploys stay on
+		//      that same data. Nothing pins a stateful service to the
+		//      control-plane host just because it's stateful — that's
+		//      the user's call (--pin-host/--pin-node, or these same
+		//      extensions), never an implicit default.
+		pinned := forcedPinNode
+		if pinned == "" {
+			pinned, _ = svc.Extensions["x-haco-pin-node"].(string)
+		}
+		if pinned == "" && pinHost {
+			pinned = agent.HostNodeID()
+		}
+		allowFresh, _ := svc.Extensions["x-haco-allow-fresh-volume"].(bool)
+		wl.Storage = model.StoragePolicy{Class: model.NodeLocalPersistent, PinnedNodeID: pinned, AllowFreshVolumeOnReschedule: allowFresh}
 	}
 
 	// x-haco-pin-host also works standalone, for a service with no volume
@@ -534,6 +651,23 @@ func isRegularFile(path string) bool {
 	return err == nil && !info.IsDir()
 }
 
+// candidateSeedPath returns v's resolved source path when it's worth
+// offering as a one-time seed for a managed volume — a bind mount (not a
+// named volume, which has no host-side directory at all) whose host
+// directory genuinely exists and has at least one entry. An empty or
+// missing directory has nothing worth adopting, so there's nothing to
+// stash/transfer for it.
+func candidateSeedPath(v types.ServiceVolumeConfig) string {
+	if v.Type != "bind" || v.Source == "" || !filepath.IsAbs(v.Source) {
+		return ""
+	}
+	entries, err := os.ReadDir(v.Source)
+	if err != nil || len(entries) == 0 {
+		return ""
+	}
+	return v.Source
+}
+
 // matchesAnyBuildContext reports whether path is equal to, or a
 // subdirectory of, any entry in contexts — the cross-service build-context
 // bind-mount auto-detection. contexts is every service's build.context in
@@ -555,38 +689,33 @@ func matchesAnyBuildContext(path string, contexts []string) bool {
 	return false
 }
 
-// bindLiteralHostPath honors a bind mount's literal host path instead of
-// substituting a managed directory — shared by the explicit
-// x-haco-bind-host-path escape hatch and the two automatic heuristics
-// above it in precedence. reason names which one fired, for the rejection
-// messages below. Only correct when the workload actually runs on this
-// control plane's own machine (the filesystem that path was resolved on),
-// so the pin is forced, not defaulted; a conflicting x-haco-pin-node is a
-// plan-time rejection rather than silently overridden. The caller never
-// reaches this function at all when x-haco-place-anywhere is set — that
-// flag opts out of literal-host-path treatment entirely instead.
-func bindLiteralHostPath(name, reason string, v types.ServiceVolumeConfig, svc types.ServiceConfig) (model.StoragePolicy, model.VolumeMount, []string) {
-	pinned, _ := svc.Extensions["x-haco-pin-node"].(string)
-	host := agent.HostNodeID()
-	if pinned != "" && pinned != host {
-		return model.StoragePolicy{}, model.VolumeMount{}, []string{
-			fmt.Sprintf("%s: %s requires this control-plane host (%s), but x-haco-pin-node is %q", name, reason, host, pinned),
-		}
+// bindLiteralHostPath honors a *directory* bind mount's literal host path
+// instead of substituting a managed directory — the build-context-source
+// heuristic and the explicit x-haco-bind-host-path escape hatch (a
+// single-file source never reaches here; see its own handling just above,
+// which embeds the file's content with the workload instead of pinning).
+// reason names which one fired, for the rejection messages below. Only
+// correct when the workload actually runs on this control plane's own
+// machine (the filesystem that path was resolved on), so the pin is
+// forced, not defaulted; a conflicting x-haco-pin-node is a plan-time
+// rejection rather than silently overridden. The caller never reaches
+// this function at all when x-haco-place-anywhere is set — that flag opts
+// out of literal-host-path treatment entirely instead.
+// validateDirSource checks that a directory bind mount's source resolves
+// to a real, absolute path on this control-plane host — the one place
+// compose.Load() ever runs, so this is the only machine whose filesystem
+// it can check. Unlike the old bindLiteralHostPath, it no longer rejects
+// an explicit x-haco-pin-node to a different node: that's fine now, since
+// the content travels there as a tarball snapshot (resolveVolumeSnapshots)
+// instead of requiring a literal bind mount.
+func validateDirSource(name, source string) (string, []string) {
+	if !filepath.IsAbs(source) {
+		return "", []string{fmt.Sprintf("%s: bind mount source %q did not resolve to an absolute path", name, source)}
 	}
-	hostPath := v.Source
-	if !filepath.IsAbs(hostPath) {
-		return model.StoragePolicy{}, model.VolumeMount{}, []string{
-			fmt.Sprintf("%s: bind mount source %q did not resolve to an absolute path", name, v.Source),
-		}
+	if _, err := os.Stat(source); err != nil {
+		return "", []string{fmt.Sprintf("%s: bind mount host path %q does not exist on this control-plane host", name, source)}
 	}
-	if _, err := os.Stat(hostPath); err != nil {
-		return model.StoragePolicy{}, model.VolumeMount{}, []string{
-			fmt.Sprintf("%s: bind mount host path %q does not exist on this control-plane host", name, hostPath),
-		}
-	}
-	storage := model.StoragePolicy{Class: model.NodeLocalPersistent, PinnedNodeID: host}
-	mount := model.VolumeMount{ContainerPath: v.Target, ReadOnly: v.ReadOnly, HostPath: hostPath}
-	return storage, mount, nil
+	return source, nil
 }
 
 func isPlaceholderHealthCheck(test types.HealthCheckTest) bool {
@@ -629,35 +758,51 @@ func parseEnvFile(path string) (map[string]string, error) {
 // undefined dependency references, dependency cycles, and host-port
 // conflicts within the same project (compose-compatibility-matrix.md
 // "Required validation").
-// ApplyHostPinOverride replaces every workload's computed storage affinity
-// with a single, explicit CLI-level decision: only the named services (e.g.
-// the one actually being live-edited, plus stateful services like a
-// database) are pinned to this control-plane host; every other workload is
-// freed to schedule anywhere, even one compose.go's own bind-mount/data-
-// volume heuristics would otherwise have pinned to host (the common
-// devcontainer pattern where every service bind-mounts its own source, even
-// though only a few are actually being developed at once). This needs no
-// x-haco-* annotations in the Compose file itself — it's an override
-// supplied per `hacoctl deploy/plan/build --pin-host <service,...>` call.
-//
-// A workload not in pinHost loses any literal bind-mount HostPath too
-// (same as x-haco-place-anywhere): that path was only ever valid on this
-// one host, so once the workload is free to land elsewhere it must fall
-// back to a normal agent-managed volume instead.
+// ApplyHostPinOverride is ApplyPinOverride for the common case: every named
+// service pins to this control-plane host specifically. Supplied per
+// `hacoctl deploy/plan/build --pin-host <service,...>` call.
 func ApplyHostPinOverride(plan *Plan, pinHost []string) {
-	keep := make(map[string]bool, len(pinHost))
-	for _, s := range pinHost {
-		if s = strings.TrimSpace(s); s != "" {
-			keep[s] = true
+	if len(pinHost) == 0 {
+		ApplyPinOverride(plan, nil)
+		return
+	}
+	ApplyPinOverride(plan, map[string][]string{agent.HostNodeID(): pinHost})
+}
+
+// ApplyPinOverride replaces every workload's computed storage affinity with
+// a single, explicit CLI-level decision: pins maps a node ID to the
+// services that must land there (e.g. the one actually being live-edited,
+// plus stateful services like a database, pinned to the control-plane
+// host; another service pinned to a specific worker node instead). Every
+// workload not named in any of pins' service lists is freed to schedule
+// anywhere, even one compose.go's own bind-mount/data-volume heuristics
+// would otherwise have pinned to host (the common devcontainer pattern
+// where every service bind-mounts its own source, even though only a few
+// are actually being developed at once). This needs no x-haco-*
+// annotations in the Compose file itself — it's an override supplied per
+// `hacoctl deploy/plan/build --pin-host`/`--pin-node` call.
+//
+// A freed workload loses any literal bind-mount HostPath too (same as
+// x-haco-place-anywhere): that path was only ever valid on this one host,
+// so once the workload is free to land elsewhere it must fall back to a
+// normal agent-managed volume instead. A single-file bind mount is
+// unaffected either way — its content already travels with the workload
+// (VolumeMount.FileContent, set at plan time), not a literal HostPath.
+func ApplyPinOverride(plan *Plan, pins map[string][]string) {
+	nodeByService := map[string]string{}
+	for node, services := range pins {
+		for _, s := range services {
+			if s = strings.TrimSpace(s); s != "" {
+				nodeByService[s] = node
+			}
 		}
 	}
-	host := agent.HostNodeID()
 	for i := range plan.Workloads {
 		wl := &plan.Workloads[i]
-		if keep[wl.Service] {
-			wl.Constraints.PinnedNodeID = host
+		if node, ok := nodeByService[wl.Service]; ok {
+			wl.Constraints.PinnedNodeID = node
 			if wl.Storage.Class == model.NodeLocalPersistent {
-				wl.Storage.PinnedNodeID = host
+				wl.Storage.PinnedNodeID = node
 			}
 			continue
 		}
@@ -668,6 +813,27 @@ func ApplyHostPinOverride(plan *Plan, pinHost []string) {
 			wl.Volumes[j].HostPath = ""
 		}
 	}
+}
+
+// MergePinOverride combines `--pin-host`'s service list (pinned to this
+// control-plane host) with `--pin-node`'s explicit node assignments into
+// the single map ApplyPinOverride expects, resolving "this host" to its
+// real node ID. ok is false when neither was supplied at all, meaning no
+// override should be applied and compose.go's own affinity decisions
+// should stand.
+func MergePinOverride(pinHost *[]string, pinNodes map[string][]string) (pins map[string][]string, ok bool) {
+	if pinHost == nil && len(pinNodes) == 0 {
+		return nil, false
+	}
+	merged := map[string][]string{}
+	for node, services := range pinNodes {
+		merged[node] = append(merged[node], services...)
+	}
+	if pinHost != nil {
+		host := agent.HostNodeID()
+		merged[host] = append(merged[host], *pinHost...)
+	}
+	return merged, true
 }
 
 // ValidateGraph checks cross-service concerns that only make sense across

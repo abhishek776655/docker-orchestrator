@@ -34,3 +34,40 @@ func TestLogsFetchesAndPrintsWorkloadLogTail(t *testing.T) {
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// TestUnpinnedPersistentServicesListsOnlyCandidatesForFresh covers the
+// --fresh warning: only a node_local_persistent workload with no pin of
+// its own is affected (and so worth warning about) — an explicitly pinned
+// one, or an ephemeral one, ignores --fresh entirely.
+func TestUnpinnedPersistentServicesListsOnlyCandidatesForFresh(t *testing.T) {
+	var planned planView
+	planned.Plan.Workloads = []struct {
+		Service   string `json:"Service"`
+		Image     string `json:"Image"`
+		Resources struct {
+			CPUMillis   int64 `json:"CPUMillis"`
+			MemoryBytes int64 `json:"MemoryBytes"`
+		} `json:"Resources"`
+		Storage struct {
+			Class        string `json:"Class"`
+			PinnedNodeID string `json:"PinnedNodeID"`
+		} `json:"Storage"`
+		Constraints struct {
+			HostPorts    []int  `json:"HostPorts"`
+			PinnedNodeID string `json:"PinnedNodeID"`
+		} `json:"Constraints"`
+	}{
+		{Service: "unpinned-db"},
+		{Service: "pinned-db"},
+		{Service: "cache"},
+	}
+	planned.Plan.Workloads[0].Storage.Class = "node_local_persistent"
+	planned.Plan.Workloads[1].Storage.Class = "node_local_persistent"
+	planned.Plan.Workloads[1].Storage.PinnedNodeID = "192-168-1-11"
+	planned.Plan.Workloads[2].Storage.Class = "ephemeral"
+
+	got := unpinnedPersistentServices(planned)
+	if len(got) != 1 || got[0] != "unpinned-db" {
+		t.Fatalf("unpinnedPersistentServices = %v, want [unpinned-db]", got)
+	}
+}

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"archive/tar"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -68,6 +69,56 @@ func (d *Docker) VolumeHostPath(workloadKey, containerPath string) string {
 	return filepath.Join(d.dataDir, sanitize.Replace(workloadKey), sanitize.Replace(containerPath))
 }
 
+// ExtractTar writes a tar stream's contents into dst, creating it if
+// needed — the agent-side half of a directory bind mount's content
+// transfer (VolumeMount.RemoteDirKey): the control plane tars up the
+// directory once at deploy time (build.TarContext), this unpacks it here
+// on whichever node actually runs the workload. Re-extracting into the
+// same directory on every (re)start is intentional — it keeps the local
+// copy in sync with whatever was stashed for the current deploy, the same
+// way PullImage re-pulls on every execute() rather than assuming a local
+// copy is already current.
+func ExtractTar(dst string, r io.Reader) error {
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		return fmt.Errorf("create %s: %w", dst, err)
+	}
+	tr := tar.NewReader(r)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("read tar entry: %w", err)
+		}
+		path := filepath.Join(dst, hdr.Name)
+		if !strings.HasPrefix(path, filepath.Clean(dst)+string(os.PathSeparator)) {
+			return fmt.Errorf("tar entry %q escapes destination directory", hdr.Name)
+		}
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(path, 0o755); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				return err
+			}
+			f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(hdr.Mode))
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(f, tr); err != nil {
+				f.Close()
+				return fmt.Errorf("write %s: %w", path, err)
+			}
+			if err := f.Close(); err != nil {
+				return err
+			}
+		}
+	}
+}
+
 // prepareVolumes ensures each node-local persistent mount's host
 // directory exists and reports a warning if the filesystem backing it is
 // nearly full (SRS §10.2: "Storage capacity, mount permissions... must be
@@ -90,20 +141,33 @@ func (d *Docker) prepareVolumes(w model.Workload) ([]string, []string, error) {
 	var warnings []string
 	for _, v := range w.Volumes {
 		hostPath := d.VolumeHostPath(w.Key(), v.ContainerPath)
-		if v.HostPath != "" {
-			// x-haco-bind-host-path: a source-code live-mount honoring the
-			// literal path compose.go resolved and validated at plan time —
-			// never a managed directory under d.dataDir. Re-check existence
-			// here too, since plan-time validation ran on whichever process
-			// handled that request; this is the process that actually
-			// starts the container.
-			if info, err := os.Stat(v.HostPath); err != nil {
+		switch {
+		case v.HostPath != "":
+			// A literal directory host path compose.go resolved and
+			// validated at plan time (x-haco-bind-host-path, a source-code
+			// live-mount) — never a managed directory under d.dataDir.
+			// Re-checked here too, since plan-time validation ran on
+			// whichever process handled that request; this is the process
+			// that actually starts the container.
+			if _, err := os.Stat(v.HostPath); err != nil {
 				return nil, nil, fmt.Errorf("bind mount host path %s: %w", v.HostPath, err)
-			} else if !info.IsDir() {
-				return nil, nil, fmt.Errorf("bind mount host path %s is not a directory", v.HostPath)
 			}
 			hostPath = v.HostPath
-		} else {
+		case v.FileContent != nil:
+			// A single-file bind mount's content, carried with the
+			// workload itself rather than a host-specific path (see
+			// VolumeMount.FileContent) — materialize it here, on whichever
+			// node actually ended up running this workload. Rewritten on
+			// every (re)start so a redeploy with updated file content
+			// (e.g. a changed config value) always takes effect, the same
+			// as any other part of the workload spec.
+			if err := os.MkdirAll(filepath.Dir(hostPath), 0o755); err != nil {
+				return nil, nil, fmt.Errorf("create directory for bind mount file %s: %w", hostPath, err)
+			}
+			if err := os.WriteFile(hostPath, v.FileContent, 0o644); err != nil {
+				return nil, nil, fmt.Errorf("write bind mount file %s: %w", hostPath, err)
+			}
+		default:
 			if err := os.MkdirAll(hostPath, 0o755); err != nil {
 				return nil, nil, fmt.Errorf("create volume directory %s: %w", hostPath, err)
 			}

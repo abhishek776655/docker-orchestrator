@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/abhishek/hardware-aware-container-orchestrator/agent"
 	"github.com/abhishek/hardware-aware-container-orchestrator/build"
 	"github.com/abhishek/hardware-aware-container-orchestrator/compose"
 	"github.com/abhishek/hardware-aware-container-orchestrator/model"
@@ -36,6 +37,15 @@ type Service struct {
 	// agent's fetch would mean redeploying, an accepted limitation.
 	buildContextsMu sync.Mutex
 	buildContexts   map[string][]byte
+
+	// volumeSnapshots holds a directory bind mount's content as a tarball,
+	// keyed by workload-key + volume index — the same in-memory, fetch-
+	// once idea as buildContexts, but for a directory mount
+	// (VolumeMount.RemoteDirKey) a service isn't explicitly pinned to this
+	// control-plane host for (resolveVolumeSnapshots), rather than a
+	// Docker build context.
+	volumeSnapshotsMu sync.Mutex
+	volumeSnapshots   map[string][]byte
 }
 
 func New(s *store.Store) *Service { return &Service{store: s} }
@@ -56,13 +66,13 @@ func (svc *Service) WithJoinManager(m *JoinManager) *Service {
 // anything (SRS UC-02, FR-023), and dry-run schedules every workload
 // against current node/reservation state so the plan shows where each
 // service would land without persisting or starting anything.
-func (svc *Service) ComposePlan(ctx context.Context, project, workingDir string, yaml []byte, onlyService string, pinHost *[]string) (*compose.Plan, []*model.Decision, error) {
+func (svc *Service) ComposePlan(ctx context.Context, project, workingDir string, yaml []byte, onlyService string, pinHost *[]string, pinNodes map[string][]string) (*compose.Plan, []*model.Decision, error) {
 	plan, err := compose.Load(ctx, project, workingDir, yaml)
 	if err != nil {
 		return nil, nil, err
 	}
-	if pinHost != nil {
-		compose.ApplyHostPinOverride(plan, *pinHost)
+	if pins, ok := compose.MergePinOverride(pinHost, pinNodes); ok {
+		compose.ApplyPinOverride(plan, pins)
 	}
 	if onlyService != "" {
 		plan, err = filterToClosure(plan, onlyService)
@@ -215,12 +225,23 @@ type DeployOptions struct {
 	// transitively depends on (see filterToClosure) instead of the whole
 	// Compose file.
 	OnlyService string
-	// PinHost, when non-nil, overrides every workload's computed storage
-	// affinity (see compose.ApplyHostPinOverride): only the named services
-	// pin to this control-plane host, everything else schedules anywhere.
-	// nil means no override — the Compose file's own x-haco-* annotations
-	// (or their defaults) decide affinity as usual.
+	// PinHost, when non-nil, pins the named services to this control-plane
+	// host specifically (see compose.ApplyPinOverride, via MergePinOverride
+	// combining this with PinNodes). nil (and an empty PinNodes) means no
+	// override — the Compose file's own x-haco-* annotations (or their
+	// defaults) decide affinity as usual. Set, either field frees every
+	// other workload to schedule anywhere, even one compose.go's own
+	// bind-mount heuristics would otherwise have pinned to host.
 	PinHost *[]string
+	// PinNodes pins each named service to an explicit node ID, for pinning
+	// something to a worker node rather than the control-plane host.
+	PinNodes map[string][]string
+	// Fresh, when true, skips reusing any currently-unpinned service's
+	// existing stored pin — the scheduler re-picks a node for it from
+	// scratch, abandoning whatever data lives on its current node. Has no
+	// effect on an explicitly pinned service (PinHost/PinNodes, or the
+	// Compose file's own x-haco-pin-node/x-haco-pin-host).
+	Fresh bool
 }
 
 // ComposeDeploy plans a Compose file, builds any services that need it,
@@ -232,8 +253,8 @@ func (svc *Service) ComposeDeploy(ctx context.Context, project, workingDir strin
 	if err != nil {
 		return nil, nil, err
 	}
-	if opts.PinHost != nil {
-		compose.ApplyHostPinOverride(plan, *opts.PinHost)
+	if pins, ok := compose.MergePinOverride(opts.PinHost, opts.PinNodes); ok {
+		compose.ApplyPinOverride(plan, pins)
 	}
 	if opts.OnlyService != "" {
 		plan, err = filterToClosure(plan, opts.OnlyService)
@@ -246,6 +267,12 @@ func (svc *Service) ComposeDeploy(ctx context.Context, project, workingDir strin
 	}
 	if !plan.Networking.Supported {
 		return plan, nil, fmt.Errorf("compose plan recommends %s networking, which is not provisioned yet: %s", plan.Networking.Mode, strings.Join(plan.Networking.Reasons, "; "))
+	}
+	if err := svc.resolveVolumeSnapshots(plan); err != nil {
+		return plan, nil, err
+	}
+	if err := svc.resolveVolumeSeeds(plan); err != nil {
+		return plan, nil, err
 	}
 
 	images, remoteBuilds, err := svc.resolveBuilds(ctx, project, plan, opts.NoCache)
@@ -262,7 +289,7 @@ func (svc *Service) ComposeDeploy(ctx context.Context, project, workingDir strin
 				wl.SkipPull = true
 			}
 		}
-		result, err := svc.Submit(ctx, wl)
+		result, err := svc.Submit(ctx, wl, opts.Fresh)
 		results = append(results, result)
 		if err != nil {
 			return plan, results, fmt.Errorf("schedule %s: %w", wl.Service, err)
@@ -346,6 +373,99 @@ func (svc *Service) FetchBuildContext(key string) ([]byte, bool) {
 	return data, ok
 }
 
+// stashVolumeSnapshot holds a directory bind mount's tarball for an agent
+// to fetch (see Service.volumeSnapshots' doc comment for why this is
+// in-memory only).
+func (svc *Service) stashVolumeSnapshot(key string, tarball []byte) {
+	svc.volumeSnapshotsMu.Lock()
+	defer svc.volumeSnapshotsMu.Unlock()
+	if svc.volumeSnapshots == nil {
+		svc.volumeSnapshots = map[string][]byte{}
+	}
+	svc.volumeSnapshots[key] = tarball
+}
+
+// FetchVolumeSnapshot returns the tarball stashed for a volume key, for
+// the agent-facing endpoint that serves it to whichever node fetches it.
+func (svc *Service) FetchVolumeSnapshot(key string) ([]byte, bool) {
+	svc.volumeSnapshotsMu.Lock()
+	defer svc.volumeSnapshotsMu.Unlock()
+	data, ok := svc.volumeSnapshots[key]
+	return data, ok
+}
+
+// resolveVolumeSnapshots tars up every directory bind mount in plan whose
+// owning workload is NOT pinned to this control-plane host (the only
+// place such a HostPath is actually valid), and stashes it for whichever
+// node the workload lands on to fetch — the same transfer idea as a
+// remote build context, just for a directory mount instead of a Docker
+// build (compose.go's own doc comment on cases 2-4 explains why). A
+// workload explicitly pinned here keeps its real, live HostPath as-is.
+// Only meaningful at actual deploy time — a plan/build dry run has
+// nothing to fetch it, so this is never called from ComposePlan or
+// ComposeBuild.
+func (svc *Service) resolveVolumeSnapshots(plan *compose.Plan) error {
+	host := agent.HostNodeID()
+	for i := range plan.Workloads {
+		wl := &plan.Workloads[i]
+		if wl.Storage.PinnedNodeID == host {
+			continue
+		}
+		for j := range wl.Volumes {
+			v := &wl.Volumes[j]
+			if v.HostPath == "" {
+				continue
+			}
+			tarball, err := build.TarContext(v.HostPath)
+			if err != nil {
+				return fmt.Errorf("package volume %s for %s: %w", v.ContainerPath, wl.Service, err)
+			}
+			data, err := io.ReadAll(tarball)
+			if err != nil {
+				return fmt.Errorf("read volume tarball %s for %s: %w", v.ContainerPath, wl.Service, err)
+			}
+			key := fmt.Sprintf("%s:%d", wl.Key(), j)
+			svc.stashVolumeSnapshot(key, data)
+			v.HostPath = ""
+			v.RemoteDirKey = key
+		}
+	}
+	return nil
+}
+
+// resolveVolumeSeeds converts every volume's candidate seed path
+// (compose.go's candidateSeedPath, momentarily held in SeedDirKey as a raw
+// path) into an actual stashed tarball the assigned agent can fetch — or
+// clears it if there's nothing to seed. A distinct key namespace
+// ("...:seed:N") from resolveVolumeSnapshots' RemoteDirKey keys, since a
+// single volume could in principle need both in different deploys and
+// they must never collide.
+func (svc *Service) resolveVolumeSeeds(plan *compose.Plan) error {
+	for i := range plan.Workloads {
+		wl := &plan.Workloads[i]
+		for j := range wl.Volumes {
+			v := &wl.Volumes[j]
+			if v.SeedDirKey == "" {
+				continue
+			}
+			sourcePath := v.SeedDirKey
+			v.SeedDirKey = ""
+			tarball, err := build.TarContext(sourcePath)
+			if err != nil {
+				return fmt.Errorf("package volume seed %s for %s: %w", v.ContainerPath, wl.Service, err)
+			}
+			data, err := io.ReadAll(tarball)
+			if err != nil {
+				return fmt.Errorf("read volume seed tarball %s for %s: %w", v.ContainerPath, wl.Service, err)
+			}
+			key := fmt.Sprintf("%s:seed:%d", wl.Key(), j)
+			svc.stashVolumeSnapshot(key, data)
+			v.SeedDirKey = key
+		}
+	}
+	return nil
+}
+
 // buildImages builds every build: service in plan centrally and
 // immediately, regardless of registry/placement — used only by
 // ComposeBuild ("just build it now"), where there's no scheduling decision
@@ -381,8 +501,8 @@ func (svc *Service) ComposeBuild(ctx context.Context, project, workingDir string
 	if err != nil {
 		return nil, nil, err
 	}
-	if opts.PinHost != nil {
-		compose.ApplyHostPinOverride(plan, *opts.PinHost)
+	if pins, ok := compose.MergePinOverride(opts.PinHost, opts.PinNodes); ok {
+		compose.ApplyPinOverride(plan, pins)
 	}
 	if opts.OnlyService != "" {
 		plan, err = filterToClosure(plan, opts.OnlyService)
@@ -483,7 +603,15 @@ type SubmitResult struct {
 
 // Submit schedules a workload against current node/reservation state and
 // persists it as "assigned" on success.
-func (svc *Service) Submit(ctx context.Context, w model.Workload) (*SubmitResult, error) {
+// Submit schedules and persists one workload. fresh, when true, skips
+// reusing an unpinned workload's existing stored pin (see below) —
+// `hacoctl deploy --fresh` for rescheduling an entire project from
+// scratch, abandoning whatever data lives on each currently-unpinned
+// service's existing node. It has no effect on a workload that already
+// carries an explicit pin (x-haco-pin-node/x-haco-pin-host in the Compose
+// file, or --pin-host/--pin-node at deploy time) — only the "no pin at
+// all, so reuse wherever it already landed" path is affected.
+func (svc *Service) Submit(ctx context.Context, w model.Workload, fresh bool) (*SubmitResult, error) {
 	nodes, err := svc.store.ListNodes(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list nodes: %w", err)
@@ -493,7 +621,7 @@ func (svc *Service) Submit(ctx context.Context, w model.Workload) (*SubmitResult
 		return nil, fmt.Errorf("load reservations: %w", err)
 	}
 
-	if w.Storage.Class == model.NodeLocalPersistent && w.Storage.PinnedNodeID == "" {
+	if !fresh && w.Storage.Class == model.NodeLocalPersistent && w.Storage.PinnedNodeID == "" {
 		// x-haco-place-anywhere: the compose file itself carries no pin, so
 		// on a redeploy, reuse wherever this workload is already pinned
 		// (its data lives there) instead of letting the scheduler pick a

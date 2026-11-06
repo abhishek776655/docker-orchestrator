@@ -23,6 +23,7 @@ func NewHandler(svc *Service) http.Handler {
 	mux.HandleFunc("POST /v1/nodes", svc.handleRegisterNode)
 	mux.HandleFunc("POST /v1/nodes/{id}/heartbeat", svc.handleHeartbeat)
 	mux.HandleFunc("GET /v1/nodes", svc.handleListNodes)
+	mux.HandleFunc("GET /v1/discovered", svc.handleListDiscovered)
 
 	mux.HandleFunc("POST /v1/workloads", svc.handleSubmit)
 	mux.HandleFunc("GET /v1/workloads", svc.handleListWorkloads)
@@ -63,6 +64,8 @@ func NewAgentHandler(svc *Service) http.Handler {
 	mux.Handle("POST /v1/nodes/{id}/heartbeat", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleHeartbeat)))
 	mux.Handle("GET /v1/agent/{node}/assignments", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleAssignments)))
 	mux.Handle("GET /v1/agent/{node}/build-context/{project}/{service}/{revision}", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleBuildContext)))
+	mux.Handle("GET /v1/agent/{node}/volume-context/{project}/{service}/{revision}/{index}", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleVolumeContext)))
+	mux.Handle("GET /v1/agent/{node}/volume-seed/{project}/{service}/{revision}/{index}", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleVolumeSeed)))
 	mux.Handle("POST /v1/agent/status", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleReportStatus)))
 	mux.Handle("GET /v1/services/{project}/{service}", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleListServiceInstances)))
 	mux.Handle("GET /v1/services/{project}", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleListProjectServices)))
@@ -280,7 +283,7 @@ func (svc *Service) handleSubmit(w http.ResponseWriter, r *http.Request) {
 		DependsOn:    req.DependsOn,
 	}
 
-	result, err := svc.Submit(r.Context(), wl)
+	result, err := svc.Submit(r.Context(), wl, false)
 	if err != nil {
 		writeJSON(w, http.StatusConflict, map[string]any{
 			"error":    err.Error(),
@@ -365,6 +368,70 @@ func (svc *Service) handleBuildContext(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
+// handleVolumeContext serves a stashed directory bind-mount snapshot to
+// the agent that needs it — the transport half of a directory bind mount
+// not explicitly pinned to the control-plane host (resolveVolumeSnapshots
+// stashes the bytes at deploy time). Same node/workload-ownership check
+// as handleBuildContext; index picks which of the workload's volumes.
+func (svc *Service) handleVolumeContext(w http.ResponseWriter, r *http.Request) {
+	nodeID := r.PathValue("node")
+	if authenticated := authenticatedNode(r); authenticated != "" && authenticated != nodeID {
+		writeError(w, http.StatusForbidden, fmt.Errorf("credential is not authorized for node %q", nodeID))
+		return
+	}
+	key := strings.Join([]string{r.PathValue("project"), r.PathValue("service"), r.PathValue("revision")}, "/")
+	rec, err := svc.GetWorkload(r.Context(), key)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	if rec.NodeID != nodeID {
+		writeError(w, http.StatusForbidden, fmt.Errorf("workload %q is not assigned to node %q", key, nodeID))
+		return
+	}
+	snapshotKey := key + ":" + r.PathValue("index")
+	data, ok := svc.FetchVolumeSnapshot(snapshotKey)
+	if !ok {
+		writeError(w, http.StatusNotFound, fmt.Errorf("no stashed volume snapshot for %q", snapshotKey))
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-tar")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
+// handleVolumeSeed serves a stashed one-time managed-volume seed to the
+// agent that needs it — the transport half of resolveVolumeSeeds. Same
+// node/workload-ownership check as handleVolumeContext; the key namespace
+// ("...:seed:N") is distinct so it can never collide with an always-fresh
+// RemoteDirKey snapshot of the same volume.
+func (svc *Service) handleVolumeSeed(w http.ResponseWriter, r *http.Request) {
+	nodeID := r.PathValue("node")
+	if authenticated := authenticatedNode(r); authenticated != "" && authenticated != nodeID {
+		writeError(w, http.StatusForbidden, fmt.Errorf("credential is not authorized for node %q", nodeID))
+		return
+	}
+	key := strings.Join([]string{r.PathValue("project"), r.PathValue("service"), r.PathValue("revision")}, "/")
+	rec, err := svc.GetWorkload(r.Context(), key)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	if rec.NodeID != nodeID {
+		writeError(w, http.StatusForbidden, fmt.Errorf("workload %q is not assigned to node %q", key, nodeID))
+		return
+	}
+	seedKey := key + ":seed:" + r.PathValue("index")
+	data, ok := svc.FetchVolumeSnapshot(seedKey)
+	if !ok {
+		writeError(w, http.StatusNotFound, fmt.Errorf("no stashed volume seed for %q", seedKey))
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-tar")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+}
+
 type reportStatusRequest struct {
 	Key         string       `json:"key"`
 	Status      model.Status `json:"status"`
@@ -397,10 +464,18 @@ type composeRequest struct {
 	Yaml        string `json:"yaml"`
 	NoCache     bool   `json:"no_cache"`
 	OnlyService string `json:"only_service"`
-	// PinHost, when non-nil (including an empty, non-null list), overrides
-	// storage affinity for the whole plan — see
-	// compose.ApplyHostPinOverride. Omitted/null means "no override".
+	// PinHost, when non-nil (including an empty, non-null list), pins the
+	// named services to this control-plane host — see
+	// compose.MergePinOverride/ApplyPinOverride. Omitted/null, combined
+	// with an empty PinNodes, means "no override".
 	PinHost *[]string `json:"pin_host"`
+	// PinNodes pins each named service to an explicit node ID — e.g.
+	// {"192-168-1-3": ["metaapi"]} to pin metaapi to that worker node
+	// specifically, rather than the control-plane host.
+	PinNodes map[string][]string `json:"pin_nodes"`
+	// Fresh, for /v1/compose/deploy only, skips reusing any currently-
+	// unpinned service's existing stored pin — see DeployOptions.Fresh.
+	Fresh bool `json:"fresh"`
 }
 
 func (svc *Service) handleComposePlan(w http.ResponseWriter, r *http.Request) {
@@ -409,7 +484,7 @@ func (svc *Service) handleComposePlan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	plan, decisions, err := svc.ComposePlan(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), req.OnlyService, req.PinHost)
+	plan, decisions, err := svc.ComposePlan(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), req.OnlyService, req.PinHost, req.PinNodes)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -427,7 +502,7 @@ func (svc *Service) handleComposeBuild(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	plan, results, err := svc.ComposeBuild(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), DeployOptions{NoCache: req.NoCache, OnlyService: req.OnlyService, PinHost: req.PinHost})
+	plan, results, err := svc.ComposeBuild(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), DeployOptions{NoCache: req.NoCache, OnlyService: req.OnlyService, PinHost: req.PinHost, PinNodes: req.PinNodes})
 	if err != nil {
 		status := http.StatusInternalServerError
 		if plan != nil && !plan.Valid() {
@@ -445,7 +520,7 @@ func (svc *Service) handleComposeDeploy(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	plan, results, err := svc.ComposeDeploy(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), DeployOptions{NoCache: req.NoCache, OnlyService: req.OnlyService, PinHost: req.PinHost})
+	plan, results, err := svc.ComposeDeploy(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), DeployOptions{NoCache: req.NoCache, OnlyService: req.OnlyService, PinHost: req.PinHost, PinNodes: req.PinNodes, Fresh: req.Fresh})
 	if err != nil {
 		status := http.StatusInternalServerError
 		if plan != nil && !plan.CanDeploy() {

@@ -1,10 +1,14 @@
 package agent
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -88,5 +92,68 @@ func TestEnsureRunningReplacesContainerWhenMutableImageTagChanges(t *testing.T) 
 	}
 	if len(createdHostConfig.DNS) != 0 || len(createdHostConfig.DNSSearch) != 0 {
 		t.Fatalf("container DNS overrides = %v / %v, want default Docker DNS", createdHostConfig.DNS, createdHostConfig.DNSSearch)
+	}
+}
+
+// TestExtractTarRoundTripsDirectoryContent covers the agent-side half of
+// a directory bind mount's content transfer (VolumeMount.RemoteDirKey):
+// what the control plane packages (build.TarContext, not imported here to
+// avoid an import cycle back through compose) must come back out intact
+// here, including a nested subdirectory, matching a real source tree's
+// shape.
+func TestExtractTarRoundTripsDirectoryContent(t *testing.T) {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for _, f := range []struct{ name, content string }{
+		{"top.txt", "top-level"},
+		{"sub/nested.txt", "nested"},
+	} {
+		hdr := &tar.Header{Name: f.name, Mode: 0o644, Size: int64(len(f.content))}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte(f.content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dst := filepath.Join(t.TempDir(), "extracted")
+	if err := ExtractTar(dst, &buf); err != nil {
+		t.Fatalf("ExtractTar: %v", err)
+	}
+
+	top, err := os.ReadFile(filepath.Join(dst, "top.txt"))
+	if err != nil || string(top) != "top-level" {
+		t.Fatalf("top.txt = %q, err = %v, want \"top-level\"", top, err)
+	}
+	nested, err := os.ReadFile(filepath.Join(dst, "sub", "nested.txt"))
+	if err != nil || string(nested) != "nested" {
+		t.Fatalf("sub/nested.txt = %q, err = %v, want \"nested\"", nested, err)
+	}
+}
+
+// TestExtractTarRejectsPathEscape covers the path-traversal guard: a
+// malicious or corrupt tar entry trying to write outside dst must be
+// rejected, not silently written there.
+func TestExtractTarRejectsPathEscape(t *testing.T) {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	hdr := &tar.Header{Name: "../escape.txt", Mode: 0o644, Size: int64(len("gotcha"))}
+	if err := tw.WriteHeader(hdr); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte("gotcha")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dst := filepath.Join(t.TempDir(), "dst")
+	if err := ExtractTar(dst, &buf); err == nil {
+		t.Fatalf("expected ExtractTar to reject a path-escaping tar entry")
 	}
 }

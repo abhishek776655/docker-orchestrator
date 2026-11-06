@@ -18,6 +18,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"runtime"
 	"sort"
 	"strings"
@@ -295,6 +296,15 @@ func (a *Agent) execute(ctx context.Context, rec store.WorkloadRecord) {
 		}
 	}
 
+	if err := a.fetchVolumeSnapshots(ctx, rec); err != nil {
+		a.report(ctx, key, model.StatusFailed, "fetch volume snapshot failed: "+err.Error(), "")
+		return
+	}
+	if err := a.fetchVolumeSeeds(ctx, rec); err != nil {
+		a.report(ctx, key, model.StatusFailed, "fetch volume seed failed: "+err.Error(), "")
+		return
+	}
+
 	a.report(ctx, key, model.StatusStarting, "", "")
 	containerID, volWarnings, err := a.docker.EnsureRunning(ctx, rec.Workload, extraHosts...)
 	if err != nil {
@@ -375,6 +385,73 @@ func (a *Agent) buildRemote(ctx context.Context, rec store.WorkloadRecord) error
 		return fmt.Errorf("fetch build context: control plane returned %s: %s", resp.Status, string(tarball))
 	}
 	return a.docker.BuildImage(ctx, bytes.NewReader(tarball), rec.Image, rec.RemoteBuild.Dockerfile, rec.RemoteBuild.Args, rec.RemoteBuild.Platform)
+}
+
+// fetchVolumeSnapshots materializes every directory bind mount this
+// workload carries as a content snapshot (VolumeMount.RemoteDirKey) rather
+// than a literal host path — the control plane already stashed each one's
+// tarball at deploy time (resolveVolumeSnapshots) since this workload
+// wasn't pinned to its own host; this agent fetches and extracts them
+// into its own managed volume directories before the container ever
+// starts, so prepareVolumes finds real content there instead of an empty
+// directory.
+func (a *Agent) fetchVolumeSnapshots(ctx context.Context, rec store.WorkloadRecord) error {
+	for i, v := range rec.Volumes {
+		if v.RemoteDirKey == "" {
+			continue
+		}
+		path := fmt.Sprintf("/v1/agent/%s/volume-context/%s/%s/%s/%d", a.cfg.NodeID, rec.Project, rec.Service, rec.Revision, i)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.cfg.ControlPlaneURL+path, nil)
+		if err != nil {
+			return err
+		}
+		resp, tarball, err := a.doRaw(req)
+		if err != nil {
+			return err
+		}
+		if resp.StatusCode >= 300 {
+			return fmt.Errorf("fetch volume snapshot %s: control plane returned %s: %s", v.ContainerPath, resp.Status, string(tarball))
+		}
+		if err := ExtractTar(a.docker.VolumeHostPath(rec.Key(), v.ContainerPath), bytes.NewReader(tarball)); err != nil {
+			return fmt.Errorf("extract volume snapshot %s: %w", v.ContainerPath, err)
+		}
+	}
+	return nil
+}
+
+// fetchVolumeSeeds adopts a managed volume's one-time seed content
+// (VolumeMount.SeedDirKey), stashed by resolveVolumeSeeds — but only the
+// very first time this volume's managed directory is created. If it
+// already exists (this workload has run here before, seeded or not),
+// whatever's already there is left completely untouched: the managed copy
+// is the sole source of truth from then on, never re-synced from the
+// compose-declared directory's current (possibly since-changed) content.
+func (a *Agent) fetchVolumeSeeds(ctx context.Context, rec store.WorkloadRecord) error {
+	for i, v := range rec.Volumes {
+		if v.SeedDirKey == "" {
+			continue
+		}
+		hostPath := a.docker.VolumeHostPath(rec.Key(), v.ContainerPath)
+		if _, err := os.Stat(hostPath); err == nil {
+			continue // already created (seeded or not) on a previous run
+		}
+		path := fmt.Sprintf("/v1/agent/%s/volume-seed/%s/%s/%s/%d", a.cfg.NodeID, rec.Project, rec.Service, rec.Revision, i)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.cfg.ControlPlaneURL+path, nil)
+		if err != nil {
+			return err
+		}
+		resp, tarball, err := a.doRaw(req)
+		if err != nil {
+			return err
+		}
+		if resp.StatusCode >= 300 {
+			return fmt.Errorf("fetch volume seed %s: control plane returned %s: %s", v.ContainerPath, resp.Status, string(tarball))
+		}
+		if err := ExtractTar(hostPath, bytes.NewReader(tarball)); err != nil {
+			return fmt.Errorf("extract volume seed %s: %w", v.ContainerPath, err)
+		}
+	}
+	return nil
 }
 
 // resolveDependencies returns Docker extra-host entries for all assigned

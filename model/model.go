@@ -235,6 +235,42 @@ type VolumeMount struct {
 	// when the workload is pinned to the same machine this path was
 	// resolved on; compose.go enforces that at plan time.
 	HostPath string `json:"host_path,omitempty"`
+	// FileContent, when non-empty, is the literal bytes of a single-file
+	// bind mount (e.g. a small ./config.json the container reads) read
+	// once at plan time and carried with the workload itself — unlike
+	// HostPath, this travels with the workload to whichever node it's
+	// actually scheduled on, so this kind of mount never needs to pin a
+	// workload to one specific host the way a directory live-mount does.
+	// The agent writes it to its own managed file path before binding.
+	// Mutually exclusive with HostPath.
+	FileContent []byte `json:"file_content,omitempty"`
+	// RemoteDirKey, when non-empty, names a directory-content tarball the
+	// control plane has stashed for this volume (a directory bind mount
+	// too large/dynamic to embed as FileContent, e.g. an application
+	// source tree a service's Dockerfile doesn't copy in and relies on
+	// entirely via the mount) — the agent fetches it over
+	// GET .../volume-context/... and extracts it into its own managed
+	// directory before binding, the same transfer idea as a remote build
+	// context, just for a directory mount instead of a Docker build. Only
+	// set when this workload is NOT pinned to the control-plane host the
+	// literal directory lives on — a service explicitly pinned there
+	// (x-haco-pin-host/--pin-host) gets the real HostPath instead, a true
+	// live bind mount, since only that case can actually offer live-reload
+	// (the snapshot this key points to is frozen at deploy time).
+	// Mutually exclusive with HostPath and FileContent.
+	RemoteDirKey string `json:"remote_dir_key,omitempty"`
+	// SeedDirKey, when non-empty, names a one-time seed tarball the control
+	// plane has stashed for this volume — the ordinary managed-volume case
+	// (e.g. ./mysql-data:/var/lib/mysql), where the compose-declared host
+	// directory already has real content (from running this stack outside
+	// the orchestrator before) that's worth adopting as this managed
+	// volume's starting point. Unlike RemoteDirKey, the agent only ever
+	// fetches and extracts this ONCE: if its own managed directory for this
+	// volume doesn't exist yet. Once created (seeded or not), the managed
+	// copy is the sole source of truth from then on — a later change to
+	// the original compose-declared directory is never picked up again,
+	// and neither is this key reused on a later redeploy.
+	SeedDirKey string `json:"seed_dir_key,omitempty"`
 }
 
 // DesiredState is the controller's intent for a workload, independent of
