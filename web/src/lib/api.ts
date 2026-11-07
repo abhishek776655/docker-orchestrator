@@ -18,7 +18,7 @@ export interface ApiNode {
   Capabilities: Record<string, boolean> | null
   Allocatable: { CPUMillis: number; MemoryBytes: number } // detected, capped by Limits
   Detected?: { CPUMillis: number; MemoryBytes: number }
-  Limits?: { CPUMillis: number; MemoryBytes: number } // 0 = no cap (hacoctl node limit)
+  Limits?: { CPUMillis: number; MemoryBytes: number } // 0 = no cap (haco node limit)
   Availability: 'available' | 'unavailable' | 'disabled'
   DisabledByAdmin: boolean
   HeartbeatAt: string
@@ -180,7 +180,7 @@ async function postJson(path: string, body: unknown): Promise<Response> {
 }
 
 const OUTDATED =
-  'The control plane is an older version without this action. Run ./install.sh, then hacoctl stop-all and hacoctl start --web (and hacoctl agent run on other machines).'
+  'The control plane is an older version without this action. Run ./install.sh, then haco stop-all and haco start --web (and haco agent run on other machines).'
 
 async function errorFrom(res: Response): Promise<ApiError> {
   // An older control plane routes unknown POST actions to a GET-only path.

@@ -1,5 +1,5 @@
-// hacoctl tui: a read-only, auto-refreshing dashboard over the same API
-// every other hacoctl command already uses. v1 is deliberately read-only
+// haco tui: a read-only, auto-refreshing dashboard over the same API
+// every other haco command already uses. v1 is deliberately read-only
 // (roadmap item 8 names a "freeze"/override pass and a full web UI as
 // later work) — this is the ahead-of-the-web-UI terminal equivalent,
 // reusing the view structs and fetch helpers the table-rendering commands
@@ -47,7 +47,7 @@ var tuiTabNames = [tabCount]string{"Dashboard", "Nodes", "Workloads", "Container
 func isTextTab(tab tuiTab) bool { return tab == tabDashboard || tab == tabLogs }
 
 // eventView and metricsView have no existing CLI view struct to reuse —
-// `hacoctl events`/`hacoctl metrics` just dump raw JSON today — so these
+// `haco events`/`haco metrics` just dump raw JSON today — so these
 // are new, matching store.Event's and store.Metrics' JSON shape.
 type eventView struct {
 	ID          int       `json:"ID"`
@@ -116,7 +116,7 @@ type tuiTickMsg time.Time
 
 func runTUI(baseURL string, args []string) error {
 	if len(args) > 1 {
-		return fmt.Errorf("usage: hacoctl tui [project]")
+		return fmt.Errorf("usage: haco tui [project]")
 	}
 	project := ""
 	if len(args) == 1 {
@@ -277,7 +277,7 @@ func (m tuiModel) View() string {
 // and fetchJSON helper the equivalent CLI table commands already use
 // (workloadRecordView/nodeView/serviceInstanceView/projectSummaryView),
 // plus intListOrDash/internalURLs for the containers tab exactly as
-// hacoctl containers renders them.
+// haco containers renders them.
 func fetchTabData(baseURL, project string, tab tuiTab) ([]table.Column, []table.Row, error) {
 	switch tab {
 	case tabNodes:
@@ -438,7 +438,7 @@ func fetchServicesTab(baseURL, project string) ([]table.Column, []table.Row, err
 		{Title: "PORT", Width: 8}, {Title: "STATUS", Width: 20},
 	}
 	if project == "" {
-		return cols, []table.Row{{"(start with a project, e.g. hacoctl tui <project>, to see services)", "", "", "", ""}}, nil
+		return cols, []table.Row{{"(start with a project, e.g. haco tui <project>, to see services)", "", "", "", ""}}, nil
 	}
 	var out []serviceInstanceView
 	if err := fetchJSON(baseURL, "/v1/services/"+neturl.PathEscape(project), &out); err != nil {
@@ -571,7 +571,7 @@ func padOrTruncate(s string, width int) string {
 }
 
 // fetchLogsContent reads the control-plane log file's tail — local-only
-// (same assumption `hacoctl start --logs` already makes: the file lives
+// (same assumption `haco start --logs` already makes: the file lives
 // wherever HACO_DATA_DIR/controlplane.log resolves to on this machine).
 // Any error is folded into the returned content instead of propagated —
 // a missing log file is a local-filesystem fact, not a control-plane
@@ -584,7 +584,7 @@ func fetchLogsContent() (string, error) {
 	path := filepath.Join(dataDir, "controlplane.log")
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Sprintf("could not read %s: %v\n\n(the control plane may be running on a different machine, or hasn't been started with `hacoctl start` here)", path, err), nil
+		return fmt.Sprintf("could not read %s: %v\n\n(the control plane may be running on a different machine, or hasn't been started with `haco start` here)", path, err), nil
 	}
 	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
 	if len(lines) > tuiLogTailLines {

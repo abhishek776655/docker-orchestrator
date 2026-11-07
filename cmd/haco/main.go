@@ -1,4 +1,4 @@
-// Command hacoctl is a thin CLI over the control-plane HTTP API, so using
+// Command haco is a thin CLI over the control-plane HTTP API, so using
 // the platform doesn't require hand-assembling JSON with curl. It has no
 // state of its own — every subcommand is a single HTTP call.
 package main
@@ -76,7 +76,7 @@ func main() {
 		err = printJoinCommand(url)
 	case "revoke-node":
 		if len(os.Args) != 3 {
-			err = fmt.Errorf("usage: hacoctl revoke-node <node-id>")
+			err = fmt.Errorf("usage: haco revoke-node <node-id>")
 		} else {
 			err = post(url, "/v1/admin/nodes/"+neturl.PathEscape(os.Args[2])+"/revoke", []byte(`{}`))
 		}
@@ -105,44 +105,44 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `hacoctl: a thin CLI over the control-plane API (HACO_CONTROLPLANE_URL, default http://localhost:8099)
+	fmt.Fprintln(os.Stderr, `haco: a thin CLI over the control-plane API (HACO_CONTROLPLANE_URL, default http://localhost:8099)
 
 Usage:
-  hacoctl build  <project> <docker-compose.yml>   just build the build: service images, no scheduling or containers (--no-cache forces a full rebuild; --service <name> scopes to that service and its dependencies (repeatable, or a comma list); --pin-host/--pin-node below)
-  hacoctl deploy <project> <docker-compose.yml>   build, schedule, and run a Compose project, then show a live status table until every workload is ready/failed/stopped (like 'docker compose up -d'); prompts if a pinned service needs a fresh volume (--yes skips it); --no-cache forces a full rebuild; --service <name> deploys only that service and its dependencies (repeat it, or give a comma list, for several); --pin-host/--pin-node below; --fresh lets every currently-unpinned service reschedule freely instead of reusing its existing node (prompts first, abandons its current data; --yes skips it)
-  hacoctl plan   <project> <docker-compose.yml>   dry-run the same, no side effects (table; add --json for raw; --service <name> to scope the same way; --pin-host/--pin-node below; --fresh previews what 'deploy --fresh' would actually do instead of the existing-pin reuse a plain deploy uses)
+  haco build  <project> <docker-compose.yml>   just build the build: service images, no scheduling or containers (--no-cache forces a full rebuild; --service <name> scopes to that service and its dependencies (repeatable, or a comma list); --pin-host/--pin-node below)
+  haco deploy <project> <docker-compose.yml>   build, schedule, and run a Compose project, then show a live status table until every workload is ready/failed/stopped (like 'docker compose up -d'); prompts if a pinned service needs a fresh volume (--yes skips it); --no-cache forces a full rebuild; --service <name> deploys only that service and its dependencies (repeat it, or give a comma list, for several); --pin-host/--pin-node below; --fresh lets every currently-unpinned service reschedule freely instead of reusing its existing node (prompts first, abandons its current data; --yes skips it)
+  haco plan   <project> <docker-compose.yml>   dry-run the same, no side effects (table; add --json for raw; --service <name> to scope the same way; --pin-host/--pin-node below; --fresh previews what 'deploy --fresh' would actually do instead of the existing-pin reuse a plain deploy uses)
                                                    --pin-host <service,...>: override storage affinity for this call only, no Compose file changes needed — only the named services (e.g. a database, and whichever service you're actively live-editing) pin to this control-plane host; every other service schedules anywhere, even one that bind-mounts its own source (overrides compose.go's own auto-pin heuristic)
                                                    --pin-node <node-id>=<service,...>: same override, but pins the named services to that specific node instead of the control-plane host — repeatable for multiple nodes; combines with --pin-host in the same call
-  hacoctl status [project] [service] [revision]   table of every workload (optionally filtered to one project), or one workload's full detail once service is named (revision defaults to "latest")
-  hacoctl logs   <project> <service> [revision]   live container logs from whichever node runs it (revision defaults to "latest"; --tail N lines, default 200; -f to follow); falls back to the tail captured when a container failed to start
-  hacoctl stop   <project> <service> <revision>   stop the workload and remove its container
-  hacoctl resume <project> [service]              start stopped services again on the nodes they last ran on (no rebuild, no rescheduling)
-  hacoctl restart <project> [service]             recreate the containers of running services, in place
-  hacoctl remove-workload <project> <service> [revision]   hard-delete that workload's record entirely (revision defaults to "latest"); distinct from stop, which keeps a stopped row
-  hacoctl remove-all-workloads [project]          hard-delete every workload record, optionally scoped to one project (--yes skips confirmation)
-  hacoctl nodes                                   list registered nodes
-  hacoctl node <id>                               one node's full detail
-  hacoctl node cordon <id>                        block new workloads from scheduling onto this node (existing ones keep running)
-  hacoctl node uncordon <id>                      make this node eligible for new workloads again
-  hacoctl node rename <id> <name>                 give a node a display name (its ID is the machine's permanent identity and never changes)
-  hacoctl node limit <id> --cpus N --memory SIZE  cap what the scheduler may reserve on a node, e.g. --cpus 4 --memory 8GiB (--clear removes the cap)
-  hacoctl workloads [project]                     table of every workload, optionally filtered to one project
-  hacoctl projects                                list distinct projects with a quick workload-status breakdown
-  hacoctl tui [project]                           read-only auto-refreshing terminal dashboard (nodes/workloads/containers/events/metrics/services/projects tabs)
-  hacoctl containers [project]                    node/workload/container join view, optionally filtered to one project
-  hacoctl services <project> [service]            resolve a logical service name to its current endpoints
-  hacoctl events [project]                        recent audit events, optionally filtered to one project
-  hacoctl metrics [project]                       node/workload counts, optionally filtered to one project's workloads
-  hacoctl join-token                              print a fresh one-time agent join command
-  hacoctl revoke-node <node-id>                   revoke that agent credential (node stays listed, permanently unavailable)
-  hacoctl remove-node <node-id> [--force]         hard-delete that node record and its credential (refused if it still has a non-terminal workload assigned, unless --force)
-  hacoctl stop-containers [project]               stop every workload's container, optionally filtered to one project (nodes stay joined; --yes skips confirmation)
-  hacoctl teardown                                stop every workload and revoke every node credential (--yes skips confirmation)
-  hacoctl shutdown                                stop the whole cluster in order: every node's containers (stopped, not removed) and agent, then the control plane; 'hacoctl start' + 'hacoctl agent run' bring the same services back (--yes skips confirmation)
-  hacoctl start                                   start the control plane in the background; each node builds its own images (--registry to run the local build registry instead, --web to also serve the web console and print its URL, --foreground to run attached, --logs to tail its log right after starting, --tui to launch the dashboard once ready instead — not combinable with each other or --foreground)
-  hacoctl stop-all                                stop the control plane process started by 'hacoctl start'
-  hacoctl agent join <token>                      join this machine as a worker node (one-time token from 'hacoctl start')
-  hacoctl agent run                                run this machine's already-joined node (reuses the saved credential, no token needed)`)
+  haco status [project] [service] [revision]   table of every workload (optionally filtered to one project), or one workload's full detail once service is named (revision defaults to "latest")
+  haco logs   <project> <service> [revision]   live container logs from whichever node runs it (revision defaults to "latest"; --tail N lines, default 200; -f to follow); falls back to the tail captured when a container failed to start
+  haco stop   <project> <service> <revision>   stop the workload and remove its container
+  haco resume <project> [service]              start stopped services again on the nodes they last ran on (no rebuild, no rescheduling)
+  haco restart <project> [service]             recreate the containers of running services, in place
+  haco remove-workload <project> <service> [revision]   hard-delete that workload's record entirely (revision defaults to "latest"); distinct from stop, which keeps a stopped row
+  haco remove-all-workloads [project]          hard-delete every workload record, optionally scoped to one project (--yes skips confirmation)
+  haco nodes                                   list registered nodes
+  haco node <id>                               one node's full detail
+  haco node cordon <id>                        block new workloads from scheduling onto this node (existing ones keep running)
+  haco node uncordon <id>                      make this node eligible for new workloads again
+  haco node rename <id> <name>                 give a node a display name (its ID is the machine's permanent identity and never changes)
+  haco node limit <id> --cpus N --memory SIZE  cap what the scheduler may reserve on a node, e.g. --cpus 4 --memory 8GiB (--clear removes the cap)
+  haco workloads [project]                     table of every workload, optionally filtered to one project
+  haco projects                                list distinct projects with a quick workload-status breakdown
+  haco tui [project]                           read-only auto-refreshing terminal dashboard (nodes/workloads/containers/events/metrics/services/projects tabs)
+  haco containers [project]                    node/workload/container join view, optionally filtered to one project
+  haco services <project> [service]            resolve a logical service name to its current endpoints
+  haco events [project]                        recent audit events, optionally filtered to one project
+  haco metrics [project]                       node/workload counts, optionally filtered to one project's workloads
+  haco join-token                              print a fresh one-time agent join command
+  haco revoke-node <node-id>                   revoke that agent credential (node stays listed, permanently unavailable)
+  haco remove-node <node-id> [--force]         hard-delete that node record and its credential (refused if it still has a non-terminal workload assigned, unless --force)
+  haco stop-containers [project]               stop every workload's container, optionally filtered to one project (nodes stay joined; --yes skips confirmation)
+  haco teardown                                stop every workload and revoke every node credential (--yes skips confirmation)
+  haco shutdown                                stop the whole cluster in order: every node's containers (stopped, not removed) and agent, then the control plane; 'haco start' + 'haco agent run' bring the same services back (--yes skips confirmation)
+  haco start                                   start the control plane in the background; each node builds its own images (--registry to run the local build registry instead, --web to also serve the web console and print its URL, --foreground to run attached, --logs to tail its log right after starting, --tui to launch the dashboard once ready instead — not combinable with each other or --foreground)
+  haco stop-all                                stop the control plane process started by 'haco start'
+  haco agent join <token>                      join this machine as a worker node (one-time token from 'haco start')
+  haco agent run                                run this machine's already-joined node (reuses the saved credential, no token needed)`)
 }
 
 func printJoinCommand(baseURL string) error {
@@ -162,13 +162,13 @@ func printJoinCommand(baseURL string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("hacoctl agent join '%s'\n", encoded)
+	fmt.Printf("haco agent join '%s'\n", encoded)
 	return nil
 }
 
 // plan calls /v1/compose/plan and renders a human-readable table by
 // default (raw JSON is for the API/future UI, not the terminal); pass
-// --json to get the same raw response hacoctl used to always print.
+// --json to get the same raw response haco used to always print.
 func plan(baseURL string, args []string) error {
 	jsonOut, fresh := false, false
 	onlyService := ""
@@ -209,7 +209,7 @@ func plan(baseURL string, args []string) error {
 		}
 	}
 	if len(rest) != 2 {
-		return fmt.Errorf("usage: hacoctl plan <project> <docker-compose.yml> [--json] [--fresh] [--service <name>[,<name>...]] [--pin-host <service,...>] [--pin-node <node-id>=<service,...>]")
+		return fmt.Errorf("usage: haco plan <project> <docker-compose.yml> [--json] [--fresh] [--service <name>[,<name>...]] [--pin-host <service,...>] [--pin-node <node-id>=<service,...>]")
 	}
 	project, file := rest[0], rest[1]
 
@@ -423,7 +423,7 @@ func buildCmd(baseURL string, args []string) error {
 		}
 	}
 	if len(rest) != 2 {
-		return fmt.Errorf("usage: hacoctl build <project> <docker-compose.yml> [--no-cache] [--service <name>[,<name>...]] [--pin-host <service,...>] [--pin-node <node-id>=<service,...>]")
+		return fmt.Errorf("usage: haco build <project> <docker-compose.yml> [--no-cache] [--service <name>[,<name>...]] [--pin-host <service,...>] [--pin-node <node-id>=<service,...>]")
 	}
 	project, file := rest[0], rest[1]
 
@@ -495,7 +495,7 @@ func deploy(baseURL string, args []string) error {
 		}
 	}
 	if len(rest) != 2 {
-		return fmt.Errorf("usage: hacoctl deploy <project> <docker-compose.yml> [--yes] [--no-cache] [--fresh] [--service <name>[,<name>...]] [--pin-host <service,...>] [--pin-node <node-id>=<service,...>]")
+		return fmt.Errorf("usage: haco deploy <project> <docker-compose.yml> [--yes] [--no-cache] [--fresh] [--service <name>[,<name>...]] [--pin-host <service,...>] [--pin-node <node-id>=<service,...>]")
 	}
 	project, file := rest[0], rest[1]
 
@@ -732,7 +732,7 @@ func watchDeploy(baseURL, project string, keys []string) error {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			fmt.Println("(timed out waiting for all workloads to reach a terminal state; check `hacoctl workloads` for current status)")
+			fmt.Println("(timed out waiting for all workloads to reach a terminal state; check `haco workloads` for current status)")
 			return nil
 		}
 		time.Sleep(time.Second)
@@ -850,10 +850,10 @@ func fetchJSON(baseURL, path string, out any) error {
 
 // workloads lists every workload, optionally filtered to one project, as a
 // table (SERVICE/REVISION/NODE/STATUS/REASON) — raw per-workload detail is
-// still available via `hacoctl status`.
+// still available via `haco status`.
 func workloads(baseURL string, args []string) error {
 	if len(args) > 1 {
-		return fmt.Errorf("usage: hacoctl workloads [project]")
+		return fmt.Errorf("usage: haco workloads [project]")
 	}
 	path := "/v1/workloads"
 	if len(args) == 1 {
@@ -884,11 +884,11 @@ type projectSummaryView struct {
 
 // projects lists every distinct project (derived from existing workload
 // rows — there's no dedicated projects table) with a quick status
-// breakdown, so you don't have to run `hacoctl workloads` with no filter
+// breakdown, so you don't have to run `haco workloads` with no filter
 // and eyeball the PROJECT column.
 func projects(baseURL string, args []string) error {
 	if len(args) != 0 {
-		return fmt.Errorf("usage: hacoctl projects")
+		return fmt.Errorf("usage: haco projects")
 	}
 	var out []projectSummaryView
 	if err := fetchJSON(baseURL, "/v1/projects", &out); err != nil {
@@ -912,11 +912,11 @@ func projects(baseURL string, args []string) error {
 // containers is a join view over workloads + nodes: which container is
 // actually running where, derived entirely from existing data (no new
 // storage). Stopped/failed workloads have no live container, so they're
-// filtered out here — hacoctl workloads keeps the full history including
+// filtered out here — haco workloads keeps the full history including
 // those.
 func containers(baseURL string, args []string) error {
 	if len(args) > 1 {
-		return fmt.Errorf("usage: hacoctl containers [project]")
+		return fmt.Errorf("usage: haco containers [project]")
 	}
 	path := "/v1/workloads"
 	if len(args) == 1 {
@@ -1003,7 +1003,7 @@ type nodeView struct {
 }
 
 // nodes prints a table of the main per-node facts — the full detail
-// (labels, cached images) stays on `hacoctl node <id>`.
+// (labels, cached images) stays on `haco node <id>`.
 func nodes(baseURL string) error {
 	var out []nodeView
 	if err := fetchJSON(baseURL, "/v1/nodes", &out); err != nil {
@@ -1024,9 +1024,9 @@ func nodes(baseURL string) error {
 
 // nodeDetail prints one node's full detail; there's no dedicated
 // single-node endpoint yet, so this filters the existing node list.
-// node dispatches `hacoctl node <id>` (detail) and the cordon/uncordon
+// node dispatches `haco node <id>` (detail) and the cordon/uncordon
 // subcommands — kept under one verb since they all operate on "a node",
-// the same way `hacoctl node <id>` already reads as "this node".
+// the same way `haco node <id>` already reads as "this node".
 func node(baseURL string, args []string) error {
 	switch {
 	case len(args) == 2 && args[0] == "cordon":
@@ -1046,7 +1046,7 @@ func node(baseURL string, args []string) error {
 // permanent identity and never changes; only the name shown does.
 func setNodeName(baseURL string, args []string) error {
 	if len(args) < 2 {
-		return fmt.Errorf("usage: hacoctl node rename <node-id> <name>   (\"\" clears the name)")
+		return fmt.Errorf("usage: haco node rename <node-id> <name>   (\"\" clears the name)")
 	}
 	id, name := args[0], strings.Join(args[1:], " ")
 	body, _ := json.Marshal(map[string]string{"name": name})
@@ -1064,7 +1064,7 @@ func setNodeName(baseURL string, args []string) error {
 // setNodeLimits caps how much CPU and memory the scheduler may reserve on a
 // node, below what its Docker reports.
 func setNodeLimits(baseURL string, args []string) error {
-	usage := fmt.Errorf("usage: hacoctl node limit <node-id> [--cpus N] [--memory SIZE] | hacoctl node limit <node-id> --clear   (SIZE like 8GiB, 512MiB, 4G)")
+	usage := fmt.Errorf("usage: haco node limit <node-id> [--cpus N] [--memory SIZE] | haco node limit <node-id> --clear   (SIZE like 8GiB, 512MiB, 4G)")
 	if len(args) < 2 {
 		return usage
 	}
@@ -1139,7 +1139,7 @@ func parseByteSize(s string) (int64, error) {
 
 func nodeDetail(baseURL string, args []string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("usage: hacoctl node <id> | hacoctl node cordon|uncordon <id>")
+		return fmt.Errorf("usage: haco node <id> | haco node cordon|uncordon <id>")
 	}
 	var nodes []nodeView
 	if err := fetchJSON(baseURL, "/v1/nodes", &nodes); err != nil {
@@ -1182,7 +1182,7 @@ type serviceInstanceView struct {
 // wrapper, table-rendered like everything else here).
 func services(baseURL string, args []string) error {
 	if len(args) != 1 && len(args) != 2 {
-		return fmt.Errorf("usage: hacoctl services <project> [service]")
+		return fmt.Errorf("usage: haco services <project> [service]")
 	}
 	path := "/v1/services/" + neturl.PathEscape(args[0])
 	if len(args) == 2 {
@@ -1213,7 +1213,7 @@ func orDash(s string) string {
 }
 
 // status is a table of everything with no/one argument (just like
-// `hacoctl workloads`, which it shares its implementation with), or one
+// `haco workloads`, which it shares its implementation with), or one
 // workload's full detail once you name a service. Revision defaults to
 // "latest" since that's the only one anything in this codebase ever
 // produces today — there's no content-addressed revisioning yet (every
@@ -1228,7 +1228,7 @@ func status(baseURL string, args []string) error {
 	case 3:
 		return get(baseURL, "/v1/workloads/"+args[0]+"/"+args[1]+"/"+args[2])
 	default:
-		return fmt.Errorf("usage: hacoctl status [project] [service] [revision]")
+		return fmt.Errorf("usage: haco status [project] [service] [revision]")
 	}
 }
 
@@ -1246,7 +1246,7 @@ func stopContainers(baseURL string, args []string) error {
 		rest = append(rest, a)
 	}
 	if len(rest) > 1 {
-		return fmt.Errorf("usage: hacoctl stop-containers [project] [--yes]")
+		return fmt.Errorf("usage: haco stop-containers [project] [--yes]")
 	}
 	project := ""
 	target := "EVERY workload's container"
@@ -1326,8 +1326,8 @@ func teardown(baseURL string, args []string) error {
 }
 
 // shutdown stops the whole cluster in order — every node's containers and
-// agent, then the control plane — so that `hacoctl start` and
-// `hacoctl agent run` bring the same services back on the same nodes.
+// agent, then the control plane — so that `haco start` and
+// `haco agent run` bring the same services back on the same nodes.
 func shutdown(baseURL string, args []string) error {
 	yes := false
 	for _, a := range args {
@@ -1359,7 +1359,7 @@ func shutdown(baseURL string, args []string) error {
 		}
 	}
 	fmt.Println("  and the control plane.")
-	fmt.Println("Containers are stopped, not removed; `hacoctl start` here and `hacoctl agent run` on each other node bring them back.")
+	fmt.Println("Containers are stopped, not removed; `haco start` here and `haco agent run` on each other node bring them back.")
 	if !yes && !confirm("Shut down the cluster?") {
 		return fmt.Errorf("shutdown aborted")
 	}
@@ -1403,15 +1403,15 @@ func shutdown(baseURL string, args []string) error {
 		time.Sleep(500 * time.Millisecond)
 	}
 	if controlPlaneUp(baseURL) {
-		fmt.Println("control plane is still up; stop it with `hacoctl stop-all`")
+		fmt.Println("control plane is still up; stop it with `haco stop-all`")
 		return nil
 	}
 	_ = os.Remove(filepath.Join(envOr("HACO_DATA_DIR", filepath.Join(homeDir(), ".haco")), "controlplane.pid"))
-	fmt.Println("control plane stopped. Bring everything back with `hacoctl start` here, then `hacoctl agent run` on each other node.")
+	fmt.Println("control plane stopped. Bring everything back with `haco start` here, then `haco agent run` on each other node.")
 	return nil
 }
 
-// start launches the control-plane binary (found next to hacoctl, in
+// start launches the control-plane binary (found next to haco, in
 // $PATH, or via HACO_CONTROLPLANE_BIN) so standing up a node doesn't
 // require knowing about a separate `controlplane` binary at all. It
 // no-ops if the control plane is already reachable, and by default
@@ -1442,7 +1442,7 @@ func start(baseURL string, args []string) error {
 		return fmt.Errorf("--logs and --tui can't be combined (the TUI takes over the terminal; run them separately)")
 	}
 	if foreground && showTUI {
-		return fmt.Errorf("--foreground and --tui can't be combined (the control plane's own foreground output and the TUI both need the terminal); drop --foreground, hacoctl start --tui already waits for readiness")
+		return fmt.Errorf("--foreground and --tui can't be combined (the control plane's own foreground output and the TUI both need the terminal); drop --foreground, haco start --tui already waits for readiness")
 	}
 
 	dataDir := envOr("HACO_DATA_DIR", filepath.Join(homeDir(), ".haco"))
@@ -1463,7 +1463,7 @@ func start(baseURL string, args []string) error {
 			if webConsoleUp(baseURL) {
 				fmt.Printf("web console: %s/\n", strings.TrimRight(baseURL, "/"))
 			} else {
-				fmt.Println("the running control plane was started without --web; run 'hacoctl stop-all' then 'hacoctl start --web' to serve the console")
+				fmt.Println("the running control plane was started without --web; run 'haco stop-all' then 'haco start --web' to serve the console")
 			}
 		}
 		if showLogs {
@@ -1553,7 +1553,7 @@ func stopAll(args []string) error {
 
 	data, err := os.ReadFile(pidPath)
 	if err != nil {
-		return fmt.Errorf("no pid file at %s (was the control plane started with `hacoctl start`?): %w", pidPath, err)
+		return fmt.Errorf("no pid file at %s (was the control plane started with `haco start`?): %w", pidPath, err)
 	}
 	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
 	if err != nil {
@@ -1617,7 +1617,7 @@ func controlPlaneUp(baseURL string) bool {
 }
 
 // tailLogFile streams new output appended to the control-plane log file —
-// `hacoctl start --logs`, so there's no need for a separate terminal/
+// `haco start --logs`, so there's no need for a separate terminal/
 // command just to watch what the control plane is doing. Starts from the
 // file's current end (only output from this point on, not the whole
 // history across every previous start) and polls rather than using a
@@ -1647,9 +1647,9 @@ func tailLogFile(path string) error {
 	}
 }
 
-// controlPlaneBinary finds the controlplane executable: next to hacoctl's
+// controlPlaneBinary finds the controlplane executable: next to haco's
 // own binary (the common case after install.sh, or a `go build` into the
-// same bin/ directory), then $PATH, so `hacoctl start` needs no separate
+// same bin/ directory), then $PATH, so `haco start` needs no separate
 // knowledge of where it lives.
 func controlPlaneBinary() (string, error) {
 	return findSiblingBinary("controlplane", "HACO_CONTROLPLANE_BIN")
@@ -1660,9 +1660,9 @@ func agentBinary() (string, error) {
 }
 
 // findSiblingBinary locates another binary from this project: an env var
-// override first, then next to hacoctl's own binary (the common case
+// override first, then next to haco's own binary (the common case
 // after install.sh, or a `go build` into the same bin/ directory), then
-// $PATH — the same resolution controlPlaneBinary used before `hacoctl
+// $PATH — the same resolution controlPlaneBinary used before `haco
 // agent run`/`join` needed the same logic for the agent binary.
 func findSiblingBinary(name, envVar string) (string, error) {
 	if p := os.Getenv(envVar); p != "" {
@@ -1677,16 +1677,16 @@ func findSiblingBinary(name, envVar string) (string, error) {
 	if p, err := exec.LookPath(name); err == nil {
 		return p, nil
 	}
-	return "", fmt.Errorf("%s binary not found next to hacoctl or in PATH (set %s)", name, envVar)
+	return "", fmt.Errorf("%s binary not found next to haco or in PATH (set %s)", name, envVar)
 }
 
-// agentCmd runs `hacoctl agent run` / `hacoctl agent join <token>` by
+// agentCmd runs `haco agent run` / `haco agent join <token>` by
 // exec'ing the actual agent binary in the foreground, inheriting stdio —
 // so a worker node never needs to know the agent binary exists
-// separately, the same way `hacoctl start` hides the controlplane binary.
+// separately, the same way `haco start` hides the controlplane binary.
 func agentCmd(args []string) error {
 	if len(args) == 0 || (args[0] != "run" && args[0] != "join") {
-		return fmt.Errorf("usage: hacoctl agent run | hacoctl agent join <token>")
+		return fmt.Errorf("usage: haco agent run | haco agent join <token>")
 	}
 	bin, err := agentBinary()
 	if err != nil {
@@ -1741,7 +1741,7 @@ func workloadsFor(baseURL, project, service string) ([]workloadRecordView, error
 // resume starts stopped (or failed) workloads again where they last ran.
 func resume(baseURL string, args []string) error {
 	if len(args) < 1 || len(args) > 2 {
-		return fmt.Errorf("usage: hacoctl resume <project> [service]")
+		return fmt.Errorf("usage: haco resume <project> [service]")
 	}
 	service := ""
 	if len(args) == 2 {
@@ -1757,7 +1757,7 @@ func resume(baseURL string, args []string) error {
 // restart recreates running workloads' containers on their current nodes.
 func restart(baseURL string, args []string) error {
 	if len(args) < 1 || len(args) > 2 {
-		return fmt.Errorf("usage: hacoctl restart <project> [service]")
+		return fmt.Errorf("usage: haco restart <project> [service]")
 	}
 	service := ""
 	if len(args) == 2 {
@@ -1767,7 +1767,7 @@ func restart(baseURL string, args []string) error {
 	if err != nil {
 		return err
 	}
-	return eachWorkload(baseURL, wl, "restart", func(w workloadRecordView) bool { return w.Status != "stopped" }, "nothing is running; use hacoctl resume")
+	return eachWorkload(baseURL, wl, "restart", func(w workloadRecordView) bool { return w.Status != "stopped" }, "nothing is running; use haco resume")
 }
 
 func eachWorkload(baseURL string, wl []workloadRecordView, action string, want func(workloadRecordView) bool, none string) error {
@@ -1797,7 +1797,7 @@ func eachWorkload(baseURL string, wl []workloadRecordView, action string, want f
 
 func stop(baseURL string, args []string) error {
 	if len(args) != 3 {
-		return fmt.Errorf("usage: hacoctl stop <project> <service> <revision>")
+		return fmt.Errorf("usage: haco stop <project> <service> <revision>")
 	}
 	path := fmt.Sprintf("/v1/workloads/%s/%s/%s/stop",
 		neturl.PathEscape(args[0]), neturl.PathEscape(args[1]), neturl.PathEscape(args[2]))
@@ -1807,10 +1807,10 @@ func stop(baseURL string, args []string) error {
 // removeWorkload hard-deletes one workload record — distinct from stop,
 // which just marks it stopped and leaves the historical row behind.
 // Revision defaults to "latest" (the only one anything produces today),
-// same convenience hacoctl status already offers.
+// same convenience haco status already offers.
 func removeWorkload(baseURL string, args []string) error {
 	if len(args) != 2 && len(args) != 3 {
-		return fmt.Errorf("usage: hacoctl remove-workload <project> <service> [revision]")
+		return fmt.Errorf("usage: haco remove-workload <project> <service> [revision]")
 	}
 	revision := "latest"
 	if len(args) == 3 {
@@ -1823,7 +1823,7 @@ func removeWorkload(baseURL string, args []string) error {
 
 // removeAllWorkloads hard-deletes every workload record, or (project
 // given) just those under that project — the destructive counterpart to
-// hacoctl stop-containers, which only marks them stopped.
+// haco stop-containers, which only marks them stopped.
 func removeAllWorkloads(baseURL string, args []string) error {
 	yes := false
 	var rest []string
@@ -1835,7 +1835,7 @@ func removeAllWorkloads(baseURL string, args []string) error {
 		rest = append(rest, a)
 	}
 	if len(rest) > 1 {
-		return fmt.Errorf("usage: hacoctl remove-all-workloads [project] [--yes]")
+		return fmt.Errorf("usage: haco remove-all-workloads [project] [--yes]")
 	}
 	project := ""
 	target := "EVERY workload record"
@@ -1857,7 +1857,7 @@ func logs(baseURL string, args []string) error {
 	return fetchLogs(http.DefaultClient, baseURL, args, os.Stdout)
 }
 
-const logsUsage = "usage: hacoctl logs <project> <service> [revision] [--tail N] [-f]"
+const logsUsage = "usage: haco logs <project> <service> [revision] [--tail N] [-f]"
 
 const followWindow = 1000
 
@@ -1968,11 +1968,11 @@ func get(baseURL, path string) error {
 }
 
 // getOptionalProject is get with an optional single "project" arg appended
-// as a query param — shared by `hacoctl events [project]` and `hacoctl
+// as a query param — shared by `haco events [project]` and `haco
 // metrics [project]`.
 func getOptionalProject(baseURL, path string, args []string) error {
 	if len(args) > 1 {
-		return fmt.Errorf("usage: hacoctl %s [project]", strings.TrimPrefix(path, "/v1/"))
+		return fmt.Errorf("usage: haco %s [project]", strings.TrimPrefix(path, "/v1/"))
 	}
 	if len(args) == 1 {
 		path += "?project=" + neturl.QueryEscape(args[0])
@@ -2004,7 +2004,7 @@ func removeNode(baseURL string, args []string) error {
 		rest = append(rest, a)
 	}
 	if len(rest) != 1 {
-		return fmt.Errorf("usage: hacoctl remove-node <node-id> [--force]")
+		return fmt.Errorf("usage: haco remove-node <node-id> [--force]")
 	}
 	path := "/v1/admin/nodes/" + neturl.PathEscape(rest[0])
 	if force {

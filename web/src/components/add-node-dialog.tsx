@@ -17,7 +17,7 @@ export function AddNodeDialog({ open, onOpenChange }: { open: boolean; onOpenCha
     }
   }, [open, mutate, reset])
 
-  const command = data ? `hacoctl agent join '${encodeJoinBundle(data)}'` : ''
+  const command = data ? `haco agent join '${encodeJoinBundle(data)}'` : ''
 
   async function copy() {
     try {

@@ -20,7 +20,7 @@ npm run build   # typecheck and production build into web/dist
 
 ## What is built
 
-- **Cluster** (`/`): the control-plane host at the center with agent nodes around it. Hover a machine for its details, click to open it. "Add node" issues a join token and shows the `hacoctl agent join` command. Projects and recent events sit below.
+- **Cluster** (`/`): the control-plane host at the center with agent nodes around it. Hover a machine for its details, click to open it. "Add node" issues a join token and shows the `haco agent join` command. Projects and recent events sit below.
 - Nodes, Projects, Deploy and Events are placeholders.
 
 ## Data notes

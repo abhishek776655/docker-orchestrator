@@ -107,7 +107,7 @@ func (svc *Service) ComposePlan(ctx context.Context, project, workingDir string,
 }
 
 // filterToClosure narrows plan to onlyService plus every service it
-// transitively depends on (walking DependsOn), so `hacoctl deploy
+// transitively depends on (walking DependsOn), so `haco deploy
 // --service X` (or `plan --service X`) runs only what X actually needs —
 // not the whole Compose file — while still respecting its real dependency
 // graph rather than just that one container in isolation.
@@ -237,7 +237,7 @@ func (svc *Service) dryRunSchedule(ctx context.Context, workloads []model.Worklo
 			// Mirror Submit()'s existing-pin reuse so planning a redeploy of
 			// an unpinned service shows where it would actually land (its
 			// existing volume's node), not a fresh pick — unless --fresh
-			// is set, mirroring Submit's own fresh bypass, so `hacoctl plan
+			// is set, mirroring Submit's own fresh bypass, so `haco plan
 			// --fresh` can preview what `deploy --fresh` would actually do.
 			if existing, err := svc.store.GetWorkload(ctx, w.Key()); err == nil {
 				w.Storage.PinnedNodeID = existing.Storage.PinnedNodeID
@@ -252,7 +252,7 @@ func (svc *Service) dryRunSchedule(ctx context.Context, workloads []model.Worklo
 	return decisions, nil
 }
 
-// DeployOptions carries hacoctl deploy's optional flags through the API.
+// DeployOptions carries haco deploy's optional flags through the API.
 type DeployOptions struct {
 	// NoCache forces every build in this deploy to bypass Docker's build
 	// cache, for when a service's tag already exists locally but its
@@ -752,7 +752,7 @@ type SubmitResult struct {
 // persists it as "assigned" on success.
 // Submit schedules and persists one workload. fresh, when true, skips
 // reusing an unpinned workload's existing stored pin (see below) —
-// `hacoctl deploy --fresh` for rescheduling an entire project from
+// `haco deploy --fresh` for rescheduling an entire project from
 // scratch, abandoning whatever data lives on each currently-unpinned
 // service's existing node. It has no effect on a workload that already
 // carries an explicit pin (x-haco-pin-node/x-haco-pin-host in the Compose
@@ -828,7 +828,7 @@ func (svc *Service) ListWorkloads(ctx context.Context, project string) ([]store.
 }
 
 // ListProjects lists every distinct project with a per-status workload
-// count, for `hacoctl projects` — there's no need to run `hacoctl
+// count, for `haco projects` — there's no need to run `haco
 // workloads` with no filter and eyeball the PROJECT column.
 func (svc *Service) ListProjects(ctx context.Context) ([]store.ProjectSummary, error) {
 	return svc.store.ListProjects(ctx)

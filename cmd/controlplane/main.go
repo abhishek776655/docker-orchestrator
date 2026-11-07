@@ -141,7 +141,7 @@ func main() {
 		log.Fatalf("encode agent join token: %v", err)
 	}
 	log.Printf("agent API listening on https://%s (certificate pin %s)", net.JoinHostPort(advertiseHost, fmt.Sprint(port)), fingerprint)
-	fmt.Printf("One-time agent join command (expires in 10 minutes): hacoctl agent join '%s'\n", encoded)
+	fmt.Printf("One-time agent join command (expires in 10 minutes): haco agent join '%s'\n", encoded)
 
 	if envOr("HACO_AUTO_JOIN_HOST", "true") != "false" {
 		go runHostAgent(ctx, joinManager, advertiseHost, dataDir)

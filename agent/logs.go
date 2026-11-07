@@ -90,7 +90,7 @@ type liveLogResponse struct {
 	Error string `json:"error,omitempty"`
 }
 
-// serveLiveLogRequests answers every `hacoctl logs` request queued for this
+// serveLiveLogRequests answers every `haco logs` request queued for this
 // node with the matching container's current log tail.
 func (a *Agent) serveLiveLogRequests(ctx context.Context) {
 	var reqs []liveLogRequest

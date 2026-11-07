@@ -2,3 +2,5 @@
 /bin/
 *.tsbuildinfo
 /docs/
+/haco
+/hacoctl

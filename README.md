@@ -26,7 +26,7 @@ cd docker-orchestrator
 **2. Start the control plane** on one machine:
 
 ```bash
-hacoctl start --web
+haco start --web
 ```
 
 It prints the web console URL (`http://localhost:8099/`) and a one-time join
@@ -35,14 +35,14 @@ command. The control-plane machine joins the cluster as a node by itself.
 **3. Join the other machines** by running the join command on each:
 
 ```bash
-hacoctl agent join '<token>'
+haco agent join '<token>'
 ```
 
 **4. Deploy a Compose project** from the console's **Deploy** page, or:
 
 ```bash
-hacoctl plan myapp ./docker-compose.yml     # dry run: where each service goes and why
-hacoctl deploy myapp ./docker-compose.yml   # build, place, start, show live status
+haco plan myapp ./docker-compose.yml     # dry run: where each service goes and why
+haco deploy myapp ./docker-compose.yml   # build, place, start, show live status
 ```
 
 Details on each step are under [Install](#install) and
@@ -59,7 +59,7 @@ Details on each step are under [Install](#install) and
 
 ## Install
 
-`./install.sh` installs `controlplane`, `agent` and `hacoctl` into
+`./install.sh` installs `controlplane`, `agent` and `haco` into
 `$(go env GOPATH)/bin` and, when npm is available, builds the web console
 into `~/.haco/web`. Make sure that bin folder is on your `PATH`.
 
@@ -102,7 +102,7 @@ into `~/.haco/web`. Make sure that bin folder is on your `PATH`.
   or old volume data, revoke or remove a node.
 - A clean cluster shutdown that brings the same services back on restart.
 
-**Web console** (`hacoctl start --web`)
+**Web console** (`haco start --web`)
 - Dashboard with what needs attention, a notification bell for new failures.
 - Cluster topology: the control-plane machine in the middle, nodes around
   it with their OS, state and temperature, and machines on the network that
@@ -115,43 +115,43 @@ into `~/.haco/web`. Make sure that bin folder is on your `PATH`.
 ## Setting up a cluster
 
 - Join tokens expire after 10 minutes. Get a fresh one any time from
-  **Add node** in the console or with `hacoctl join-token`.
+  **Add node** in the console or with `haco join-token`.
 - After a machine has joined once, restart its agent without a token:
 
   ```bash
-  hacoctl agent run
+  haco agent run
   ```
 
-- `hacoctl plan` never changes anything; use it to check placements before
-  a deploy. `hacoctl deploy` shows live status until every service is ready
+- `haco plan` never changes anything; use it to check placements before
+  a deploy. `haco deploy` shows live status until every service is ready
   or failed.
 
 ## Everyday commands
 
 | Task | Command |
 | --- | --- |
-| Start the control plane (with the web console) | `hacoctl start --web` |
-| Stop the control plane | `hacoctl stop-all` |
-| Dry-run a deploy | `hacoctl plan <project> <compose.yml>` |
-| Deploy or redeploy | `hacoctl deploy <project> <compose.yml>` |
-| Deploy one service and what it depends on | `hacoctl deploy <project> <compose.yml> --service <name>` |
-| Let the scheduler place everything again | `hacoctl deploy <project> <compose.yml> --fresh` |
+| Start the control plane (with the web console) | `haco start --web` |
+| Stop the control plane | `haco stop-all` |
+| Dry-run a deploy | `haco plan <project> <compose.yml>` |
+| Deploy or redeploy | `haco deploy <project> <compose.yml>` |
+| Deploy one service and what it depends on | `haco deploy <project> <compose.yml> --service <name>` |
+| Let the scheduler place everything again | `haco deploy <project> <compose.yml> --fresh` |
 | Keep services on the control-plane machine | `--pin-host db,cache` on plan or deploy |
 | Pin services to a node | `--pin-node <node-id>=api,web` on plan or deploy |
-| Projects and workloads | `hacoctl projects`, `hacoctl status [project]` |
-| Live logs | `hacoctl logs <project> <service> -f` |
-| Stop / start again / restart | `hacoctl stop <project> <service> latest`, `hacoctl resume <project> [service]`, `hacoctl restart <project> [service]` |
-| Remove a project | `hacoctl remove-all-workloads <project>` |
-| Nodes | `hacoctl nodes`, `hacoctl node <id>` |
-| Cordon / uncordon a node | `hacoctl node cordon <id>`, `hacoctl node uncordon <id>` |
-| Name a node | `hacoctl node rename <id> "Studio Mac"` |
-| Cap a node's resources | `hacoctl node limit <id> --cpus 4 --memory 8GiB` |
-| Remove a node | `hacoctl remove-node <id>` |
-| Terminal dashboard | `hacoctl tui` |
-| Audit events | `hacoctl events [project]` |
-| Shut the whole cluster down | `hacoctl shutdown` |
+| Projects and workloads | `haco projects`, `haco status [project]` |
+| Live logs | `haco logs <project> <service> -f` |
+| Stop / start again / restart | `haco stop <project> <service> latest`, `haco resume <project> [service]`, `haco restart <project> [service]` |
+| Remove a project | `haco remove-all-workloads <project>` |
+| Nodes | `haco nodes`, `haco node <id>` |
+| Cordon / uncordon a node | `haco node cordon <id>`, `haco node uncordon <id>` |
+| Name a node | `haco node rename <id> "Studio Mac"` |
+| Cap a node's resources | `haco node limit <id> --cpus 4 --memory 8GiB` |
+| Remove a node | `haco remove-node <id>` |
+| Terminal dashboard | `haco tui` |
+| Audit events | `haco events [project]` |
+| Shut the whole cluster down | `haco shutdown` |
 
-Run `hacoctl help` for every command and flag.
+Run `haco help` for every command and flag.
 
 ## Compose extensions
 
@@ -169,7 +169,7 @@ Docker reads the file:
 ## How it works
 
 ```
-             operator: hacoctl / web console
+             operator: haco / web console
                           |
                           v
    +-------------------- control plane --------------------+
@@ -193,7 +193,7 @@ Docker reads the file:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `HACO_CONTROLPLANE_URL` | `http://localhost:8099` | Where `hacoctl` finds the control plane |
+| `HACO_CONTROLPLANE_URL` | `http://localhost:8099` | Where `haco` finds the control plane |
 | `HACO_LISTEN_ADDR` | `127.0.0.1:8099` | Operator API and web console address |
 | `HACO_AGENT_LISTEN_ADDR` | `:8443` | Agent API (mTLS) |
 | `HACO_DATA_DIR` | `~/.haco` | Database, credentials, TLS identity, volumes |

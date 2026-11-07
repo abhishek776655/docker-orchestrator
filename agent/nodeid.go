@@ -25,7 +25,7 @@ var nodeIDMu sync.Mutex
 
 // SavedNodeID returns this machine's permanent node ID, creating and
 // saving it on first use. It re-reads the file each call so a rename
-// (`hacoctl node rename`) takes effect without restarting the process.
+// (`haco node rename`) takes effect without restarting the process.
 func SavedNodeID() string {
 	nodeIDMu.Lock()
 	defer nodeIDMu.Unlock()

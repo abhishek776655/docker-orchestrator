@@ -142,7 +142,7 @@ export function NodePage() {
       )}
       {node.state === 'offline' && (
         <div role="status" className="rounded-lg border border-bad/30 bg-bad-soft px-4 py-3.5 text-bad-fg">
-          <strong className="font-semibold">No heartbeat.</strong> {offlineHint(node)} Start it on that machine with <span className={mono}>hacoctl agent run</span>.
+          <strong className="font-semibold">No heartbeat.</strong> {offlineHint(node)} Start it on that machine with <span className={mono}>haco agent run</span>.
         </div>
       )}
 
@@ -179,7 +179,7 @@ export function NodePage() {
             <p className="m-0 text-[13px] text-muted-foreground">Reserved by workloads placed here, out of what the scheduler may use.</p>
             {(node.limits.cpu > 0 || node.limits.mem > 0) && (
               <p className="m-0 rounded-md bg-info-soft px-3 py-2 text-[13px] text-info-fg">
-                Capped with <span className={mono}>hacoctl node limit</span>: {node.limits.cpu > 0 ? `${node.limits.cpu} of ${node.detected.cpu.toFixed(0)} cores` : 'all cores'}, {node.limits.mem > 0 ? `${node.limits.mem.toFixed(1)} of ${node.detected.mem.toFixed(1)} GiB` : 'all memory'}.
+                Capped with <span className={mono}>haco node limit</span>: {node.limits.cpu > 0 ? `${node.limits.cpu} of ${node.detected.cpu.toFixed(0)} cores` : 'all cores'}, {node.limits.mem > 0 ? `${node.limits.mem.toFixed(1)} of ${node.detected.mem.toFixed(1)} GiB` : 'all memory'}.
               </p>
             )}
             <Bar label="CPU reserved" value={`${node.cpuUsed.toFixed(1)} / ${node.cpuCap.toFixed(1)} cores`} pct={node.cpuCap ? (node.cpuUsed / node.cpuCap) * 100 : 0} />

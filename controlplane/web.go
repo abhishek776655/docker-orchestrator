@@ -10,7 +10,7 @@ import (
 // WithWebUI serves the built web console from dir next to the operator API:
 // /v1/... goes to api, anything else is a file from dir, and a path with no
 // file behind it gets index.html so the console's client-side routes
-// (/projects/x, /nodes/y) load on a refresh. `hacoctl start --web` turns it on
+// (/projects/x, /nodes/y) load on a refresh. `haco start --web` turns it on
 // by setting HACO_WEB_DIR; without it the control plane serves the API only.
 func WithWebUI(api http.Handler, dir string) http.Handler {
 	files := http.FileServer(http.Dir(dir))

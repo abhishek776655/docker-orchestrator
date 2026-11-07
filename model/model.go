@@ -55,7 +55,7 @@ type Node struct {
 	// Detected is the capacity the agent reported, before Limits.
 	Detected Resources
 	// Limits caps how much of this node the scheduler may use
-	// (hacoctl node limit); a zero field means no cap.
+	// (haco node limit); a zero field means no cap.
 	Limits       Resources
 	Availability Availability
 	// DisabledByAdmin is true once an operator has cordoned this node

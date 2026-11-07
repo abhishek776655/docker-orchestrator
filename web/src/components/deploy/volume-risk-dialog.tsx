@@ -53,7 +53,7 @@ export function VolumeRiskDialog({ risks, open, onOpenChange, pending, error, on
         {stuck.length > 0 && (
           <p className="m-0 text-[13px] text-muted-foreground">
             {stuck.map((r) => r.service).join(', ')} cannot keep {stuck.length === 1 ? 'its' : 'their'} data until that node is back. Start its agent with{' '}
-            <span className="font-mono">hacoctl agent run</span>, then plan again.
+            <span className="font-mono">haco agent run</span>, then plan again.
           </p>
         )}
 

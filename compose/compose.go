@@ -328,7 +328,7 @@ func convertService(project, workingDir, name string, svc types.ServiceConfig, b
 		}
 		// Caught here rather than left to surface mid-deploy: a missing
 		// build context (typo'd path, directory never committed, wrong
-		// working dir) is knowable with no Docker call at all, so `hacoctl
+		// working dir) is knowable with no Docker call at all, so `haco
 		// plan` should reject it up front instead of `deploy` failing after
 		// everything else already scheduled.
 		if info, err := os.Stat(build.Context); err != nil {
@@ -791,7 +791,7 @@ func parseEnvFile(path string) (map[string]string, error) {
 // "Required validation").
 // ApplyHostPinOverride is ApplyPinOverride for the common case: every named
 // service pins to this control-plane host specifically. Supplied per
-// `hacoctl deploy/plan/build --pin-host <service,...>` call.
+// `haco deploy/plan/build --pin-host <service,...>` call.
 func ApplyHostPinOverride(plan *Plan, pinHost []string) {
 	if len(pinHost) == 0 {
 		ApplyPinOverride(plan, nil)
@@ -811,7 +811,7 @@ func ApplyHostPinOverride(plan *Plan, pinHost []string) {
 // where every service bind-mounts its own source, even though only a few
 // are actually being developed at once). This needs no x-haco-*
 // annotations in the Compose file itself — it's an override supplied per
-// `hacoctl deploy/plan/build --pin-host`/`--pin-node` call.
+// `haco deploy/plan/build --pin-host`/`--pin-node` call.
 //
 // A freed workload loses any literal bind-mount HostPath too (same as
 // x-haco-place-anywhere): that path was only ever valid on this one host,
@@ -889,7 +889,7 @@ func MergePinOverride(pinHost *[]string, pinNodes map[string][]string) (pins map
 // ValidateGraph checks cross-service concerns that only make sense across
 // the whole set being validated together: undefined depends_on references,
 // dependency cycles, and host-port conflicts. Exported so a caller that
-// filters down to a dependency closure (hacoctl deploy/plan --service) can
+// filters down to a dependency closure (haco deploy/plan --service) can
 // re-run it on just that subset — a port conflict between two services
 // that aren't both actually being deployed together isn't a real conflict.
 func ValidateGraph(workloads []model.Workload) []string {

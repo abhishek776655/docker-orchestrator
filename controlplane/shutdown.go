@@ -32,7 +32,7 @@ type NodeShutdownResult struct {
 	Errors  []string `json:"errors,omitempty"`
 }
 
-// ShutdownReport is the per-node outcome returned to `hacoctl shutdown`.
+// ShutdownReport is the per-node outcome returned to `haco shutdown`.
 type ShutdownReport struct {
 	Nodes map[string]NodeShutdownResult `json:"nodes"`
 	// NotReached lists nodes that couldn't be told: already unavailable
@@ -173,7 +173,7 @@ func (svc *Service) confirmNodeShutdown(node string, res NodeShutdownResult) boo
 func (svc *Service) refuseDuringShutdown(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if svc.ShuttingDown() {
-			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("%w; run `hacoctl start` again once it has stopped", ErrShuttingDown))
+			writeError(w, http.StatusServiceUnavailable, fmt.Errorf("%w; run `haco start` again once it has stopped", ErrShuttingDown))
 			return
 		}
 		next(w, r)
@@ -194,7 +194,7 @@ func (svc *Service) handleShutdown(w http.ResponseWriter, r *http.Request) {
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
-	// Let the response reach hacoctl before the process goes away.
+	// Let the response reach haco before the process goes away.
 	go func() {
 		time.Sleep(500 * time.Millisecond)
 		svc.Exit()

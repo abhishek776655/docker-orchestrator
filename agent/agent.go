@@ -243,8 +243,8 @@ func (a *Agent) Run(ctx context.Context) error {
 }
 
 // ErrShutdownByControlPlane is returned by Run after a cluster shutdown
-// (`hacoctl shutdown`) stopped this node's containers.
-var ErrShutdownByControlPlane = errors.New("shut down by control plane (hacoctl shutdown); run `hacoctl agent run` to bring this node and its services back")
+// (`haco shutdown`) stopped this node's containers.
+var ErrShutdownByControlPlane = errors.New("shut down by control plane (haco shutdown); run `haco agent run` to bring this node and its services back")
 
 const shutdownStatusReason = "stopped by cluster shutdown; restarts when this node's agent returns"
 
@@ -712,7 +712,7 @@ func (a *Agent) fetchVolumeSnapshots(ctx context.Context, rec store.WorkloadReco
 		hostPath := a.docker.VolumeHostPath(rec.Key(), v.ContainerPath)
 		if resp.StatusCode == http.StatusNotFound {
 			// Snapshots live only in control-plane memory, so a control
-			// plane restarted since the deploy (e.g. after hacoctl
+			// plane restarted since the deploy (e.g. after haco
 			// shutdown) no longer has one. The copy already extracted here
 			// is that same deploy's snapshot, so reuse it.
 			if hasEntries(hostPath) {

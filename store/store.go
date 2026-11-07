@@ -225,7 +225,7 @@ func (s *Store) RevokeAgentCredential(ctx context.Context, nodeID string) error 
 
 // DeleteNode hard-removes a node and its agent credential, unlike
 // RevokeAgentCredential which only blocks future auth and leaves the row
-// (so `hacoctl nodes` keeps showing it). No table references node_id as a
+// (so `haco nodes` keeps showing it). No table references node_id as a
 // foreign key, so this is safe without touching workload/event history —
 // those rows just keep whatever node_id they already recorded.
 func (s *Store) DeleteNode(ctx context.Context, nodeID string) error {
@@ -833,7 +833,7 @@ func (s *Store) CreateWorkload(ctx context.Context, w WorkloadRecord) error {
 	}
 	now := formatTime(time.Now())
 	// ON CONFLICT: redeploying the same project/service/revision (the
-	// common case — rerunning `hacoctl deploy`, or retrying after a
+	// common case — rerunning `haco deploy`, or retrying after a
 	// previous attempt got stuck) must replace that workload's spec and
 	// restart its lifecycle, not fail with a duplicate-key error or leave
 	// stale fields behind. container_id is reset so the agent doesn't

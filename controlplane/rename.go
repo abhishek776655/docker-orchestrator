@@ -60,7 +60,7 @@ func (svc *Service) RenameNode(ctx context.Context, oldID, newID string) error {
 		return fmt.Errorf("%w: node %q", store.ErrNotFound, oldID)
 	}
 	if found.Availability != model.Available && found.Availability != model.Disabled {
-		return fmt.Errorf("%w: node %q is %s; its agent must be running to move its own data folder and credential (run `hacoctl agent run` on that machine first)", errRenameInvalid, oldID, found.Availability)
+		return fmt.Errorf("%w: node %q is %s; its agent must be running to move its own data folder and credential (run `haco agent run` on that machine first)", errRenameInvalid, oldID, found.Availability)
 	}
 
 	p := &pendingRename{newID: newID, done: make(chan error, 1)}

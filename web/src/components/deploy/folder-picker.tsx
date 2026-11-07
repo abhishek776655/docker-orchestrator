@@ -98,7 +98,7 @@ function Browser({ start, machine, mode, onPick, onCancel }: { start: string; ma
         {q.isError && (
           <p role="alert" className="m-0 p-4 text-[13px] text-bad-fg">
             {oldControlPlane
-              ? 'This control plane cannot list folders yet. Run ./install.sh, then hacoctl stop-all and hacoctl start --web, or type the path instead.'
+              ? 'This control plane cannot list folders yet. Run ./install.sh, then haco stop-all and haco start --web, or type the path instead.'
               : q.error.message}
           </p>
         )}

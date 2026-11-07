@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Builds and installs controlplane, agent, and hacoctl onto this machine's
-# $GOBIN (usually ~/go/bin), so `hacoctl`/`agent`/`controlplane` work from
+# Builds and installs controlplane, agent, and haco onto this machine's
+# $GOBIN (usually ~/go/bin), so `haco`/`agent`/`controlplane` work from
 # any directory without a ./bin/ prefix.
 set -euo pipefail
 
@@ -11,10 +11,10 @@ fi
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-echo "Installing controlplane, agent, hacoctl..."
+echo "Installing controlplane, agent, haco..."
 go install ./cmd/controlplane
 go install ./cmd/agent
-go install ./cmd/hacoctl
+go install ./cmd/haco
 
 GOBIN="$(go env GOBIN)"
 if [ -z "$GOBIN" ]; then
@@ -23,7 +23,14 @@ fi
 
 echo "Installed to $GOBIN"
 
-# The web console (served by 'hacoctl start --web') is built into the
+# The CLI used to be called hacoctl; drop the old binary this script
+# installed, so the stale one can't be run by mistake.
+if [ -f "$GOBIN/hacoctl" ]; then
+	rm -f "$GOBIN/hacoctl"
+	echo "Removed the old hacoctl binary (the command is now 'haco')"
+fi
+
+# The web console (served by 'haco start --web') is built into the
 # control plane's data dir. It needs npm; without it the CLI still works.
 WEB_DEST="${HACO_DATA_DIR:-$HOME/.haco}/web"
 if command -v npm >/dev/null 2>&1; then
@@ -32,9 +39,9 @@ if command -v npm >/dev/null 2>&1; then
 	mkdir -p "$WEB_DEST"
 	rm -rf "${WEB_DEST:?}"/*
 	cp -R web/dist/. "$WEB_DEST/"
-	echo "Web console installed to $WEB_DEST (serve it with 'hacoctl start --web')"
+	echo "Web console installed to $WEB_DEST (serve it with 'haco start --web')"
 else
-	echo "npm not found: skipping the web console ('hacoctl start --web' needs it)"
+	echo "npm not found: skipping the web console ('haco start --web' needs it)"
 fi
 
 case ":$PATH:" in
@@ -51,10 +58,10 @@ cat <<'EOF'
 
 Next steps:
   On this machine (runs the control plane and its own node):
-    hacoctl start            # add --web to also serve the web console
+    haco start            # add --web to also serve the web console
 
   On every OTHER machine you want as a worker node, once the control
   plane above is running (it prints a one-time join command/token too):
-    hacoctl agent join '<token-from-hacoctl-start-output>'   # first time only
-    hacoctl agent run                                        # later restarts (reuses the saved credential, no token needed)
+    haco agent join '<token-from-haco-start-output>'   # first time only
+    haco agent run                                        # later restarts (reuses the saved credential, no token needed)
 EOF
