@@ -37,6 +37,8 @@ export interface ApiWorkload {
   Status: string
   StatusReason: string
   NodeID: string
+  /** Live memory use reported by the node; absent when unknown. */
+  MemoryUsedBytes?: number
   DependsOn?: string[] | null
   DependsOnHealthy?: string[] | null
   ContainerID?: string

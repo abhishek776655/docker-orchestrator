@@ -23,6 +23,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/abhishek/hardware-aware-container-orchestrator/model"
@@ -64,7 +65,12 @@ type Agent struct {
 	docker       *Docker
 	http         *http.Client
 	transferHTTP *http.Client
+
+	memMu  sync.Mutex
+	memory map[string]int64 // latest per-workload memory use, sent with each heartbeat
 }
+
+const memorySampleInterval = 10 * time.Second
 
 const (
 	agentAPIHTTPTimeout = 10 * time.Second
@@ -139,6 +145,21 @@ func (a *Agent) Run(ctx context.Context) error {
 	defer stopWork()
 	shutdown := make(chan struct{})
 	rename := make(chan string, 1)
+
+	// Memory sampling reads one stats snapshot per container, so it runs on
+	// its own slower loop rather than delaying heartbeats.
+	go func() {
+		t := time.NewTicker(memorySampleInterval)
+		defer t.Stop()
+		for {
+			a.sampleMemory(ctx)
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+		}
+	}()
 
 	// Heartbeats get their own goroutine. pollAndExecute can block for
 	// minutes on an image pull or build; if the heartbeat shared its loop, a
@@ -374,11 +395,25 @@ func (a *Agent) heartbeat(ctx context.Context) error {
 	if err != nil {
 		log.Printf("list cached images failed: %v", err)
 	}
+	a.memMu.Lock()
+	memory := a.memory
+	a.memMu.Unlock()
 	body := map[string]any{
-		"thermal":       collectThermal(),
-		"cached_images": cachedImages,
+		"thermal":          collectThermal(),
+		"cached_images":    cachedImages,
+		"container_memory": memory,
 	}
 	return a.post(ctx, "/v1/nodes/"+a.cfg.NodeID+"/heartbeat", body, nil)
+}
+
+func (a *Agent) sampleMemory(ctx context.Context) {
+	memory, err := a.docker.ContainerMemory(ctx)
+	if err != nil {
+		return
+	}
+	a.memMu.Lock()
+	a.memory = memory
+	a.memMu.Unlock()
 }
 
 func (a *Agent) pollAndExecute(ctx context.Context) error {

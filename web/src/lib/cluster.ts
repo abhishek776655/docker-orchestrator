@@ -1,5 +1,6 @@
 import type { Tone } from '@/components/ui/badge'
 import type { ApiEvent, ApiGPU, ApiNode, ApiWorkload } from './api'
+import { liveMemGiB } from './memory'
 
 export type NodeState = 'available' | 'throttling' | 'cordoned' | 'offline'
 export type OsKind = 'darwin' | 'linux' | 'windows' | 'unknown'
@@ -19,6 +20,8 @@ export interface NodeView {
   cpuCap: number
   memUsed: number
   memCap: number
+  /** RAM its containers actually use right now, GiB; null when unknown. */
+  memLive: number | null
   gpus: ApiGPU[]
   thermal: ApiNode['Thermal']
   heartbeatAgeSec: number | null
@@ -77,6 +80,7 @@ export function deriveNodes(nodes: ApiNode[], workloads: ApiWorkload[], now = Da
       cpuCap: n.Allocatable.CPUMillis / 1000,
       memUsed: mine.reduce((sum, w) => sum + w.Resources.MemoryBytes, 0) / GIB,
       memCap: n.Allocatable.MemoryBytes / GIB,
+      memLive: liveMemGiB(mine),
       gpus: n.GPUs ?? [],
       thermal: n.Thermal ?? { Known: false, TemperatureC: 0, Throttling: false },
       heartbeatAgeSec: Number.isNaN(heartbeat) || heartbeat <= 0 ? null : Math.max(0, Math.round((now - heartbeat) / 1000)),
@@ -91,6 +95,8 @@ export interface ProjectView {
   services: number
   revisions: string[]
   statusCounts: { status: string; count: number }[]
+  /** RAM in use right now across the project, GiB; null when unknown. */
+  memLiveGiB: number | null
 }
 
 export function deriveProjects(workloads: ApiWorkload[]): ProjectView[] {
@@ -109,6 +115,7 @@ export function deriveProjects(workloads: ApiWorkload[]): ProjectView[] {
         services: new Set(list.map((w) => w.Service)).size,
         revisions: [...new Set(list.map((w) => w.Revision))].sort(),
         statusCounts: [...counts.entries()].map(([status, count]) => ({ status, count })),
+        memLiveGiB: liveMemGiB(list),
       }
     })
     .sort((a, b) => a.name.localeCompare(b.name))

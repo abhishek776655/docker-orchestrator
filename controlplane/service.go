@@ -50,6 +50,7 @@ type Service struct {
 	liveLogs liveLogRelay
 	shutdown shutdownState
 	renames  renameState
+	usage    usageState
 	// nodeReqs queues restarts and image deletions for agents' control polls.
 	nodeReqs nodeRequests
 

@@ -15,6 +15,7 @@ import { Card } from '@/components/ui/card'
 import { api } from '@/lib/api'
 import { eventTone, sinceLabel, statusTone } from '@/lib/cluster'
 import { blockedSummary, deriveProject, graphNodesOf, projectEvents } from '@/lib/project'
+import { formatMem } from '@/lib/memory'
 import { requestLabel } from '@/lib/plan'
 import { deployLink, loadDeploy } from '@/lib/saved-deploys'
 
@@ -260,6 +261,7 @@ export function ProjectPage() {
       <section aria-label="Summary" className="grid grid-cols-[repeat(auto-fit,minmax(220px,1fr))] gap-4">
         <Tile label="Services" value={String(project.services.length)} note={sameRevision ? `revision ${project.revision}` : `revision ${project.revision} of ${project.revisions.length}`} />
         <Tile label="Reserved" value={`${project.cpuCores.toFixed(1)} cores`} note={requestLabel({ cpuCores: project.cpuCores, memGiB: project.memGiB }).split(' · ')[1]} />
+        <Tile label="RAM in use" value={formatMem(project.memLiveGiB)} note={project.memLiveGiB === null ? 'no recent report' : 'live, across all its containers'} />
         <Tile label="Nodes in use" value={String(project.nodes.length)} note={project.nodes.join(', ') || 'none placed'} />
       </section>
 
@@ -273,6 +275,7 @@ export function ProjectPage() {
                 <th className="px-4 py-3 font-medium">Status</th>
                 <th className="px-4 py-3 font-medium">Node</th>
                 <th className="px-4 py-3 font-medium">Reserved</th>
+                <th className="px-4 py-3 font-medium">RAM used</th>
                 <th className="px-4 py-3 font-medium">Waits for</th>
               </tr>
             </thead>
@@ -290,6 +293,7 @@ export function ProjectPage() {
                   </td>
                   <td className="px-4 py-3.5 font-mono">{s.node || <span className="text-muted-foreground">unplaced</span>}</td>
                   <td className="whitespace-nowrap px-4 py-3.5 font-mono text-xs">{requestLabel(s)}</td>
+                  <td className="whitespace-nowrap px-4 py-3.5 font-mono text-xs">{formatMem(s.memLiveGiB)}</td>
                   <td className="min-w-[260px] px-4 py-3.5 text-[13px]">
                     {s.waitsFor.length ? s.waitsFor.map((d) => `${d.name} (${d.healthy ? 'healthy' : 'started'})`).join(', ') : <span className="text-muted-foreground">nothing</span>}
                   </td>

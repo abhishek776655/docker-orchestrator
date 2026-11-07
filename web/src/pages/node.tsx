@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { ApiError, api } from '@/lib/api'
 import { OS_LABEL, STATE_LABEL, ageLabel, deriveNodes, offlineHint, stateTone, statusTone } from '@/lib/cluster'
+import { formatMem, liveMemGiB } from '@/lib/memory'
 import { requestLabel } from '@/lib/plan'
 import { cn } from '@/lib/utils'
 
@@ -183,6 +184,11 @@ export function NodePage() {
             )}
             <Bar label="CPU reserved" value={`${node.cpuUsed.toFixed(1)} / ${node.cpuCap.toFixed(1)} cores`} pct={node.cpuCap ? (node.cpuUsed / node.cpuCap) * 100 : 0} />
             <Bar label="Memory reserved" value={`${node.memUsed.toFixed(1)} / ${node.memCap.toFixed(1)} GiB`} pct={node.memCap ? (node.memUsed / node.memCap) * 100 : 0} />
+            {node.memLive === null ? (
+              <p className="m-0 text-[13px] text-muted-foreground">RAM in use: no recent report from this node's containers.</p>
+            ) : (
+              <Bar label="RAM in use by containers" value={`${formatMem(node.memLive)} / ${node.detected.mem.toFixed(1)} GiB`} pct={node.detected.mem ? (node.memLive / node.detected.mem) * 100 : 0} tone="bg-info" />
+            )}
           </Section>
 
           <Section title="GPU and thermal">
@@ -226,7 +232,7 @@ export function NodePage() {
               <table className="w-full min-w-[600px] border-collapse">
                 <thead>
                   <tr className="text-left text-xs text-muted-foreground">
-                    {['Workload', 'Status', 'Reserved', 'Host ports'].map((h) => <th key={h} className="px-4 py-3 font-medium">{h}</th>)}
+                    {['Workload', 'Status', 'Reserved', 'RAM used', 'Host ports'].map((h) => <th key={h} className="px-4 py-3 font-medium">{h}</th>)}
                   </tr>
                 </thead>
                 <tbody>
@@ -239,12 +245,13 @@ export function NodePage() {
                       </td>
                       <td className="px-4 py-3"><Badge tone={statusTone(w.Status)}>{w.Status.replace(/_/g, ' ')}</Badge></td>
                       <td className={`${mono} whitespace-nowrap px-4 py-3 text-xs`}>{requestLabel({ cpuCores: w.Resources.CPUMillis / 1000, memGiB: w.Resources.MemoryBytes / GIB })}</td>
+                      <td className={`${mono} whitespace-nowrap px-4 py-3 text-xs`}>{formatMem(liveMemGiB([w]))}</td>
                       <td className={`${mono} px-4 py-3 text-[13px]`}>
                         {(w.PortBindings ?? []).length ? w.PortBindings!.map((p) => (p.HostPort === p.ContainerPort ? `${p.HostPort}` : `${p.HostPort} → ${p.ContainerPort}`)).join(', ') : 'none'}
                       </td>
                     </tr>
                   ))}
-                  {node.workloads.length === 0 && <tr className="border-t border-muted"><td colSpan={4} className="px-4 py-6 text-center text-muted-foreground">Nothing is placed on this node.</td></tr>}
+                  {node.workloads.length === 0 && <tr className="border-t border-muted"><td colSpan={5} className="px-4 py-6 text-center text-muted-foreground">Nothing is placed on this node.</td></tr>}
                 </tbody>
               </table>
             </Card>

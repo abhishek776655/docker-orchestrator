@@ -810,3 +810,42 @@ func (d *Docker) WaitRunning(ctx context.Context, containerID string, timeout ti
 		}
 	}
 }
+
+// ContainerMemory returns the current memory use, in bytes, of every
+// running container this agent manages, keyed by workload key. It matches
+// `docker stats`: usage minus reclaimable page cache.
+func (d *Docker) ContainerMemory(ctx context.Context) (map[string]int64, error) {
+	managed, err := d.ManagedContainers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]int64, len(managed))
+	for _, c := range managed {
+		if !c.Running || c.WorkloadKey == "" {
+			continue
+		}
+		resp, err := d.cli.ContainerStatsOneShot(ctx, c.ContainerID)
+		if err != nil {
+			continue
+		}
+		var stats types.StatsJSON
+		err = json.NewDecoder(resp.Body).Decode(&stats)
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		out[c.WorkloadKey] = int64(memoryInUse(stats.MemoryStats))
+	}
+	return out, nil
+}
+
+// memoryInUse is the Docker CLI's own calculation (cgroup v1 and v2).
+func memoryInUse(m types.MemoryStats) uint64 {
+	if v, ok := m.Stats["total_inactive_file"]; ok && v < m.Usage {
+		return m.Usage - v
+	}
+	if v, ok := m.Stats["inactive_file"]; ok && v < m.Usage {
+		return m.Usage - v
+	}
+	return m.Usage
+}

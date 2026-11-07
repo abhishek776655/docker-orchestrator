@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { api } from '@/lib/api'
 import { deriveProjects, statusTone } from '@/lib/cluster'
+import { formatMem } from '@/lib/memory'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
@@ -33,6 +34,7 @@ export function ProjectsPage() {
               <th className="px-4 py-3 font-medium">Project</th>
               <th className="px-4 py-3 font-medium">Services</th>
               <th className="px-4 py-3 font-medium">Status</th>
+              <th className="px-4 py-3 font-medium">RAM used</th>
               <th className="px-4 py-3 font-medium">Revision</th>
             </tr>
           </thead>
@@ -54,12 +56,13 @@ export function ProjectsPage() {
                     ))}
                   </div>
                 </td>
+                <td className="whitespace-nowrap px-4 py-3.5 font-mono text-xs">{formatMem(p.memLiveGiB)}</td>
                 <td className="px-4 py-3.5 font-mono">{p.revisions.join(', ')}</td>
               </tr>
             ))}
             {projects.length === 0 && (
               <tr className="border-t border-muted">
-                <td colSpan={4} className="px-4 py-6 text-center text-muted-foreground">
+                <td colSpan={5} className="px-4 py-6 text-center text-muted-foreground">
                   {workloadsQ.isPending ? 'Loading…' : 'No projects deployed yet.'}
                 </td>
               </tr>

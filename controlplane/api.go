@@ -229,8 +229,9 @@ func (svc *Service) handleRegisterNode(w http.ResponseWriter, r *http.Request) {
 }
 
 type heartbeatRequest struct {
-	Thermal      model.Thermal `json:"thermal"`
-	CachedImages []string      `json:"cached_images"`
+	Thermal         model.Thermal    `json:"thermal"`
+	CachedImages    []string         `json:"cached_images"`
+	ContainerMemory map[string]int64 `json:"container_memory"`
 }
 
 func (svc *Service) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
@@ -241,6 +242,9 @@ func (svc *Service) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if err := svc.Heartbeat(r.Context(), id, req.Thermal, req.CachedImages); err != nil {
 		writeError(w, http.StatusNotFound, err)
 		return
+	}
+	if authenticated := authenticatedNode(r); authenticated == "" || authenticated == id {
+		svc.recordMemory(id, req.ContainerMemory)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -326,6 +330,7 @@ func (svc *Service) handleListWorkloads(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	svc.withMemory(workloads)
 	writeJSON(w, http.StatusOK, workloads)
 }
 
@@ -345,7 +350,9 @@ func (svc *Service) handleGetWorkload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, rec)
+	one := []store.WorkloadRecord{*rec}
+	svc.withMemory(one)
+	writeJSON(w, http.StatusOK, one[0])
 }
 
 func (svc *Service) handleAssignments(w http.ResponseWriter, r *http.Request) {

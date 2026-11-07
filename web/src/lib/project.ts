@@ -1,5 +1,6 @@
 import type { ApiEvent, ApiWorkload } from './api'
 import type { GraphNodeInfo } from '@/components/deploy/dependency-graph'
+import { liveMemGiB } from './memory'
 import { liveState, stagesOf } from './plan'
 
 const GIB = 1024 ** 3
@@ -12,6 +13,8 @@ export interface ServiceRow {
   node: string // "" while unplaced
   cpuCores: number
   memGiB: number
+  /** RAM in use right now, GiB; null when unknown. */
+  memLiveGiB: number | null
   waitsFor: { name: string; healthy: boolean }[]
   stopped: boolean
 }
@@ -24,6 +27,7 @@ export interface ProjectDetail {
   statusCounts: { status: string; count: number }[]
   cpuCores: number
   memGiB: number
+  memLiveGiB: number | null
   nodes: string[]
   stages: number
   /** True when no service is desired running, so the rows are the stopped ones. */
@@ -55,6 +59,7 @@ export function deriveProject(name: string, workloads: ApiWorkload[], revision?:
         node: w.NodeID,
         cpuCores: w.Resources.CPUMillis / 1000,
         memGiB: w.Resources.MemoryBytes / GIB,
+        memLiveGiB: liveMemGiB([w]),
         waitsFor: (w.DependsOn ?? []).map((d) => ({ name: d, healthy: healthy.has(d) })),
         stopped: w.DesiredState === 'stopped',
       }
@@ -73,6 +78,7 @@ export function deriveProject(name: string, workloads: ApiWorkload[], revision?:
     statusCounts: [...counts.entries()].map(([status, count]) => ({ status, count })),
     cpuCores: services.reduce((n, s) => n + s.cpuCores, 0),
     memGiB: services.reduce((n, s) => n + s.memGiB, 0),
+    memLiveGiB: liveMemGiB(list),
     nodes: [...new Set(services.map((s) => s.node).filter(Boolean))].sort(),
     stages: [...stages.values()].reduce((m, s) => Math.max(m, s + 1), 0),
     allStopped: running.length === 0,

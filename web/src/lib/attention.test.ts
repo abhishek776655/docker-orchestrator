@@ -6,7 +6,7 @@ import type { NodeView } from './cluster'
 function node(id: string, state: NodeView['state'], temp = 50): NodeView {
   return {
     id, name: id, address: '10.0.0.1', arch: 'arm64', os: 'darwin', isHost: false, state, labels: {},
-    limits: { cpu: 0, mem: 0 }, detected: { cpu: 8, mem: 16 }, cpuUsed: 0, cpuCap: 8, memUsed: 0, memCap: 16, gpus: [],
+    limits: { cpu: 0, mem: 0 }, detected: { cpu: 8, mem: 16 }, cpuUsed: 0, cpuCap: 8, memUsed: 0, memCap: 16, memLive: null, gpus: [],
     thermal: { Known: true, TemperatureC: temp, Throttling: state === 'throttling' }, heartbeatAgeSec: 120, workloads: [], cachedImages: [],
   }
 }

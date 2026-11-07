@@ -805,6 +805,10 @@ type WorkloadRecord struct {
 	StatusReason string
 	NodeID       string
 	ContainerID  string
+	// MemoryUsedBytes is the container's live memory use as last reported
+	// by its node; nil when unknown (not running, or no fresh report).
+	// Filled in by the API from agent heartbeats, never stored.
+	MemoryUsedBytes *int64 `json:",omitempty"`
 }
 
 // CreateWorkload inserts a newly submitted, scheduled workload.

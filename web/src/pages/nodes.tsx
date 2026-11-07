@@ -51,7 +51,7 @@ export function NodesPage() {
         <table className="w-full min-w-[1000px] border-collapse">
           <thead>
             <tr className="text-left text-xs text-muted-foreground">
-              {['Node', 'State', 'CPU reserved', 'Memory reserved', 'GPU', 'Thermal', 'Workloads', 'Heartbeat'].map((h) => (
+              {['Node', 'State', 'CPU reserved', 'Memory reserved', 'RAM used', 'GPU', 'Thermal', 'Workloads', 'Heartbeat'].map((h) => (
                 <th key={h} className="px-4 py-3 font-medium">{h}</th>
               ))}
             </tr>
@@ -73,6 +73,9 @@ export function NodesPage() {
                 <td className="px-4 py-3"><Badge tone={stateTone(n.state)}>{STATE_LABEL[n.state]}</Badge></td>
                 <td className="px-4 py-3"><MiniBar used={n.cpuUsed} cap={n.cpuCap} unit="cores" /></td>
                 <td className="px-4 py-3"><MiniBar used={n.memUsed} cap={n.memCap} unit="GiB" /></td>
+                <td className="px-4 py-3">
+                  {n.memLive === null ? <span className="text-muted-foreground">—</span> : <MiniBar used={n.memLive} cap={n.detected.mem} unit="GiB" />}
+                </td>
                 <td className="px-4 py-3 text-[13px]">{n.gpus.length ? n.gpus.map((g) => g.Model).join(', ') : <span className="text-muted-foreground">none</span>}</td>
                 <td className="px-4 py-3 text-[13px]">{thermalLabel(n)}</td>
                 <td className="px-4 py-3 font-mono">{running(n)}</td>
@@ -81,7 +84,7 @@ export function NodesPage() {
             ))}
             {nodes.length === 0 && (
               <tr className="border-t border-muted">
-                <td colSpan={8} className="px-4 py-8 text-center text-muted-foreground">{nodesQ.isPending ? 'Loading…' : 'No nodes have joined yet.'}</td>
+                <td colSpan={9} className="px-4 py-8 text-center text-muted-foreground">{nodesQ.isPending ? 'Loading…' : 'No nodes have joined yet.'}</td>
               </tr>
             )}
           </tbody>
