@@ -128,7 +128,7 @@ export function ServicePage() {
     mutationFn: async () => {
       const parsed = summarizeCompose(saved!.file.text)
       if (!parsed.ok) throw new Error(parsed.error)
-      const config = { ...defaultConfig(parsed.summary), ...saved!.config, scope: 'one' as const, onlyService: service, placements: {}, fresh: true }
+      const config = { ...defaultConfig(parsed.summary), ...saved!.config, scope: 'one' as const, onlyServices: [service], placements: {}, fresh: true }
       const response = await api.composePlan(buildRequest(saved!.file.text, config, false))
       const row = derivePlan(response, null, config, workloadsQ.data ?? []).find((s) => s.name === service)
       if (!row) throw new Error(`${service} is not in the saved Compose file.`)

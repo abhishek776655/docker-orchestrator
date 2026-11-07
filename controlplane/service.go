@@ -111,13 +111,28 @@ func (svc *Service) ComposePlan(ctx context.Context, project, workingDir string,
 // --service X` (or `plan --service X`) runs only what X actually needs —
 // not the whole Compose file — while still respecting its real dependency
 // graph rather than just that one container in isolation.
+//
+// onlyService may name several services, comma-separated ("api,worker");
+// the result is the union of their closures. Compose service names can't
+// contain commas, so the single only_service field carries the list and
+// older clients sending one name are unaffected.
 func filterToClosure(plan *compose.Plan, onlyService string) (*compose.Plan, error) {
 	byService := make(map[string]model.Workload, len(plan.Workloads))
 	for _, wl := range plan.Workloads {
 		byService[wl.Service] = wl
 	}
-	if _, ok := byService[onlyService]; !ok {
-		return nil, fmt.Errorf("service %q not found in compose file", onlyService)
+	var roots []string
+	for _, s := range strings.Split(onlyService, ",") {
+		if s = strings.TrimSpace(s); s == "" {
+			continue
+		}
+		if _, ok := byService[s]; !ok {
+			return nil, fmt.Errorf("service %q not found in compose file", s)
+		}
+		roots = append(roots, s)
+	}
+	if len(roots) == 0 {
+		return nil, fmt.Errorf("no service named to deploy")
 	}
 
 	keep := map[string]bool{}
@@ -131,7 +146,9 @@ func filterToClosure(plan *compose.Plan, onlyService string) (*compose.Plan, err
 			visit(dep)
 		}
 	}
-	visit(onlyService)
+	for _, r := range roots {
+		visit(r)
+	}
 
 	filtered := *plan
 	filtered.Workloads = nil

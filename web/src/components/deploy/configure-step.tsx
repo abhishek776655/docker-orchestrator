@@ -8,7 +8,7 @@ import { FolderOpen } from 'lucide-react'
 import type { ComposeFile } from '@/components/deploy/upload-step'
 import { api } from '@/lib/api'
 import { LABEL_ROLE } from '@/lib/cluster'
-import { dependencyClosure, servicesInScope, validateConfig, type DeployConfig } from '@/lib/deploy-config'
+import { dependencyClosure, neededBy, nextRoots, scopeRoots, servicesInScope, validateConfig, type DeployConfig } from '@/lib/deploy-config'
 import { cn } from '@/lib/utils'
 
 interface Props {
@@ -115,8 +115,20 @@ export function ConfigureStep({ compose, config, onChange, onBack, onNext }: Pro
   const preset = (names: string[]) => onChange({ hostServices: names })
   const keptStateful = summary.details.filter((d) => d.stateful && config.hostServices.includes(d.name)).length
 
-  const scopeItems: ServiceItem[] = summary.details.map((d) => ({ name: d.name }))
-  const closure = config.scope === 'one' && config.onlyService ? dependencyClosure(summary.details, config.onlyService) : []
+  // Picked services plus, checked and locked, everything they depend on.
+  const roots = scopeRoots(summary, config)
+  const closure = config.scope === 'one' && roots.length > 0 ? dependencyClosure(summary.details, roots) : []
+  const requiredBy = neededBy(summary.details, roots)
+  const scopeItems: ServiceItem[] = summary.details.map((d) => {
+    const needers = requiredBy.get(d.name)
+    const lockedIn = !!needers && !roots.includes(d.name)
+    return {
+      name: d.name,
+      disabled: lockedIn,
+      note: needers ? `needed by ${needers.join(', ')}` : undefined,
+    }
+  })
+  const changeScope = (next: string[]) => onChange({ onlyServices: nextRoots(roots, closure, next) })
 
   function run() {
     if (hasErrors) {
@@ -209,16 +221,16 @@ export function ConfigureStep({ compose, config, onChange, onBack, onNext }: Pro
             name="scope"
             checked={config.scope === 'one'}
             onChange={() => onChange({ scope: 'one' })}
-            title="One service, plus everything it depends on"
+            title="Chosen services, plus everything they depend on"
           >
-            The chosen service and what it depends on. Others are left alone.
+            Pick one or more services; what they depend on is selected for you. Others are left alone.
           </OptionCard>
           {config.scope === 'one' && (
             <div className="flex flex-col gap-2.5 pl-7">
-              <ServiceList label="service to deploy" items={scopeItems} selected={config.onlyService ? [config.onlyService] : []} mode="single" onChange={([onlyService]) => onChange({ onlyService })} />
+              <ServiceList label="services to deploy" items={scopeItems} selected={closure} mode="multi" onChange={changeScope} />
               {closure.length > 0 ? (
                 <p className="m-0 text-[13px] text-muted-foreground">
-                  {config.onlyService} and {closure.length - 1} {closure.length - 1 === 1 ? 'dependency' : 'dependencies'} will deploy ({closure.length} of{' '}
+                  {roots.length} picked and {closure.length - roots.length} {closure.length - roots.length === 1 ? 'dependency' : 'dependencies'} will deploy ({closure.length} of{' '}
                   {summary.services.length}).
                 </p>
               ) : (

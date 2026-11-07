@@ -39,7 +39,7 @@ describe('buildRequest', () => {
   const config: DeployConfig = { ...defaultConfig({ services: [], details: [], builds: 0, gpu: 0, volumes: 0, ports: 0, dependencies: 0 }), project: 'shop', workingDir: ' /srv/shop ' }
 
   it('maps the configuration onto the compose request', () => {
-    const r = buildRequest('services: {}', { ...config, hostServices: ['db'], scope: 'one', onlyService: 'web', noCache: true, fresh: true }, false)
+    const r = buildRequest('services: {}', { ...config, hostServices: ['db'], scope: 'one', onlyServices: ['web'], noCache: true, fresh: true }, false)
     expect(r).toMatchObject({ project: 'shop', working_dir: '/srv/shop', no_cache: true, only_service: 'web', pin_host: ['db'], pin_nodes: {}, fresh: true })
   })
 
@@ -75,17 +75,23 @@ describe('pruneToScope', () => {
     expect(pruneToScope(file, config)).toBe(file)
   })
 
+  it('keeps every picked service and their dependencies, and names them all in the request', () => {
+    const picked = { ...config, scope: 'one' as const, onlyServices: ['api', 'dbt'] }
+    expect(Object.keys(parse(pruneToScope(file, picked)).services)).toEqual(['db', 'api', 'dbt'])
+    expect(buildRequest(file, picked, false).only_service).toBe('api,dbt')
+  })
+
   it('drops services outside the chosen one and its dependencies', () => {
-    const out = parse(pruneToScope(file, { ...config, scope: 'one', onlyService: 'api' }))
+    const out = parse(pruneToScope(file, { ...config, scope: 'one', onlyServices: ['api'] }))
     expect(Object.keys(out.services)).toEqual(['db', 'api'])
   })
 
   it('leaves text it cannot read alone', () => {
-    expect(pruneToScope('not: [valid', { ...config, scope: 'one', onlyService: 'api' })).toBe('not: [valid')
+    expect(pruneToScope('not: [valid', { ...config, scope: 'one', onlyServices: ['api'] })).toBe('not: [valid')
   })
 
   it('is what the request carries', () => {
-    const r = buildRequest(file, { ...config, scope: 'one', onlyService: 'db' }, false)
+    const r = buildRequest(file, { ...config, scope: 'one', onlyServices: ['db'] }, false)
     expect(Object.keys(parse(r.yaml).services)).toEqual(['db'])
     expect(r.only_service).toBe('db')
   })

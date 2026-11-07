@@ -108,8 +108,8 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `hacoctl: a thin CLI over the control-plane API (HACO_CONTROLPLANE_URL, default http://localhost:8099)
 
 Usage:
-  hacoctl build  <project> <docker-compose.yml>   just build the build: service images, no scheduling or containers (--no-cache forces a full rebuild; --service <name> scopes to that service's dependencies; --pin-host/--pin-node below)
-  hacoctl deploy <project> <docker-compose.yml>   build, schedule, and run a Compose project, then show a live status table until every workload is ready/failed/stopped (like 'docker compose up -d'); prompts if a pinned service needs a fresh volume (--yes skips it); --no-cache forces a full rebuild; --service <name> deploys only that service and its dependencies; --pin-host/--pin-node below; --fresh lets every currently-unpinned service reschedule freely instead of reusing its existing node (prompts first, abandons its current data; --yes skips it)
+  hacoctl build  <project> <docker-compose.yml>   just build the build: service images, no scheduling or containers (--no-cache forces a full rebuild; --service <name> scopes to that service and its dependencies (repeatable, or a comma list); --pin-host/--pin-node below)
+  hacoctl deploy <project> <docker-compose.yml>   build, schedule, and run a Compose project, then show a live status table until every workload is ready/failed/stopped (like 'docker compose up -d'); prompts if a pinned service needs a fresh volume (--yes skips it); --no-cache forces a full rebuild; --service <name> deploys only that service and its dependencies (repeat it, or give a comma list, for several); --pin-host/--pin-node below; --fresh lets every currently-unpinned service reschedule freely instead of reusing its existing node (prompts first, abandons its current data; --yes skips it)
   hacoctl plan   <project> <docker-compose.yml>   dry-run the same, no side effects (table; add --json for raw; --service <name> to scope the same way; --pin-host/--pin-node below; --fresh previews what 'deploy --fresh' would actually do instead of the existing-pin reuse a plain deploy uses)
                                                    --pin-host <service,...>: override storage affinity for this call only, no Compose file changes needed — only the named services (e.g. a database, and whichever service you're actively live-editing) pin to this control-plane host; every other service schedules anywhere, even one that bind-mounts its own source (overrides compose.go's own auto-pin heuristic)
                                                    --pin-node <node-id>=<service,...>: same override, but pins the named services to that specific node instead of the control-plane host — repeatable for multiple nodes; combines with --pin-host in the same call
@@ -186,7 +186,7 @@ func plan(baseURL string, args []string) error {
 			if i >= len(args) {
 				return fmt.Errorf("--service requires a value")
 			}
-			onlyService = args[i]
+			onlyService = addService(onlyService, args[i])
 		case "--pin-host":
 			i++
 			if i >= len(args) {
@@ -209,7 +209,7 @@ func plan(baseURL string, args []string) error {
 		}
 	}
 	if len(rest) != 2 {
-		return fmt.Errorf("usage: hacoctl plan <project> <docker-compose.yml> [--json] [--fresh] [--service <name>] [--pin-host <service,...>] [--pin-node <node-id>=<service,...>]")
+		return fmt.Errorf("usage: hacoctl plan <project> <docker-compose.yml> [--json] [--fresh] [--service <name>[,<name>...]] [--pin-host <service,...>] [--pin-node <node-id>=<service,...>]")
 	}
 	project, file := rest[0], rest[1]
 
@@ -400,7 +400,7 @@ func buildCmd(baseURL string, args []string) error {
 			if i >= len(args) {
 				return fmt.Errorf("--service requires a value")
 			}
-			onlyService = args[i]
+			onlyService = addService(onlyService, args[i])
 		case "--pin-host":
 			i++
 			if i >= len(args) {
@@ -423,7 +423,7 @@ func buildCmd(baseURL string, args []string) error {
 		}
 	}
 	if len(rest) != 2 {
-		return fmt.Errorf("usage: hacoctl build <project> <docker-compose.yml> [--no-cache] [--service <name>] [--pin-host <service,...>] [--pin-node <node-id>=<service,...>]")
+		return fmt.Errorf("usage: hacoctl build <project> <docker-compose.yml> [--no-cache] [--service <name>[,<name>...]] [--pin-host <service,...>] [--pin-node <node-id>=<service,...>]")
 	}
 	project, file := rest[0], rest[1]
 
@@ -472,7 +472,7 @@ func deploy(baseURL string, args []string) error {
 			if i >= len(args) {
 				return fmt.Errorf("--service requires a value")
 			}
-			onlyService = args[i]
+			onlyService = addService(onlyService, args[i])
 		case "--pin-host":
 			i++
 			if i >= len(args) {
@@ -495,7 +495,7 @@ func deploy(baseURL string, args []string) error {
 		}
 	}
 	if len(rest) != 2 {
-		return fmt.Errorf("usage: hacoctl deploy <project> <docker-compose.yml> [--yes] [--no-cache] [--fresh] [--service <name>] [--pin-host <service,...>] [--pin-node <node-id>=<service,...>]")
+		return fmt.Errorf("usage: hacoctl deploy <project> <docker-compose.yml> [--yes] [--no-cache] [--fresh] [--service <name>[,<name>...]] [--pin-host <service,...>] [--pin-node <node-id>=<service,...>]")
 	}
 	project, file := rest[0], rest[1]
 
@@ -2050,4 +2050,19 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// addService appends a --service value to the comma-separated scope, so the
+// flag can be repeated (--service api --service worker) or given a list
+// (--service api,worker); the control plane deploys the union of their
+// dependency closures.
+func addService(list, value string) string {
+	value = strings.Trim(strings.TrimSpace(value), ",")
+	if value == "" {
+		return list
+	}
+	if list == "" {
+		return value
+	}
+	return list + "," + value
 }

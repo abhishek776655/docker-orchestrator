@@ -15,3 +15,10 @@ func TestParseByteSize(t *testing.T) {
 		}
 	}
 }
+
+func TestAddServiceBuildsCommaSeparatedScope(t *testing.T) {
+	got := addService(addService(addService("", "api"), "worker,cron"), " ")
+	if got != "api,worker,cron" {
+		t.Fatalf("scope = %q, want api,worker,cron", got)
+	}
+}

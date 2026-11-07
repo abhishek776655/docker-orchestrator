@@ -1,7 +1,7 @@
 import { parseDocument } from 'yaml'
 import type { ApiWorkload, ComposeRequest, Decision, PlanResponse } from './api'
 import { summarizeCompose } from './compose-summary'
-import { dependencyClosure, type DeployConfig } from './deploy-config'
+import { dependencyClosure, pickedServices, scopeRoots, type DeployConfig } from './deploy-config'
 
 /**
  * The file with only the chosen service and what it depends on. The control
@@ -12,8 +12,10 @@ import { dependencyClosure, type DeployConfig } from './deploy-config'
 export function pruneToScope(yaml: string, config: DeployConfig): string {
   if (config.scope !== 'one') return yaml
   const parsed = summarizeCompose(yaml)
-  if (!parsed.ok || !parsed.summary.services.includes(config.onlyService)) return yaml
-  const keep = new Set(dependencyClosure(parsed.summary.details, config.onlyService))
+  if (!parsed.ok) return yaml
+  const roots = scopeRoots(parsed.summary, config)
+  if (roots.length === 0) return yaml
+  const keep = new Set(dependencyClosure(parsed.summary.details, roots))
   if (keep.size === parsed.summary.services.length) return yaml
   const doc = parseDocument(yaml)
   const services = doc.get('services', true)
@@ -33,7 +35,7 @@ export function buildRequest(yaml: string, config: DeployConfig, withPlacements:
     working_dir: config.workingDir.trim(),
     yaml: pruneToScope(yaml, config),
     no_cache: config.noCache,
-    only_service: config.scope === 'one' ? config.onlyService : '',
+    only_service: config.scope === 'one' ? pickedServices(config).join(',') : '',
     pin_host: config.hostServices.length > 0 ? config.hostServices : null,
     pin_nodes: pinNodes,
     fresh: config.fresh,
