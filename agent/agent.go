@@ -37,6 +37,9 @@ type Config struct {
 	PollPeriod      time.Duration
 	Credential      string
 	TLSFingerprint  string
+	// CredentialPath is where this node's credential file lives; a node
+	// rename rewrites it under the new ID.
+	CredentialPath string
 	// Role marks this agent as the one co-located with the control plane
 	// ("host"); empty for every ordinary worker. It is published as a node
 	// label so the web console can draw the host at the center.
@@ -135,6 +138,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	workCtx, stopWork := context.WithCancel(ctx)
 	defer stopWork()
 	shutdown := make(chan struct{})
+	rename := make(chan string, 1)
 
 	// Heartbeats get their own goroutine. pollAndExecute can block for
 	// minutes on an image pull or build; if the heartbeat shared its loop, a
@@ -164,9 +168,15 @@ func (a *Agent) Run(ctx context.Context) error {
 				return
 			case <-t.C:
 				a.serveLiveLogRequests(ctx)
-				if a.shutdownRequested(ctx) {
+				ctl := a.controlPoll(ctx)
+				if ctl.Shutdown {
 					stopWork()
 					close(shutdown)
+					return
+				}
+				if ctl.RenameTo != "" {
+					stopWork()
+					rename <- ctl.RenameTo
 					return
 				}
 			}
@@ -181,6 +191,8 @@ func (a *Agent) Run(ctx context.Context) error {
 		case <-shutdown:
 			a.shutdownNode(ctx)
 			return ErrShutdownByControlPlane
+		case newID := <-rename:
+			return a.renameNode(ctx, newID)
 		case <-poll.C:
 			if workCtx.Err() != nil {
 				continue
@@ -210,14 +222,17 @@ func (a *Agent) pause() {
 	log.Printf("node %s paused; its containers keep running", a.cfg.NodeID)
 }
 
-func (a *Agent) shutdownRequested(ctx context.Context) bool {
-	var resp struct {
-		Shutdown bool `json:"shutdown"`
-	}
+type controlResponse struct {
+	Shutdown bool   `json:"shutdown"`
+	RenameTo string `json:"rename_to"`
+}
+
+func (a *Agent) controlPoll(ctx context.Context) controlResponse {
+	var resp controlResponse
 	if err := a.get(ctx, "/v1/agent/"+a.cfg.NodeID+"/control", &resp); err != nil {
-		return false // older control plane without this endpoint, or a transient error
+		return controlResponse{} // older control plane without this endpoint, or a transient error
 	}
-	return resp.Shutdown
+	return resp
 }
 
 // shutdownNode stops (not removes) every running container this agent

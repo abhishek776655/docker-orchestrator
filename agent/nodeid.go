@@ -21,18 +21,37 @@ import (
 // node and stranded its pins, data folders and credential. Now each
 // machine picks its ID once and saves it next to the data it names.
 
-var (
-	savedNodeIDOnce sync.Once
-	savedNodeID     string
-)
+var nodeIDMu sync.Mutex
 
 // SavedNodeID returns this machine's permanent node ID, creating and
-// saving it on first use.
+// saving it on first use. It re-reads the file each call so a rename
+// (`hacoctl node rename`) takes effect without restarting the process.
 func SavedNodeID() string {
-	savedNodeIDOnce.Do(func() {
-		savedNodeID = loadOrCreateNodeID(dataDir(), legacyHostnameNodeID(), machineName())
-	})
-	return savedNodeID
+	nodeIDMu.Lock()
+	defer nodeIDMu.Unlock()
+	dir := dataDir()
+	if data, err := os.ReadFile(filepath.Join(dir, "node-id")); err == nil {
+		if id := strings.TrimSpace(string(data)); agentjoin.ValidNodeID(id) {
+			return id
+		}
+	}
+	return loadOrCreateNodeID(dir, legacyHostnameNodeID(), machineName())
+}
+
+// saveNodeID records a new permanent ID (after a rename).
+func saveNodeID(id string) error {
+	nodeIDMu.Lock()
+	defer nodeIDMu.Unlock()
+	dir := dataDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, "node-id")
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(id+"\n"), 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func dataDir() string {

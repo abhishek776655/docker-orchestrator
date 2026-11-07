@@ -118,6 +118,7 @@ Usage:
   hacoctl node <id>                               one node's full detail
   hacoctl node cordon <id>                        block new workloads from scheduling onto this node (existing ones keep running)
   hacoctl node uncordon <id>                      make this node eligible for new workloads again
+  hacoctl node rename <old-id> <new-id>           rename a node everywhere: database pins, its data folder and credential; its containers are recreated under the new name (its agent must be running; --yes skips confirmation)
   hacoctl workloads [project]                     table of every workload, optionally filtered to one project
   hacoctl projects                                list distinct projects with a quick workload-status breakdown
   hacoctl tui [project]                           read-only auto-refreshing terminal dashboard (nodes/workloads/containers/events/metrics/services/projects tabs)
@@ -1025,9 +1026,46 @@ func node(baseURL string, args []string) error {
 		return post(baseURL, "/v1/admin/nodes/"+neturl.PathEscape(args[1])+"/cordon", []byte(`{}`))
 	case len(args) == 2 && args[0] == "uncordon":
 		return post(baseURL, "/v1/admin/nodes/"+neturl.PathEscape(args[1])+"/uncordon", []byte(`{}`))
+	case len(args) >= 1 && args[0] == "rename":
+		return renameNode(baseURL, args[1:])
 	default:
 		return nodeDetail(baseURL, args)
 	}
+}
+
+func renameNode(baseURL string, args []string) error {
+	var ids []string
+	yes := false
+	for _, a := range args {
+		if a == "--yes" || a == "-y" {
+			yes = true
+		} else {
+			ids = append(ids, a)
+		}
+	}
+	if len(ids) != 2 {
+		return fmt.Errorf("usage: hacoctl node rename <old-id> <new-id> [--yes]")
+	}
+	oldID, newID := ids[0], ids[1]
+	fmt.Printf("Renaming node %s to %s.\n", oldID, newID)
+	fmt.Println("Its containers are stopped, removed and recreated under the new name (services on it restart once);")
+	fmt.Println("its data folder and credential move with it. Any --pin-node or x-haco-pin-node naming the old ID must be updated by hand.")
+	if !yes && !confirm("Continue?") {
+		return fmt.Errorf("rename aborted")
+	}
+	body, _ := json.Marshal(map[string]string{"new_id": newID})
+	client := &http.Client{Timeout: 10 * time.Minute}
+	resp, err := client.Post(baseURL+"/v1/admin/nodes/"+neturl.PathEscape(oldID)+"/rename", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("control plane returned %s: %s", resp.Status, string(data))
+	}
+	fmt.Printf("renamed %s -> %s; its agent is restarting under the new name and will recreate its containers.\n", oldID, newID)
+	return nil
 }
 
 func nodeDetail(baseURL string, args []string) error {

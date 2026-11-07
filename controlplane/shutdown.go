@@ -208,7 +208,7 @@ func (svc *Service) handleAgentControl(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, fmt.Errorf("credential is not authorized for node %q", node))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]bool{"shutdown": svc.shutdownRequested(node)})
+	writeJSON(w, http.StatusOK, map[string]any{"shutdown": svc.shutdownRequested(node), "rename_to": svc.pendingRenameFor(node)})
 }
 
 func (svc *Service) handleShutdownDone(w http.ResponseWriter, r *http.Request) {

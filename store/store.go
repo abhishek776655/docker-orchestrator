@@ -334,6 +334,47 @@ func (s *Store) UncordonNode(ctx context.Context, nodeID string) error {
 	return nil
 }
 
+// ErrNodeIDTaken is RenameNode's refusal when the new ID already exists.
+var ErrNodeIDTaken = errors.New("node ID already in use")
+
+// RenameNode moves a node and everything that references it (workload
+// placement and pins, its agent credential, its event history) to a new
+// ID in one transaction. The node is left paused: its agent reconnects
+// under the new ID right after.
+func (s *Store) RenameNode(ctx context.Context, oldID, newID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var n int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM nodes WHERE id = ?`, newID).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return fmt.Errorf("%w: %q", ErrNodeIDTaken, newID)
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE nodes SET id = ?, availability = CASE WHEN disabled_by_admin = 1 THEN availability ELSE 'paused' END WHERE id = ?`, newID, oldID)
+	if err != nil {
+		return err
+	}
+	if rows, _ := res.RowsAffected(); rows == 0 {
+		return fmt.Errorf("%w: node %q", ErrNotFound, oldID)
+	}
+	for _, q := range []string{
+		`UPDATE workloads SET node_id = ? WHERE node_id = ?`,
+		`UPDATE workloads SET storage_pinned_node = ? WHERE storage_pinned_node = ?`,
+		`UPDATE workloads SET constraint_pinned_node = ? WHERE constraint_pinned_node = ?`,
+		`UPDATE agent_credentials SET node_id = ? WHERE node_id = ?`,
+		`UPDATE events SET node_id = ? WHERE node_id = ?`,
+	} {
+		if _, err := tx.ExecContext(ctx, q, newID, oldID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // PauseNode records that a node's agent stopped cleanly. Only an available
 // node is paused: a cordoned node stays cordoned. MarkStaleNodesUnavailable
 // only demotes 'available' nodes, so a paused one is never failed over.

@@ -32,6 +32,7 @@ func main() {
 			cfg.Address = address
 		}
 		log.Printf("joined control plane as node %s; credential saved to %s", nodeID, credentialPath)
+		cfg.CredentialPath = credentialPath
 		run(cfg)
 		return
 	}
@@ -46,28 +47,45 @@ func main() {
 	if address := os.Getenv("HACO_NODE_ADDRESS"); address != "" {
 		cfg.Address = address
 	}
+	cfg.CredentialPath = credentialPath
 	run(cfg)
 }
 
 func run(cfg agent.Config) {
-	home, _ := os.UserHomeDir()
-	dataDir := envOr("HACO_DATA_DIR", filepath.Join(home, ".haco", "volumes", cfg.NodeID))
-	docker, err := agent.NewDocker(cfg.NodeID, dataDir)
-	if err != nil {
-		log.Fatalf("docker client: %v", err)
-	}
-	log.Printf("node-local persistent volumes rooted at %s", dataDir)
-
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	a := agent.New(cfg, docker)
-	if err := a.Run(ctx); err != nil {
+	for {
+		home, _ := os.UserHomeDir()
+		dataDir := envOr("HACO_DATA_DIR", filepath.Join(home, ".haco", "volumes", cfg.NodeID))
+		docker, err := agent.NewDocker(cfg.NodeID, dataDir)
+		if err != nil {
+			log.Fatalf("docker client: %v", err)
+		}
+		log.Printf("node-local persistent volumes rooted at %s", dataDir)
+
+		err = agent.New(cfg, docker).Run(ctx)
+		if err == nil {
+			return
+		}
 		if errors.Is(err, agent.ErrShutdownByControlPlane) {
 			log.Print(err)
 			return
 		}
-		log.Fatalf("agent: %v", err)
+		re, ok := agent.IsRestart(err)
+		if !ok {
+			log.Fatalf("agent: %v", err)
+		}
+		log.Print(re)
+		next, loadErr := agent.LoadCredential(re.CredentialPath)
+		if loadErr != nil {
+			log.Fatalf("reload credential after %v: %v", re, loadErr)
+		}
+		if address := os.Getenv("HACO_NODE_ADDRESS"); address != "" {
+			next.Address = address
+		}
+		next.CredentialPath = re.CredentialPath
+		cfg = next
 	}
 }
 

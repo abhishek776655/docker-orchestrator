@@ -49,6 +49,7 @@ type Service struct {
 
 	liveLogs liveLogRelay
 	shutdown shutdownState
+	renames  renameState
 
 	// volumeSnapshots holds a directory bind mount's content as a tarball,
 	// keyed by workload-key + volume index — the same in-memory, fetch-

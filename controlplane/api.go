@@ -42,6 +42,8 @@ func NewHandler(svc *Service) http.Handler {
 	mux.HandleFunc("POST /v1/agent/{node}/shutdown-done", svc.handleShutdownDone)
 	mux.HandleFunc("POST /v1/nodes/{id}/pause", svc.handlePauseNode)
 	mux.HandleFunc("POST /v1/admin/shutdown", svc.handleShutdown)
+	mux.HandleFunc("POST /v1/admin/nodes/{id}/rename", svc.refuseDuringShutdown(svc.handleRenameNode))
+	mux.HandleFunc("POST /v1/agent/{node}/rename-commit", svc.handleRenameCommit)
 
 	mux.HandleFunc("GET /v1/services/{project}/{service}", svc.handleListServiceInstances)
 	mux.HandleFunc("GET /v1/services/{project}", svc.handleListProjectServices)
@@ -78,6 +80,7 @@ func NewAgentHandler(svc *Service) http.Handler {
 	mux.Handle("POST /v1/agent/{node}/log-response", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleDeliverLiveLogs)))
 	mux.Handle("GET /v1/agent/{node}/control", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleAgentControl)))
 	mux.Handle("POST /v1/agent/{node}/shutdown-done", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleShutdownDone)))
+	mux.Handle("POST /v1/agent/{node}/rename-commit", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleRenameCommit)))
 	mux.Handle("POST /v1/nodes/{id}/pause", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handlePauseNode)))
 	mux.Handle("GET /v1/services/{project}/{service}", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleListServiceInstances)))
 	mux.Handle("GET /v1/services/{project}", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleListProjectServices)))

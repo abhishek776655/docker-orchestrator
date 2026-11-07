@@ -177,6 +177,7 @@ func runHostAgent(ctx context.Context, jm *controlplane.JoinManager, advertiseHo
 		cfg.Address = advertiseHost
 	}
 	cfg.Role = "host"
+	cfg.CredentialPath = credentialPath
 
 	docker, err := agent.NewDocker(nodeID, filepath.Join(dataDir, "volumes", nodeID))
 	if err != nil {
@@ -185,7 +186,15 @@ func runHostAgent(ctx context.Context, jm *controlplane.JoinManager, advertiseHo
 	}
 
 	log.Printf("host agent running as node %s", nodeID)
-	if err := agent.New(cfg, docker).Run(ctx); err != nil && ctx.Err() == nil {
+	err = agent.New(cfg, docker).Run(ctx)
+	if re, ok := agent.IsRestart(err); ok && ctx.Err() == nil {
+		// After a rename the saved node-id file already holds the new ID,
+		// so starting over picks up the renamed credential and data folder.
+		log.Printf("host agent: %v", re)
+		runHostAgent(ctx, jm, advertiseHost, dataDir)
+		return
+	}
+	if err != nil && ctx.Err() == nil {
 		log.Printf("host agent: %v", err)
 	}
 }
