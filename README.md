@@ -10,6 +10,44 @@ the services in dependency order.
 No Kubernetes, no YAML rewrite, no registry to run. One control plane, one
 agent per machine, a CLI and a web console.
 
+## Quick start
+
+You need Docker on every machine and Go 1.26+ to build (Node.js and npm
+only for the web console). All machines must be on the same network.
+
+**1. Install** on every machine you want in the cluster:
+
+```bash
+git clone https://github.com/abhishek776655/docker-orchestrator.git
+cd docker-orchestrator
+./install.sh
+```
+
+**2. Start the control plane** on one machine:
+
+```bash
+hacoctl start --web
+```
+
+It prints the web console URL (`http://localhost:8099/`) and a one-time join
+command. The control-plane machine joins the cluster as a node by itself.
+
+**3. Join the other machines** by running the join command on each:
+
+```bash
+hacoctl agent join '<token>'
+```
+
+**4. Deploy a Compose project** from the console's **Deploy** page, or:
+
+```bash
+hacoctl plan myapp ./docker-compose.yml     # dry run: where each service goes and why
+hacoctl deploy myapp ./docker-compose.yml   # build, place, start, show live status
+```
+
+Details on each step are under [Install](#install) and
+[Setting up a cluster](#setting-up-a-cluster) below.
+
 ## Features
 
 **Scheduling**
@@ -70,57 +108,23 @@ agent per machine, a CLI and a web console.
 
 ## Install
 
-On every machine you want in the cluster:
+`./install.sh` installs `controlplane`, `agent` and `hacoctl` into
+`$(go env GOPATH)/bin` and, when npm is available, builds the web console
+into `~/.haco/web`. Make sure that bin folder is on your `PATH`.
 
-```bash
-git clone https://github.com/abhishek776655/docker-orchestrator.git
-cd docker-orchestrator
-./install.sh
-```
+## Setting up a cluster
 
-This installs `controlplane`, `agent` and `hacoctl` into `$(go env GOPATH)/bin`
-and, when npm is available, builds the web console into `~/.haco/web`.
-Make sure that bin folder is on your `PATH`.
+- Join tokens expire after 10 minutes. Get a fresh one any time from
+  **Add node** in the console or with `hacoctl join-token`.
+- After a machine has joined once, restart its agent without a token:
 
-## Quick start
+  ```bash
+  hacoctl agent run
+  ```
 
-**1. Start the control plane** on the machine that will run it:
-
-```bash
-hacoctl start --web
-```
-
-It prints the web console URL (`http://localhost:8099/`) and a one-time
-join command. The control-plane machine joins the cluster as a node by
-itself.
-
-**2. Join the other machines.** On each one, paste the join command
-(get a fresh one any time from **Add node** in the console or
-`hacoctl join-token`; tokens expire after 10 minutes):
-
-```bash
-hacoctl agent join '<token>'
-```
-
-Later restarts need no token:
-
-```bash
-hacoctl agent run
-```
-
-**3. Deploy a Compose project.** From the console's **Deploy** page, or:
-
-```bash
-hacoctl plan myapp ./docker-compose.yml
-```
-
-```bash
-hacoctl deploy myapp ./docker-compose.yml
-```
-
-`plan` is a dry run that shows where each service would go and why.
-`deploy` builds, places and starts everything, then shows live status until
-every service is ready or failed.
+- `hacoctl plan` never changes anything; use it to check placements before
+  a deploy. `hacoctl deploy` shows live status until every service is ready
+  or failed.
 
 ## Everyday commands
 
