@@ -38,6 +38,8 @@ func NewHandler(svc *Service) http.Handler {
 	mux.HandleFunc("POST /v1/admin/nodes/{id}/limits", svc.handleSetNodeLimits)
 	mux.HandleFunc("POST /v1/admin/nodes/{id}/images/remove", svc.handleRemoveNodeImages)
 	mux.HandleFunc("POST /v1/agent/{node}/images-removed", svc.handleImagesRemoved)
+	mux.HandleFunc("POST /v1/admin/nodes/{id}/volumes/remove", svc.handleRemoveVolumes)
+	mux.HandleFunc("POST /v1/agent/{node}/volumes-removed", svc.handleVolumesRemoved)
 	mux.HandleFunc("DELETE /v1/workloads", svc.handleDeleteWorkloads)
 
 	mux.HandleFunc("GET /v1/agent/{node}/assignments", svc.handleAssignments)
@@ -88,6 +90,7 @@ func NewAgentHandler(svc *Service) http.Handler {
 	mux.Handle("GET /v1/agent/{node}/control", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleAgentControl)))
 	mux.Handle("POST /v1/agent/{node}/shutdown-done", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleShutdownDone)))
 	mux.Handle("POST /v1/agent/{node}/images-removed", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleImagesRemoved)))
+	mux.Handle("POST /v1/agent/{node}/volumes-removed", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleVolumesRemoved)))
 	mux.Handle("POST /v1/agent/{node}/rename-commit", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleRenameCommit)))
 	mux.Handle("POST /v1/nodes/{id}/pause", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handlePauseNode)))
 	mux.Handle("GET /v1/services/{project}/{service}", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleListServiceInstances)))

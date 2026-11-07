@@ -21,6 +21,7 @@ type nodeRequests struct {
 	mu      sync.Mutex
 	restart map[string][]string // node -> workload keys
 	images  map[string][]string // node -> image references
+	volumes map[string][]string // node -> workload keys whose volume data to delete
 }
 
 func (q *nodeRequests) add(target *map[string][]string, node string, items ...string) {
@@ -42,13 +43,14 @@ func (q *nodeRequests) add(target *map[string][]string, node string, items ...st
 }
 
 // take hands a node's pending requests to its agent and forgets them.
-func (q *nodeRequests) take(node string) (restart, images []string) {
+func (q *nodeRequests) take(node string) (restart, images, volumes []string) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	restart, images = q.restart[node], q.images[node]
+	restart, images, volumes = q.restart[node], q.images[node], q.volumes[node]
 	delete(q.restart, node)
 	delete(q.images, node)
-	return restart, images
+	delete(q.volumes, node)
+	return restart, images, volumes
 }
 
 func (svc *Service) requests() *nodeRequests { return &svc.nodeReqs }
@@ -142,6 +144,91 @@ func (svc *Service) RemoveNodeImages(ctx context.Context, nodeID string, images 
 	q := svc.requests()
 	q.add(&q.images, nodeID, clean...)
 	return nil
+}
+
+// ErrVolumeInUse is returned when a workload still runs on the node whose
+// volume data would be deleted.
+var ErrVolumeInUse = errors.New("volume is in use")
+
+// RemoveVolumes asks a node's agent to delete the volume data of the given
+// workloads. Refused for a workload that is meant to be running on that
+// node: stop it first. Deleting data on a node it no longer runs on (left
+// behind after a move) is always allowed.
+func (svc *Service) RemoveVolumes(ctx context.Context, nodeID string, keys []string) error {
+	nodes, err := svc.store.ListNodes(ctx)
+	if err != nil {
+		return err
+	}
+	found := false
+	for _, n := range nodes {
+		found = found || n.ID == nodeID
+	}
+	if !found {
+		return fmt.Errorf("%w: node %q", store.ErrNotFound, nodeID)
+	}
+	if len(keys) == 0 {
+		return errors.New("no workloads given")
+	}
+	for _, k := range keys {
+		rec, err := svc.store.GetWorkload(ctx, k)
+		if errors.Is(err, store.ErrNotFound) {
+			continue // record gone; its data may still be on disk
+		}
+		if err != nil {
+			return err
+		}
+		if rec.NodeID == nodeID && rec.Status != model.StatusStopped && rec.Status != model.StatusFailed {
+			return fmt.Errorf("%w: %s is %s on %s; stop it first", ErrVolumeInUse, k, rec.Status, nodeID)
+		}
+	}
+	q := svc.requests()
+	q.add(&q.volumes, nodeID, keys...)
+	return nil
+}
+
+func (svc *Service) handleRemoveVolumes(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Workloads []string `json:"workloads"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	err := svc.RemoveVolumes(r.Context(), r.PathValue("id"), req.Workloads)
+	switch {
+	case err == nil:
+		writeJSON(w, http.StatusAccepted, map[string]any{"status": "requested", "count": len(req.Workloads)})
+	case errors.Is(err, store.ErrNotFound):
+		writeError(w, http.StatusNotFound, err)
+	case errors.Is(err, ErrVolumeInUse):
+		writeError(w, http.StatusConflict, err)
+	default:
+		writeError(w, http.StatusBadRequest, err)
+	}
+}
+
+// handleVolumesRemoved records what a node's agent deleted, as node events.
+func (svc *Service) handleVolumesRemoved(w http.ResponseWriter, r *http.Request) {
+	node := r.PathValue("node")
+	if authenticated := authenticatedNode(r); authenticated != "" && authenticated != node {
+		writeError(w, http.StatusForbidden, fmt.Errorf("credential is not authorized for node %q", node))
+		return
+	}
+	var res struct {
+		Removed []string          `json:"removed"`
+		Failed  map[string]string `json:"failed"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&res); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	for _, k := range res.Removed {
+		svc.store.RecordNodeEvent(r.Context(), node, "volume_removed", "deleted volume data of "+k)
+	}
+	for k, why := range res.Failed {
+		svc.store.RecordNodeEvent(r.Context(), node, "volume_remove_failed", fmt.Sprintf("could not delete volume data of %s: %s", k, why))
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func workloadKeyFrom(r *http.Request) string {

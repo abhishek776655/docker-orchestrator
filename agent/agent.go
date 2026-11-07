@@ -185,6 +185,9 @@ func (a *Agent) Run(ctx context.Context) error {
 				if len(ctl.RemoveImages) > 0 {
 					go a.removeImages(ctx, ctl.RemoveImages)
 				}
+				if len(ctl.RemoveVolumes) > 0 {
+					go a.removeVolumes(ctx, ctl.RemoveVolumes)
+				}
 			}
 		}
 	}()
@@ -236,6 +239,27 @@ type controlResponse struct {
 	Restart []string `json:"restart"`
 	// RemoveImages lists image references to delete from this node.
 	RemoveImages []string `json:"remove_images"`
+	// RemoveVolumes lists workload keys whose volume data to delete here.
+	RemoveVolumes []string `json:"remove_volumes"`
+}
+
+// removeVolumes deletes workloads' volume data on this node and reports it.
+func (a *Agent) removeVolumes(ctx context.Context, keys []string) {
+	res := struct {
+		Removed []string          `json:"removed"`
+		Failed  map[string]string `json:"failed"`
+	}{Failed: map[string]string{}}
+	for _, k := range keys {
+		if err := a.docker.RemoveVolumes(ctx, k); err != nil {
+			res.Failed[k] = err.Error()
+			continue
+		}
+		res.Removed = append(res.Removed, k)
+		log.Printf("deleted volume data of %s", k)
+	}
+	if err := a.post(ctx, "/v1/agent/"+a.cfg.NodeID+"/volumes-removed", res, nil); err != nil {
+		log.Printf("report volume removal: %v", err)
+	}
 }
 
 // restartContainers removes the containers of the given workloads so the

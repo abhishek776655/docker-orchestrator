@@ -23,6 +23,8 @@ export interface ServiceDetail {
   health: HealthView | null
   /** Why it runs where it does: facts the scheduler had to respect. */
   placement: { label: string; value: string; tone: 'hard' | 'soft' }[]
+  persistent: boolean // has node-local volume data
+  dataNode: string // node holding that data, "" when unknown
 }
 
 export interface HealthView {
@@ -114,6 +116,8 @@ export function deriveService(
       .sort((a, b) => a.name.localeCompare(b.name)),
     health: healthView(w.HealthCheck),
     placement: placementFacts(w),
+    persistent: w.Storage?.Class === 'node_local_persistent',
+    dataNode: w.Storage?.Class === 'node_local_persistent' ? w.Storage.PinnedNodeID || w.NodeID : '',
   }
 }
 

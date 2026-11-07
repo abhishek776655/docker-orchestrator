@@ -69,8 +69,11 @@ export function ServicePage() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [revision, setRevision] = useState<string>()
-  const [confirm, setConfirm] = useState<'stop' | 'remove' | 'start' | 'restart' | null>(null)
+  const [confirm, setConfirm] = useState<'stop' | 'remove' | 'start' | 'restart' | 'volume' | null>(null)
   const [follow, setFollow] = useState(false)
+  const [volumeNode, setVolumeNode] = useState('')
+  const [volumeAck, setVolumeAck] = useState(false)
+  const [volumeSent, setVolumeSent] = useState<string | null>(null)
 
   const workloadsQ = useQuery({ queryKey: ['workloads'], queryFn: api.workloads, refetchInterval: 3000 })
   const instancesQ = useQuery({ queryKey: ['instances', name], queryFn: () => api.instances(name), refetchInterval: 3000 })
@@ -100,6 +103,13 @@ export function ServicePage() {
     mutationFn: (action: 'start' | 'restart') => api.workloadAction(name, service, detail!.revision, action),
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ['workloads'] })
+      setConfirm(null)
+    },
+  })
+  const removeVolume = useMutation({
+    mutationFn: (node: string) => api.removeVolumes(node, [`${name}/${service}/${detail!.revision}`]),
+    onSuccess: (_, node) => {
+      setVolumeSent(`Asked ${node} to delete the volume data. The result shows in Events.`)
       setConfirm(null)
     },
   })
@@ -150,6 +160,7 @@ export function ServicePage() {
   }
 
   const stopped = detail.desired === 'stopped'
+  const stoppedHere = detail.status === 'stopped' || detail.status === 'failed'
   // The service's home page from outside: its node's address and first published port.
   const address = detail.instances[0]?.Address ?? nodesAddress(nodesQ.data ?? [], detail.node)
   const homeUrl = address && detail.ports[0] ? `http://${address}:${detail.ports[0].host}/` : ''
@@ -201,6 +212,39 @@ export function ServicePage() {
         {confirm === 'start'
           ? `Runs again on ${detail.node || 'its last node'}, with its data and image still there. No rebuild.`
           : `Its container on ${detail.node} is recreated. No rebuild, no move.`}
+      </ConfirmDialog>
+      <ConfirmDialog
+        open={confirm === 'volume'}
+        onOpenChange={(o) => !o && setConfirm(null)}
+        title={`Delete ${service}'s volume data?`}
+        confirmLabel="Delete data"
+        pending={removeVolume.isPending}
+        error={removeVolume.error?.message ?? null}
+        confirmDisabled={!volumeNode || !volumeAck || (volumeNode === detail.node && !stoppedHere)}
+        onConfirm={() => removeVolume.mutate(volumeNode)}
+      >
+        <div className="flex flex-col gap-3 text-foreground">
+          <label className="flex flex-col gap-1.5 text-[13px]">
+            <span className="text-muted-foreground">On node</span>
+            <select value={volumeNode} onChange={(e) => setVolumeNode(e.target.value)} className="min-h-11 rounded-md border border-zinc-300 bg-card px-2 font-mono text-sm">
+              {(nodesQ.data ?? []).map((n) => (
+                <option key={n.ID} value={n.ID}>
+                  {n.DisplayName || n.ID}{n.ID === detail.dataNode ? ' · holds its data' : ''}{n.ID === detail.node ? ' · runs it' : ''}
+                </option>
+              ))}
+            </select>
+          </label>
+          {volumeNode === detail.node && !stoppedHere && (
+            <p className="m-0 rounded-md bg-warn-soft px-3 py-2 text-[13px] text-warn-fg">It is running on this node. Stop it first.</p>
+          )}
+          <p className="m-0 text-[13px] text-muted-foreground">
+            Every volume of this revision on that node is deleted from disk. It cannot be undone. Next time it starts there, it starts empty.
+          </p>
+          <label className="flex items-start gap-2.5 text-sm">
+            <input type="checkbox" className="mt-0.5 size-4" checked={volumeAck} onChange={(e) => setVolumeAck(e.target.checked)} />
+            <span>I understand this data is gone for good.</span>
+          </label>
+        </div>
       </ConfirmDialog>
       <ConfirmDialog open={confirm === 'remove'} onOpenChange={(o) => !o && setConfirm(null)} title={`Remove ${service} ${detail.revision}?`} confirmLabel="Remove revision" pending={remove.isPending} error={remove.error?.message ?? null} onConfirm={() => remove.mutate()}>
         This deletes the record of this revision from the control plane. Its node removes the container shortly after. It cannot be undone.
@@ -328,6 +372,30 @@ export function ServicePage() {
                 <p className="m-0 text-[13px] text-muted-foreground">Nothing. Any node with room could run it.</p>
               )}
             </div>
+
+            {detail.persistent && (
+              <div className="flex flex-wrap items-center justify-between gap-2 border-t border-muted pt-3.5">
+                <div>
+                  <div className="text-sm font-medium">Volume data</div>
+                  <p className="m-0 text-[13px] text-muted-foreground">
+                    Lives on <span className={mono}>{detail.dataNode || 'an unknown node'}</span>. Old copies can remain on nodes it ran on before.
+                  </p>
+                  {volumeSent && <p role="status" className="m-0 mt-1 text-[13px] text-ok-fg">{volumeSent}</p>}
+                </div>
+                <Button
+                  variant="outline"
+                  className="text-bad-fg"
+                  onClick={() => {
+                    removeVolume.reset()
+                    setVolumeNode(detail.dataNode || detail.node)
+                    setVolumeAck(false)
+                    setConfirm('volume')
+                  }}
+                >
+                  Delete volume data…
+                </Button>
+              </div>
+            )}
 
             <div className="flex flex-col gap-3 border-t border-muted pt-3.5">
               <div className="flex flex-wrap items-center justify-between gap-2">

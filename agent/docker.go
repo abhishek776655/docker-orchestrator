@@ -71,6 +71,27 @@ func (d *Docker) VolumeHostPath(workloadKey, containerPath string) string {
 	return filepath.Join(d.dataDir, sanitize.Replace(workloadKey), sanitize.Replace(containerPath))
 }
 
+// RemoveVolumes deletes every volume directory of one workload on this
+// node. It refuses while a container for that workload exists, running or
+// not, so data is never pulled from under a container.
+func (d *Docker) RemoveVolumes(ctx context.Context, workloadKey string) error {
+	managed, err := d.ManagedContainers(ctx)
+	if err != nil {
+		return err
+	}
+	for _, c := range managed {
+		if c.WorkloadKey == workloadKey {
+			return fmt.Errorf("a container for %s still exists on this node", workloadKey)
+		}
+	}
+	sanitize := strings.NewReplacer("/", "_", ":", "_")
+	dir := filepath.Join(d.dataDir, sanitize.Replace(workloadKey))
+	if filepath.Dir(dir) != filepath.Clean(d.dataDir) {
+		return fmt.Errorf("refusing to delete %s: outside the volume root", dir)
+	}
+	return os.RemoveAll(dir)
+}
+
 // ExtractTar writes a tar stream's contents into dst, creating it if
 // needed — the agent-side half of a directory bind mount's content
 // transfer (VolumeMount.RemoteDirKey): the control plane tars up the

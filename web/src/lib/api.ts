@@ -275,6 +275,11 @@ export const api = {
     const res = await postJson(`/v1/admin/nodes/${encodeURIComponent(id)}/images/remove`, { images })
     if (!res.ok) throw await errorFrom(res)
   },
+  // Deletes workloads' volume data on one node; refused (409) while a workload still runs there.
+  removeVolumes: async (nodeId: string, workloads: string[]): Promise<void> => {
+    const res = await postJson(`/v1/admin/nodes/${encodeURIComponent(nodeId)}/volumes/remove`, { workloads })
+    if (!res.ok) throw await errorFrom(res)
+  },
   // Start runs a stopped workload again on its last node; restart recreates a running one's container.
   workloadAction: async (project: string, service: string, revision: string, action: 'start' | 'restart'): Promise<void> => {
     const path = [project, service, revision].map(encodeURIComponent).join('/')

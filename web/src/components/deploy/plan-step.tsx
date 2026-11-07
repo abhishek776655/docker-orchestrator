@@ -11,7 +11,7 @@ import type { DeployConfig } from '@/lib/deploy-config'
 import { saveDeploy } from '@/lib/saved-deploys'
 import { VolumeRiskDialog } from '@/components/deploy/volume-risk-dialog'
 import { keepVolumePlacements, volumeRisks, type VolumeRisk } from '@/lib/volume-risk'
-import type { ComposeRequest } from '@/lib/api'
+import type { ApiWorkload, ComposeRequest } from '@/lib/api'
 import { buildRequest, derivePlan, liveState, nodesUsed, pinsFor, type LiveState } from '@/lib/plan'
 
 interface Props {
@@ -72,6 +72,11 @@ export function PlanStep({ compose, config, onChange, onBack }: Props) {
   // Where services run now: live status after deploying, and before that,
   // which node holds each stateful service's volume data.
   const workloadsQ = useQuery({ queryKey: ['workloads'], queryFn: api.workloads, refetchInterval: deployed ? 2000 : 10000 })
+  // Volume data locations come from where services ran before this deploy.
+  // After deploying, the live list shows the new placement, which would make
+  // the plan's own choices look like they moved away from their data.
+  const [beforeDeploy, setBeforeDeploy] = useState<ApiWorkload[] | null>(null)
+  const dataSource = deployed ? (beforeDeploy ?? []) : (workloadsQ.data ?? [])
   const [risks, setRisks] = useState<{ list: VolumeRisk[]; req: ComposeRequest } | null>(null)
   const requestFor = (fresh: boolean): ComposeRequest => {
     const req = hasPlacements ? effReq : baseReq
@@ -83,6 +88,7 @@ export function PlanStep({ compose, config, onChange, onBack }: Props) {
     mutationFn: async (fresh: boolean) => {
       const req = requestFor(fresh)
       const [planned, current] = await Promise.all([api.composePlan(req), api.workloads()])
+      setBeforeDeploy(current)
       return { req, list: volumeRisks(planned, current) }
     },
     onSuccess: ({ req, list }) => {
@@ -105,7 +111,7 @@ export function PlanStep({ compose, config, onChange, onBack }: Props) {
   })
 
   const effective = hasPlacements ? (effQ.data ?? null) : null
-  const services = useMemo(() => (base ? derivePlan(base, effective, config, workloadsQ.data ?? []) : []), [base, effective, config, workloadsQ.data])
+  const services = useMemo(() => (base ? derivePlan(base, effective, config, dataSource) : []), [base, effective, config, dataSource])
   const states = useMemo(() => {
     const m = new Map<string, LiveState>()
     if (!deployed) return m
