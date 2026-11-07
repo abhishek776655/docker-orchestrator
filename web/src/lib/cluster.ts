@@ -6,6 +6,9 @@ export type OsKind = 'darwin' | 'linux' | 'windows' | 'unknown'
 
 export interface NodeView {
   id: string
+  name: string // display name, or the ID when none is set
+  limits: { cpu: number; mem: number } // cores / GiB; 0 = no cap
+  detected: { cpu: number; mem: number }
   address: string
   arch: string
   os: OsKind
@@ -61,6 +64,9 @@ export function deriveNodes(nodes: ApiNode[], workloads: ApiWorkload[], now = Da
     const labels = n.Labels ?? {}
     return {
       id: n.ID,
+      name: n.DisplayName || n.ID,
+      limits: { cpu: (n.Limits?.CPUMillis ?? 0) / 1000, mem: (n.Limits?.MemoryBytes ?? 0) / GIB },
+      detected: { cpu: (n.Detected?.CPUMillis ?? n.Allocatable.CPUMillis) / 1000, mem: (n.Detected?.MemoryBytes ?? n.Allocatable.MemoryBytes) / GIB },
       address: n.Address,
       arch: n.Architecture,
       os: parseOs(labels[LABEL_OS]),
@@ -89,8 +95,9 @@ export interface ProjectView {
 
 export function deriveProjects(workloads: ApiWorkload[]): ProjectView[] {
   const byProject = new Map<string, ApiWorkload[]>()
+  // Stopped projects stay listed: they still have records (and pins) that
+  // can block a redeploy, so hiding them leaves nothing to inspect or remove.
   for (const w of workloads) {
-    if (w.DesiredState !== 'running') continue
     byProject.set(w.Project, [...(byProject.get(w.Project) ?? []), w])
   }
   return [...byProject.entries()]

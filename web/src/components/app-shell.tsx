@@ -1,4 +1,5 @@
 import { NavLink, Outlet, useLocation } from 'react-router-dom'
+import { ErrorBoundary } from '@/components/error-boundary'
 import { useQuery } from '@tanstack/react-query'
 import { Activity, Layers, Network, Server, Upload, type LucideIcon } from 'lucide-react'
 import { api } from '@/lib/api'
@@ -65,10 +66,10 @@ const TITLES: Record<string, string> = {
 
 export function AppShell() {
   const { pathname } = useLocation()
-  const title = TITLES[pathname] ?? (pathname.startsWith('/nodes/') ? 'Nodes' : 'haco')
+  const title = TITLES[pathname] ?? (pathname.startsWith('/nodes/') ? 'Nodes' : pathname.startsWith('/projects/') ? 'Projects' : 'haco')
   return (
     <div className="flex min-h-screen flex-wrap items-stretch">
-      <aside className="flex min-w-0 flex-[0_0_256px] flex-col gap-5 border-r border-border bg-card p-3 max-md:flex-[1_1_100%] max-md:border-b max-md:border-r-0">
+      <aside className="flex min-w-0 flex-[0_0_256px] flex-col md:sticky md:top-0 md:h-screen md:self-start md:overflow-y-auto gap-5 border-r border-border bg-card p-3 max-md:flex-[1_1_100%] max-md:border-b max-md:border-r-0">
         <NavLink to="/" className="flex items-center gap-2.5 px-2 py-1.5">
           <span
             aria-hidden="true"
@@ -92,7 +93,9 @@ export function AppShell() {
           Platform <span aria-hidden="true">&nbsp;/&nbsp;</span>
           <span className="font-medium text-foreground">{title}</span>
         </header>
-        <Outlet />
+        <ErrorBoundary resetKey={pathname}>
+          <Outlet />
+        </ErrorBoundary>
       </div>
     </div>
   )

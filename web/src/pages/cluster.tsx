@@ -2,8 +2,7 @@ import { useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { api } from '@/lib/api'
-import { deriveNodes, deriveProjects, eventTone, sinceLabel, statusTone } from '@/lib/cluster'
-import { Badge } from '@/components/ui/badge'
+import { deriveNodes } from '@/lib/cluster'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { AddNodeDialog } from '@/components/add-node-dialog'
@@ -11,18 +10,35 @@ import { Topology } from '@/components/topology/topology'
 
 const POLL_MS = 3000
 
+// "192.168.1.20" -> "192.168.1.0/24". The control plane does not report its
+// subnet, so a /24 around the host is the usual home or lab network.
+function networkLabel(address: string | undefined): string {
+  const m = address?.match(/^(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}$/)
+  return m ? `Network ${m[1]}.0/24` : 'Local network'
+}
+
 export function ClusterPage() {
   const [adding, setAdding] = useState(false)
   const nodesQ = useQuery({ queryKey: ['nodes'], queryFn: api.nodes, refetchInterval: POLL_MS })
   const workloadsQ = useQuery({ queryKey: ['workloads'], queryFn: api.workloads, refetchInterval: POLL_MS })
-  const eventsQ = useQuery({ queryKey: ['events'], queryFn: () => api.events(50), refetchInterval: 5000 })
+  // Discovery reads the host's ARP table. If the control plane is older or
+  // cannot read it, the page simply shows no discovered devices.
+  const discoveredQ = useQuery({ queryKey: ['discovered'], queryFn: api.discovered, refetchInterval: 60000, retry: false })
 
   const nodes = useMemo(() => deriveNodes(nodesQ.data ?? [], workloadsQ.data ?? []), [nodesQ.data, workloadsQ.data])
-  const projects = useMemo(() => deriveProjects(workloadsQ.data ?? []), [workloadsQ.data])
+  const discovered = discoveredQ.data?.devices ?? []
+  // Why the list is empty, when it is fixable: an old control plane (404) or
+  // the OS hiding the network from it (the server's own hint).
+  const discoveryNote = discoveredQ.isError
+    ? discoveredQ.error.message.startsWith('404')
+      ? 'Device discovery needs a newer control plane. Reinstall and restart it.'
+      : `Device discovery failed: ${discoveredQ.error.message}`
+    : discoveredQ.data?.hint
 
   const schedulable = nodes.filter((n) => n.state === 'available' || n.state === 'throttling').length
   const workloads = (workloadsQ.data ?? []).filter((w) => w.DesiredState === 'running')
   const failed = workloads.filter((w) => w.Status === 'failed').length
+  const host = nodes.find((n) => n.isHost) ?? nodes[0]
 
   return (
     <main className="mx-auto flex max-w-[1180px] flex-col gap-6 p-6">
@@ -47,85 +63,33 @@ export function ClusterPage() {
 
       <Card className="overflow-hidden">
         <div className="flex flex-wrap items-center justify-between gap-x-5 gap-y-2 border-b border-border px-4 py-3 text-xs text-muted-foreground">
-          <span className="text-sm font-medium text-foreground">Control plane to agents</span>
+          <span className="text-sm font-medium text-foreground">
+            {networkLabel(host?.address)}
+            {discovered.length > 0 && (
+              <span className="ml-2 text-xs font-normal text-muted-foreground">
+                {discovered.length} {discovered.length === 1 ? 'device' : 'devices'} seen, not joined
+                {discovered.length > 4 && ' (4 shown)'}
+              </span>
+            )}
+          </span>
           <span className="flex flex-wrap items-center gap-x-4 gap-y-1.5">
             <Legend color="bg-ok" label="available" />
             <Legend color="bg-warn" label="throttling" />
             <Legend color="bg-off" label="cordoned" />
             <Legend color="bg-bad" label="no heartbeat" />
+            <span className="flex items-center gap-1.5">
+              <span aria-hidden="true" className="size-2 rounded-full border border-dashed border-off" />
+              discovered, not joined
+            </span>
           </span>
         </div>
-        <Topology nodes={nodes} onAddNode={() => setAdding(true)} />
+        {discoveryNote && (
+          <p role="status" className="m-0 border-b border-border bg-warn-soft px-4 py-2 text-xs text-warn-fg">
+            {discoveryNote}
+          </p>
+        )}
+        <Topology nodes={nodes} discovered={discovered} onAddNode={() => setAdding(true)} />
       </Card>
-
-      <div className="flex flex-wrap items-start gap-6">
-        <section className="flex min-w-0 flex-[999_1_560px] flex-col gap-3">
-          <h2 className="m-0 text-base font-semibold">Projects</h2>
-          <Card className="overflow-x-auto">
-            <table className="w-full min-w-[480px] border-collapse">
-              <thead>
-                <tr className="text-left text-xs text-muted-foreground">
-                  <th className="px-4 py-3 font-medium">Project</th>
-                  <th className="px-4 py-3 font-medium">Services</th>
-                  <th className="px-4 py-3 font-medium">Status</th>
-                  <th className="px-4 py-3 font-medium">Revision</th>
-                </tr>
-              </thead>
-              <tbody>
-                {projects.map((p) => (
-                  <tr key={p.name} className="border-t border-muted">
-                    <td className="px-4 py-3.5 font-mono font-medium">{p.name}</td>
-                    <td className="px-4 py-3.5">{p.services}</td>
-                    <td className="px-4 py-3.5">
-                      <div className="flex flex-wrap gap-1.5">
-                        {p.statusCounts.map((s) => (
-                          <Badge key={s.status} tone={statusTone(s.status)}>
-                            {s.count} {s.status}
-                          </Badge>
-                        ))}
-                      </div>
-                    </td>
-                    <td className="px-4 py-3.5 font-mono">{p.revisions.join(', ')}</td>
-                  </tr>
-                ))}
-                {projects.length === 0 && (
-                  <tr className="border-t border-muted">
-                    <td colSpan={4} className="px-4 py-6 text-center text-muted-foreground">
-                      {workloadsQ.isPending ? 'Loading…' : 'No projects deployed yet.'}
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </Card>
-        </section>
-
-        <section className="flex min-w-0 flex-[1_1_340px] flex-col gap-3">
-          <h2 className="m-0 text-base font-semibold">Recent events</h2>
-          <Card>
-            <ul
-              className="m-0 max-h-[420px] list-none overflow-y-auto p-0 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-primary"
-              tabIndex={0}
-              aria-label="Recent events, scrollable"
-            >
-              {(eventsQ.data ?? []).map((e) => (
-                <li key={e.ID} className="flex flex-col gap-1 border-b border-muted px-4 py-3 last:border-b-0">
-                  <div className="flex items-center gap-2 text-xs">
-                    <Badge tone={eventTone(e)} className="rounded">
-                      {e.Type}
-                    </Badge>
-                    <span className="font-mono text-muted-foreground">{sinceLabel(e.CreatedAt)}</span>
-                  </div>
-                  <span>{e.Message}</span>
-                </li>
-              ))}
-              {(eventsQ.data ?? []).length === 0 && (
-                <li className="px-4 py-6 text-center text-muted-foreground">{eventsQ.isPending ? 'Loading…' : 'No events yet.'}</li>
-              )}
-            </ul>
-          </Card>
-        </section>
-      </div>
 
       <AddNodeDialog open={adding} onOpenChange={setAdding} />
     </main>

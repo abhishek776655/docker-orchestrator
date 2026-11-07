@@ -4,13 +4,17 @@ import { Cpu, Thermometer } from 'lucide-react'
 import { HoverCard, HoverCardContent, HoverCardTrigger } from '@/components/ui/hover-card'
 import { Badge } from '@/components/ui/badge'
 import { OsMonitor } from '@/components/os-monitor'
-import { ControlPlaneOnlyDetail, NodeDetail } from '@/components/topology/node-detail'
+import { ControlPlaneOnlyDetail, DiscoveredDetail, NodeDetail } from '@/components/topology/node-detail'
+import type { Discovered } from '@/lib/api'
 import { STATE_LABEL, ageLabel, stateTone, type NodeState, type NodeView } from '@/lib/cluster'
 import { cn } from '@/lib/utils'
 
 const AGENT = { w: 176, h: 140 }
 const HOST = { w: 216, h: 176 }
+const DEVICE = { w: 148, h: 96 }
 const HEIGHT = 640
+const CORNER_PAD = 24
+const MAX_CORNER_DEVICES = 4
 // Below this width the ring cannot keep a readable gap between the host and
 // the side cards, so nodes stack as a list instead.
 const COMPACT_BELOW = 780
@@ -34,6 +38,7 @@ const EDGE: Record<NodeState, { stroke: string; dash?: string }> = {
 
 interface Props {
   nodes: NodeView[]
+  discovered: Discovered[]
   onAddNode: () => void
 }
 
@@ -45,7 +50,7 @@ function NodeCard({ node, host = false, style, className }: { node: NodeView; ho
     <HoverCard openDelay={60} closeDelay={80}>
       <HoverCardTrigger asChild>
         <Link
-          to={host ? '/deploy' : `/nodes/${node.id}`}
+          to={host ? '/deploy' : `/nodes/${encodeURIComponent(node.id)}`}
           style={style}
           className={cn(
             'flex flex-col items-center justify-center gap-1.5 rounded-xl border p-2.5 text-center no-underline outline-none transition-shadow',
@@ -56,7 +61,7 @@ function NodeCard({ node, host = false, style, className }: { node: NodeView; ho
         >
           <OsMonitor os={node.os} tone={host ? 'inverse' : 'default'} size={host ? 64 : 52} dim={node.state === 'cordoned'} />
           {host && <span className="text-[11px] font-medium uppercase tracking-wider text-zinc-400">Host · control plane</span>}
-          <span className="max-w-full truncate font-mono text-[13px] font-medium">{node.id}</span>
+          <span className="max-w-full truncate font-mono text-[13px] font-medium">{node.name}</span>
           <span className="flex flex-wrap items-center justify-center gap-1.5">
             <Badge tone={stateTone(node.state)}>● {STATE_LABEL[node.state]}</Badge>
             {showThermal && (
@@ -118,7 +123,35 @@ function AddCard({ onClick, style, className }: { onClick: () => void; style?: C
   )
 }
 
-export function Topology({ nodes, onAddNode }: Props) {
+// A machine seen on the network that has not joined: dashed and faded, with
+// no line to the host.
+function DiscoveredCard({ device, onClick, style, className }: { device: Discovered; onClick: () => void; style?: CSSProperties; className?: string }) {
+  const name = device.hostname || device.address
+  return (
+    <HoverCard openDelay={60} closeDelay={80}>
+      <HoverCardTrigger asChild>
+        <button
+          type="button"
+          onClick={onClick}
+          style={style}
+          className={cn(
+            'flex flex-col items-center justify-center gap-1 rounded-xl border border-dashed border-zinc-400 bg-white/60 p-1.5 text-center text-muted-foreground outline-none hover:ring-2 hover:ring-primary focus-visible:ring-2 focus-visible:ring-primary',
+            className,
+          )}
+        >
+          <OsMonitor os="unknown" tone="muted" size={42} />
+          <span className="max-w-full truncate font-mono text-xs font-medium text-foreground">{name}</span>
+          {device.hostname && <span className="text-[11px]">{device.address}</span>}
+        </button>
+      </HoverCardTrigger>
+      <HoverCardContent>
+        <DiscoveredDetail device={device} />
+      </HoverCardContent>
+    </HoverCard>
+  )
+}
+
+export function Topology({ nodes, discovered, onAddNode }: Props) {
   const ref = useRef<HTMLDivElement>(null)
   const [width, setWidth] = useState(0)
 
@@ -143,6 +176,9 @@ export function Topology({ nodes, onAddNode }: Props) {
         {slots.map((slot) =>
           slot.kind === 'node' ? <NodeCard key={slot.node.id} node={slot.node} className="w-full" /> : <AddCard key="add" onClick={onAddNode} className="w-full" />,
         )}
+        {discovered.map((d) => (
+          <DiscoveredCard key={d.address} device={d} onClick={onAddNode} className="w-full" style={{ minHeight: DEVICE.h }} />
+        ))}
       </div>
     )
   }
@@ -155,6 +191,13 @@ export function Topology({ nodes, onAddNode }: Props) {
     const angle = -Math.PI / 2 + (2 * Math.PI * i) / slots.length
     return { slot, x: cx + rx * Math.cos(angle), y: cy + ry * Math.sin(angle) }
   })
+  const corners = [
+    { left: CORNER_PAD, top: CORNER_PAD },
+    { left: width - CORNER_PAD - DEVICE.w, top: CORNER_PAD },
+    { left: CORNER_PAD, top: HEIGHT - CORNER_PAD - DEVICE.h },
+    { left: width - CORNER_PAD - DEVICE.w, top: HEIGHT - CORNER_PAD - DEVICE.h },
+  ]
+  const shown = discovered.slice(0, MAX_CORNER_DEVICES)
 
   return (
     <div ref={ref} className="dot-grid relative overflow-hidden" style={{ height: HEIGHT }}>
@@ -200,6 +243,14 @@ export function Topology({ nodes, onAddNode }: Props) {
             const style: CSSProperties = { position: 'absolute', left: x - AGENT.w / 2, top: y - AGENT.h / 2, width: AGENT.w, height: AGENT.h }
             return slot.kind === 'node' ? <NodeCard key={slot.node.id} node={slot.node} style={style} /> : <AddCard key="add" onClick={onAddNode} style={style} />
           })}
+          {shown.map((d, i) => (
+            <DiscoveredCard
+              key={d.address}
+              device={d}
+              onClick={onAddNode}
+              style={{ position: 'absolute', left: corners[i].left, top: corners[i].top, width: DEVICE.w, height: DEVICE.h }}
+            />
+          ))}
         </>
       )}
     </div>

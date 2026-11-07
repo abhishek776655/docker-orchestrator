@@ -1,0 +1,157 @@
+import { describe, expect, it } from 'vitest'
+import type { Decision, PlanResponse, PlanWorkload } from './api'
+import { defaultConfig, type DeployConfig } from './deploy-config'
+import { parse } from 'yaml'
+import { buildRequest, derivePlan, liveState, nodesUsed, pinsFor, pruneToScope, requestLabel, stagesOf } from './plan'
+
+function wl(service: string, over: Partial<PlanWorkload> = {}): PlanWorkload {
+  return {
+    Project: 'shop', Service: service, Revision: 'latest', Image: `${service}:1`,
+    Resources: { CPUMillis: 500, MemoryBytes: 2 * 1024 ** 3 },
+    Constraints: { HostPorts: null, GPU: { Required: false, Vendor: '', VRAMBytes: 0 }, PinnedNodeID: '' },
+    PortBindings: null, Storage: { Class: 'ephemeral', PinnedNodeID: '' },
+    DependsOn: null, DependsOnHealthy: null,
+    ...over,
+  }
+}
+
+function dec(service: string, selected: string, others: string[] = []): Decision {
+  const score = (id: string, total: number) => ({ NodeID: id, CPUFit: total, MemoryFit: total, ThermalFit: 1, CacheFit: 0, Total: total })
+  return {
+    WorkloadKey: `shop/${service}/latest`, Candidates: [selected, ...others], Selected: selected, Warnings: null,
+    Scores: [score(selected, 0.8), ...others.map((o, i) => score(o, 0.6 - i * 0.1))],
+    Rejections: [{ NodeID: 'nuc-old', Reason: 'node nuc-old is disabled' }],
+  }
+}
+
+const base: PlanResponse = {
+  plan: {
+    project: 'shop',
+    workloads: [wl('db'), wl('api', { DependsOn: ['db'], DependsOnHealthy: ['db'] }), wl('web', { DependsOn: ['api'] })],
+    builds: [{ Service: 'api', Context: './api' }],
+    networking: { mode: 'lan', supported: true },
+    warnings: null, rejections: null,
+  },
+  decisions: [dec('db', 'mbp-m3', ['gpu-box']), dec('api', 'mbp-m3', ['gpu-box']), dec('web', 'mbp-m3')],
+}
+
+describe('buildRequest', () => {
+  const config: DeployConfig = { ...defaultConfig({ services: [], details: [], builds: 0, gpu: 0, volumes: 0, ports: 0, dependencies: 0 }), project: 'shop', workingDir: ' /srv/shop ' }
+
+  it('maps the configuration onto the compose request', () => {
+    const r = buildRequest('services: {}', { ...config, hostServices: ['db'], scope: 'one', onlyService: 'web', noCache: true, fresh: true }, false)
+    expect(r).toMatchObject({ project: 'shop', working_dir: '/srv/shop', no_cache: true, only_service: 'web', pin_host: ['db'], pin_nodes: {}, fresh: true })
+  })
+
+  it('sends no host pin when nothing is kept on the host', () => {
+    expect(buildRequest('y', config, false).pin_host).toBeNull()
+    expect(buildRequest('y', config, false).only_service).toBe('')
+  })
+
+  it('groups placement changes by node, only when asked', () => {
+    const c = { ...config, placements: { api: 'gpu-box', web: 'gpu-box', db: 'jetson-orin' } }
+    expect(buildRequest('y', c, true).pin_nodes).toEqual({ 'gpu-box': ['api', 'web'], 'jetson-orin': ['db'] })
+    expect(buildRequest('y', c, false).pin_nodes).toEqual({})
+  })
+})
+
+describe('pruneToScope', () => {
+  const file = `services:
+  db: { image: pg }
+  api: { image: api, depends_on: [db] }
+  dbt:
+    build: ./dbt
+    env_file: ./dbt/.env
+`
+  const config = { ...defaultConfig({ services: [], details: [], builds: 0, gpu: 0, volumes: 0, ports: 0, dependencies: 0 }), project: 'shop' }
+
+  it('keeps the whole file when everything is in scope', () => {
+    expect(pruneToScope(file, config)).toBe(file)
+  })
+
+  it('drops services outside the chosen one and its dependencies', () => {
+    const out = parse(pruneToScope(file, { ...config, scope: 'one', onlyService: 'api' }))
+    expect(Object.keys(out.services)).toEqual(['db', 'api'])
+  })
+
+  it('leaves text it cannot read alone', () => {
+    expect(pruneToScope('not: [valid', { ...config, scope: 'one', onlyService: 'api' })).toBe('not: [valid')
+  })
+
+  it('is what the request carries', () => {
+    const r = buildRequest(file, { ...config, scope: 'one', onlyService: 'db' }, false)
+    expect(Object.keys(parse(r.yaml).services)).toEqual(['db'])
+    expect(r.only_service).toBe('db')
+  })
+})
+
+describe('stagesOf', () => {
+  it('numbers services by their longest dependency chain', () => {
+    const s = stagesOf(base.plan.workloads!)
+    expect([s.get('db'), s.get('api'), s.get('web')]).toEqual([0, 1, 2])
+  })
+
+  it('does not loop on a cycle', () => {
+    const s = stagesOf([wl('a', { DependsOn: ['b'] }), wl('b', { DependsOn: ['a'] })])
+    expect(s.size).toBe(2)
+  })
+})
+
+describe('derivePlan', () => {
+  const config = defaultConfig({ services: [], details: [], builds: 0, gpu: 0, volumes: 0, ports: 0, dependencies: 0 })
+
+  it('describes each service from the unaided plan when nothing changed', () => {
+    const rows = derivePlan(base, null, config)
+    const api = rows.find((r) => r.name === 'api')!
+    expect(api).toMatchObject({ source: 'build ./api', build: true, stage: 1, node: 'mbp-m3', pickNode: 'mbp-m3', changed: false, cpuCores: 0.5, memGiB: 2 })
+    expect(api.deps).toEqual([{ name: 'db', healthy: true }])
+    expect(api.candidates.map((c) => [c.node, c.outcome, c.isPick])).toEqual([
+      ['mbp-m3', 'selected', true],
+      ['gpu-box', 'eligible', false],
+      ['nuc-old', 'rejected', false],
+    ])
+  })
+
+  it('shows the changed node as selected and keeps the scheduler pick marked', () => {
+    const moved: PlanResponse = { ...base, decisions: [dec('db', 'mbp-m3'), dec('api', 'gpu-box'), dec('web', 'mbp-m3')] }
+    const api = derivePlan(base, moved, config).find((r) => r.name === 'api')!
+    expect(api).toMatchObject({ node: 'gpu-box', pickNode: 'mbp-m3', changed: true })
+    expect(api.candidates.find((c) => c.isPick)!.node).toBe('mbp-m3')
+    expect(api.candidates.find((c) => c.outcome === 'selected')!.node).toBe('gpu-box')
+    expect(nodesUsed(derivePlan(base, moved, config))).toBe(2)
+  })
+})
+
+describe('pinsFor', () => {
+  const config = defaultConfig({ services: [], details: [], builds: 0, gpu: 0, volumes: 0, ports: 0, dependencies: 0 })
+
+  it('pins every other service to its shown node so only the user change moves', () => {
+    expect(pinsFor(base, { ...config, placements: { api: 'gpu-box' } })).toEqual({ db: 'mbp-m3', api: 'gpu-box', web: 'mbp-m3' })
+  })
+
+  it('leaves services kept on the host to pin_host', () => {
+    expect(pinsFor(base, { ...config, hostServices: ['db'], placements: { api: 'gpu-box' } })).toEqual({ api: 'gpu-box', web: 'mbp-m3' })
+  })
+})
+
+describe('requestLabel', () => {
+  it('says so when no memory is requested', () => {
+    expect(requestLabel({ cpuCores: 0.25, memGiB: 0 })).toBe('0.3 cores · no memory request')
+  })
+
+  it('shows small memory in MiB and large in GiB', () => {
+    expect(requestLabel({ cpuCores: 0.25, memGiB: 0.125 })).toBe('0.3 cores · 128 MiB')
+    expect(requestLabel({ cpuCores: 2.4, memGiB: 3 })).toBe('2.4 cores · 3.0 GiB')
+  })
+})
+
+describe('liveState', () => {
+  it('collapses workload statuses', () => {
+    expect(liveState(undefined)).toBe('planned')
+    expect(liveState('ready')).toBe('ready')
+    expect(liveState('building')).toBe('progress')
+    expect(liveState('running')).toBe('progress')
+    expect(liveState('waiting_dependencies')).toBe('waiting')
+    expect(liveState('failed')).toBe('failed')
+  })
+})

@@ -1,4 +1,5 @@
 import { Badge } from '@/components/ui/badge'
+import type { Discovered } from '@/lib/api'
 import {
   OS_LABEL,
   STATE_LABEL,
@@ -59,7 +60,7 @@ export function NodeDetail({ node, host }: { node: NodeView; host: boolean }) {
         <span className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
           {host ? 'Host · control plane' : 'Agent node'}
         </span>
-        <span className="font-mono text-[15px] font-medium">{node.id}</span>
+        <span className="font-mono text-[15px] font-medium">{node.name}</span>
         <span className="text-xs text-muted-foreground">
           {node.address} · {OS_LABEL[node.os]} · {node.arch}
         </span>
@@ -79,6 +80,30 @@ export function NodeDetail({ node, host }: { node: NodeView; host: boolean }) {
         <Row label="Workloads" value={workloadSummary} />
       </dl>
       <span className="text-xs font-medium text-ok">{host ? 'Click to start a deploy' : 'Click to open node page'}</span>
+    </div>
+  )
+}
+
+export function DiscoveredDetail({ device }: { device: Discovered }) {
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex flex-col gap-1">
+        <span className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">Discovered on the network</span>
+        <span className="font-mono text-[15px] font-medium">{device.hostname || device.address}</span>
+        <span className="text-xs text-muted-foreground">
+          {device.address}
+          {device.mac && ` · ${device.mac}`}
+        </span>
+        <div className="mt-0.5">
+          <Badge tone="off">not joined</Badge>
+        </div>
+      </div>
+      <dl className="m-0 flex flex-col">
+        <Row label="Seen" value="Answered a probe on this network" />
+        <Row label="Agent" value="Not installed" />
+        <Row label="Connection" value="None to the control plane" />
+      </dl>
+      <span className="text-xs font-medium text-ok">Click to issue a join token</span>
     </div>
   )
 }
