@@ -278,7 +278,13 @@ func recommendOverlay(networking *NetworkRecommendation, reason string) {
 
 func convertService(project, workingDir, name string, svc types.ServiceConfig, buildContexts []string, sharedBindDirs map[string]bool) (model.Workload, *BuildSpec, []string, []string) {
 	var warnings, rejections []string
-	buildPlatform := "linux/amd64"
+	// No platform: build for the architecture of whichever node builds it,
+	// as `docker compose build` would. Each node builds its own image, so
+	// forcing amd64 only made arm64 nodes build and then run an emulated
+	// image. An explicit platform: (e.g. for x86-only drivers) still wins.
+	// (Registry builds, where one image must run everywhere, pin this in
+	// controlplane.resolveBuilds.)
+	buildPlatform := ""
 	if _, ok := platformArch(svc.Platform); ok {
 		buildPlatform = svc.Platform
 	}

@@ -72,3 +72,30 @@ func TestResolveBuildsBuildIDStableUnlessNoCache(t *testing.T) {
 		t.Fatal("build ID unchanged after a source edit; the node would keep the stale image")
 	}
 }
+
+func TestRequireArchitectureOnlyFillsUnsetConstraint(t *testing.T) {
+	plan := &compose.Plan{Workloads: []model.Workload{
+		{Service: "native"},
+		{Service: "pinned", Constraints: model.Constraints{Architecture: "amd64"}},
+	}}
+	requireArchitecture(plan, "native", "arm64")
+	requireArchitecture(plan, "pinned", "arm64")
+	if got := plan.Workloads[0].Constraints.Architecture; got != "arm64" {
+		t.Fatalf("native = %q, want arm64 so it only lands where the central image runs", got)
+	}
+	if got := plan.Workloads[1].Constraints.Architecture; got != "amd64" {
+		t.Fatalf("an explicit platform must not be overridden, got %q", got)
+	}
+}
+
+func TestRemoteBuildWithoutPlatformBuildsNative(t *testing.T) {
+	plan := remoteBuildPlan(t, nil)
+	svc := &Service{}
+	_, remote, err := svc.resolveBuilds(context.Background(), "demo", plan, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := remote["api"].Platform; p != "" {
+		t.Fatalf("platform = %q, want empty so the building node uses its own architecture", p)
+	}
+}

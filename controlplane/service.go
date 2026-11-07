@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -353,6 +354,13 @@ func (svc *Service) resolveBuilds(ctx context.Context, project string, plan *com
 			if svc.builder == nil {
 				return images, remote, fmt.Errorf("service %s requires a build but no builder is configured", b.Service)
 			}
+			if b.Platform == "" {
+				// One central image is pulled by every node, so it can't be
+				// "native" to each of them: build it for this machine and
+				// only place the service on nodes that can run that.
+				b.Platform = "linux/" + runtime.GOARCH
+				requireArchitecture(plan, b.Service, runtime.GOARCH)
+			}
 			ref, err := svc.builder.Build(ctx, project, "latest", b, noCache)
 			if err != nil {
 				return images, remote, fmt.Errorf("build %s: %w", b.Service, err)
@@ -393,6 +401,15 @@ func (svc *Service) resolveBuilds(ctx context.Context, project string, plan *com
 		svc.stashBuildSSH(wl.Key(), sshKeys)
 	}
 	return images, remote, nil
+}
+
+// requireArchitecture restricts a service to nodes able to run arch.
+func requireArchitecture(plan *compose.Plan, service, arch string) {
+	for i := range plan.Workloads {
+		if plan.Workloads[i].Service == service && plan.Workloads[i].Constraints.Architecture == "" {
+			plan.Workloads[i].Constraints.Architecture = arch
+		}
+	}
 }
 
 // resolveBuildSSHKeys loads the private key behind each build.ssh entry:

@@ -144,10 +144,9 @@ services:
 }
 
 func TestComposeBuildDefaultsPlatformWithNoArchitectureConstraint(t *testing.T) {
-	// No explicit platform: the build itself still defaults to linux/amd64
-	// (docker build's own default), but no hard Architecture constraint is
-	// placed on the workload — it should schedule onto whatever node is
-	// available (e.g. an arm64-only fleet), not just an amd64 one.
+	// No explicit platform: no build platform either, so whichever node
+	// builds it builds for its own architecture (as docker compose does),
+	// and no hard Architecture constraint is placed on the workload.
 	plan, err := compose.Load(context.Background(), "demo", "/tmp", []byte(`
 services:
   app:
@@ -156,7 +155,7 @@ services:
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	assertBuildPlatform(t, plan, "linux/amd64", "")
+	assertBuildPlatform(t, plan, "", "")
 }
 
 func TestComposeBuildUsesExplicitPlatform(t *testing.T) {
