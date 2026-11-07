@@ -507,3 +507,32 @@ func TestPortConflictWithinOneBatchNamesEarlierService(t *testing.T) {
 		t.Fatalf("reason = %q, want it to name %s", reason, first.Key())
 	}
 }
+
+func TestForcedPlacementOverridesRejection(t *testing.T) {
+	small := node("small", "amd64", 100, 1<<30)
+	big := node("big", "amd64", 8000, 16<<30)
+	s := scheduler.New([]model.Node{small, big})
+	w := testdata.SmallWorkload("p", "api")
+	w.Resources.CPUMillis = 2000
+	w.Constraints.PinnedNodeID = "small"
+
+	if _, err := s.Schedule(w); err == nil {
+		t.Fatal("unforced: want a rejection, small has too little CPU")
+	}
+	w.Constraints.Forced = true
+	d, err := s.Schedule(w)
+	if err != nil {
+		t.Fatalf("forced: %v", err)
+	}
+	if d.Selected != "small" {
+		t.Fatalf("selected %s, want small", d.Selected)
+	}
+	if len(d.Warnings) != 1 || !strings.Contains(d.Warnings[0], "despite: insufficient allocatable CPU") {
+		t.Fatalf("warnings = %v", d.Warnings)
+	}
+
+	w.Constraints.PinnedNodeID = "missing"
+	if _, err := s.Schedule(w); err == nil {
+		t.Fatal("forcing onto an unknown node must fail")
+	}
+}

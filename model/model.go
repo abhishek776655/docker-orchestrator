@@ -164,6 +164,11 @@ type Constraints struct {
 	// persistent-volume data locality and participates in the fresh-volume
 	// reschedule waiver). Empty means no affinity.
 	PinnedNodeID string
+	// Forced means an operator chose PinnedNodeID knowingly: the scheduler
+	// places the workload there even when a hard filter would reject the
+	// node, and records the rejection as a warning instead. Not persisted;
+	// it applies to the deploy that asked for it.
+	Forced bool `json:"-"`
 }
 
 // Workload is a normalized placement request (SRS 12.1).

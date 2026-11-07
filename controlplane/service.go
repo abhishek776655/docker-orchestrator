@@ -81,7 +81,7 @@ func (svc *Service) WithJoinManager(m *JoinManager) *Service {
 // anything (SRS UC-02, FR-023), and dry-run schedules every workload
 // against current node/reservation state so the plan shows where each
 // service would land without persisting or starting anything.
-func (svc *Service) ComposePlan(ctx context.Context, project, workingDir string, yaml []byte, onlyService string, pinHost *[]string, pinNodes map[string][]string, fresh bool) (*compose.Plan, []*model.Decision, error) {
+func (svc *Service) ComposePlan(ctx context.Context, project, workingDir string, yaml []byte, onlyService string, pinHost *[]string, pinNodes map[string][]string, fresh bool, force []string) (*compose.Plan, []*model.Decision, error) {
 	plan, err := compose.Load(ctx, project, workingDir, yaml)
 	if err != nil {
 		return nil, nil, err
@@ -89,6 +89,7 @@ func (svc *Service) ComposePlan(ctx context.Context, project, workingDir string,
 	if pins, ok := compose.MergePinOverride(pinHost, pinNodes); ok {
 		compose.ApplyPinOverride(plan, pins)
 	}
+	compose.MarkForced(plan, force)
 	if onlyService != "" {
 		plan, err = filterToClosure(plan, onlyService)
 		if err != nil {
@@ -253,6 +254,9 @@ type DeployOptions struct {
 	// PinNodes pins each named service to an explicit node ID, for pinning
 	// something to a worker node rather than the control-plane host.
 	PinNodes map[string][]string
+	// Force lists services whose PinNodes placement overrides the
+	// scheduler's hard filters (see model.Constraints.Forced).
+	Force []string
 	// Fresh, when true, skips reusing any currently-unpinned service's
 	// existing stored pin — the scheduler re-picks a node for it from
 	// scratch, abandoning whatever data lives on its current node. Has no
@@ -273,6 +277,7 @@ func (svc *Service) ComposeDeploy(ctx context.Context, project, workingDir strin
 	if pins, ok := compose.MergePinOverride(opts.PinHost, opts.PinNodes); ok {
 		compose.ApplyPinOverride(plan, pins)
 	}
+	compose.MarkForced(plan, opts.Force)
 	if opts.OnlyService != "" {
 		plan, err = filterToClosure(plan, opts.OnlyService)
 		if err != nil {

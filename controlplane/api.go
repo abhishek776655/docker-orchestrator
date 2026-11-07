@@ -533,6 +533,9 @@ type composeRequest struct {
 	// exactly what /v1/compose/deploy --fresh would actually do, instead
 	// of showing the existing-pin reuse a plain deploy would use.
 	Fresh bool `json:"fresh"`
+	// Force lists services whose pin_nodes placement must be used even on
+	// a node the scheduler rejects; the rejection becomes a warning.
+	Force []string `json:"force"`
 }
 
 func (svc *Service) handleComposePlan(w http.ResponseWriter, r *http.Request) {
@@ -541,7 +544,7 @@ func (svc *Service) handleComposePlan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	plan, decisions, err := svc.ComposePlan(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), req.OnlyService, req.PinHost, req.PinNodes, req.Fresh)
+	plan, decisions, err := svc.ComposePlan(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), req.OnlyService, req.PinHost, req.PinNodes, req.Fresh, req.Force)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -577,7 +580,7 @@ func (svc *Service) handleComposeDeploy(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	plan, results, err := svc.ComposeDeploy(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), DeployOptions{NoCache: req.NoCache, OnlyService: req.OnlyService, PinHost: req.PinHost, PinNodes: req.PinNodes, Fresh: req.Fresh})
+	plan, results, err := svc.ComposeDeploy(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), DeployOptions{NoCache: req.NoCache, OnlyService: req.OnlyService, PinHost: req.PinHost, PinNodes: req.PinNodes, Fresh: req.Fresh, Force: req.Force})
 	if err != nil {
 		status := http.StatusInternalServerError
 		if plan != nil && !plan.CanDeploy() {

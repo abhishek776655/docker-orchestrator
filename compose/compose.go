@@ -840,6 +840,25 @@ func ApplyPinOverride(plan *Plan, pins map[string][]string) {
 	}
 }
 
+// MarkForced flags the named services' pinned placements as forced, so the
+// scheduler honors them even on a node it would reject. A service with no
+// pin is left alone: forcing means "this node", and there is none.
+func MarkForced(plan *Plan, services []string) {
+	if len(services) == 0 {
+		return
+	}
+	want := map[string]bool{}
+	for _, s := range services {
+		want[strings.TrimSpace(s)] = true
+	}
+	for i := range plan.Workloads {
+		wl := &plan.Workloads[i]
+		if want[wl.Service] && wl.Constraints.PinnedNodeID != "" {
+			wl.Constraints.Forced = true
+		}
+	}
+}
+
 // MergePinOverride combines `--pin-host`'s service list (pinned to this
 // control-plane host) with `--pin-node`'s explicit node assignments into
 // the single map ApplyPinOverride expects, resolving "this host" to its

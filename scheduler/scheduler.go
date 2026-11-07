@@ -111,6 +111,23 @@ func (s *Scheduler) Schedule(w model.Workload) (*model.Decision, error) {
 		}
 	}
 
+	// An operator's forced placement: use the pinned node whatever the
+	// filters say, and keep their verdict as a warning.
+	if w.Constraints.Forced && w.Constraints.PinnedNodeID != "" {
+		ns, ok := s.nodes[w.Constraints.PinnedNodeID]
+		if !ok {
+			return decision, fmt.Errorf("forced placement for %s: node %q is not known", w.Key(), w.Constraints.PinnedNodeID)
+		}
+		if reason, rejected := s.reject(ns, w); rejected {
+			decision.Warnings = append(decision.Warnings, fmt.Sprintf("placed on %s by operator despite: %s", ns.node.ID, reason))
+		}
+		decision.Candidates = []string{ns.node.ID}
+		decision.Scores = []model.ScoreFactors{s.score(ns, w)}
+		decision.Selected = ns.node.ID
+		s.reserve(ns, w)
+		return decision, nil
+	}
+
 	var eligible []*nodeState
 	for _, id := range s.order {
 		ns := s.nodes[id]
