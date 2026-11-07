@@ -6,6 +6,8 @@ import { SplitButton } from '@/components/split-button'
 import { summarizeCompose } from '@/lib/compose-summary'
 import { defaultConfig } from '@/lib/deploy-config'
 import { buildRequest } from '@/lib/plan'
+import { VolumeRiskDialog } from '@/components/deploy/volume-risk-dialog'
+import { keepVolumePlacements, volumeRisks, type VolumeRisk } from '@/lib/volume-risk'
 import { DependencyGraph } from '@/components/deploy/dependency-graph'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -45,16 +47,36 @@ export function ProjectPage() {
   // Redeploy straight from the Compose file and settings this browser saved
   // at the last deploy. Normal keeps services where they run; fresh lets the
   // scheduler place them again.
+  // pins: extra service -> node placements (from "Replan keeping volumes").
+  // force: deploy even though services would start on empty volumes.
+  type RedeployInput = { fresh: boolean; pins?: Record<string, string>; force?: boolean }
+  const [risks, setRisks] = useState<{ list: VolumeRisk[]; input: RedeployInput } | null>(null)
   const redeploy = useMutation({
-    mutationFn: async (fresh: boolean) => {
+    mutationFn: async (input: RedeployInput): Promise<VolumeRisk[]> => {
       const saved = loadDeploy(name)
       if (!saved) throw new Error('No saved Compose file for this project. Use Edit configuration to upload it.')
       const parsed = summarizeCompose(saved.file.text)
       if (!parsed.ok) throw new Error(parsed.error)
-      const config = { ...defaultConfig(parsed.summary), ...saved.config, ...(fresh ? { fresh: true, placements: {} } : { fresh: false }) }
-      await api.composeDeploy(buildRequest(saved.file.text, config, !fresh))
+      const base = { ...defaultConfig(parsed.summary), ...saved.config }
+      const config = { ...base, fresh: input.fresh, placements: { ...(input.fresh ? {} : base.placements), ...input.pins } }
+      const req = buildRequest(saved.file.text, config, true)
+      if (!input.force) {
+        const [planned, current] = await Promise.all([api.composePlan(req), api.workloads()])
+        const list = volumeRisks(planned, current)
+        if (list.length) return list
+      }
+      await api.composeDeploy(req)
+      return []
     },
-    onSuccess: (_, fresh) => done(fresh ? 'Fresh redeploy submitted. Services are being placed again.' : 'Redeploy submitted. Services update on the nodes they run on.'),
+    onSuccess: (list, input) => {
+      if (list.length) {
+        setConfirm(null)
+        setRisks({ list, input })
+        return
+      }
+      setRisks(null)
+      done(input.fresh ? 'Fresh redeploy submitted. Services are being placed again.' : 'Redeploy submitted. Services update on the nodes they run on.')
+    },
   })
   // Start or restart every matching service; one failure does not stop the rest.
   const bulk = useMutation({
@@ -191,11 +213,21 @@ export function ProjectPage() {
       >
         Containers are stopped and removed. The services stay listed as stopped; Start brings them back on the same nodes.
       </ConfirmDialog>
-      <ConfirmDialog open={confirm === 'redeploy' || confirm === 'fresh'} onOpenChange={(o) => !o && setConfirm(null)} danger={confirm === 'fresh'} title={confirm === 'fresh' ? `Redeploy ${project.name} fresh?` : `Redeploy ${project.name}?`} confirmLabel={confirm === 'fresh' ? 'Redeploy fresh' : 'Redeploy'} pending={redeploy.isPending} error={redeploy.error?.message ?? null} onConfirm={() => redeploy.mutate(confirm === 'fresh')}>
+      <ConfirmDialog open={confirm === 'redeploy' || confirm === 'fresh'} onOpenChange={(o) => !o && setConfirm(null)} danger={confirm === 'fresh'} title={confirm === 'fresh' ? `Redeploy ${project.name} fresh?` : `Redeploy ${project.name}?`} confirmLabel={confirm === 'fresh' ? 'Redeploy fresh' : 'Redeploy'} pending={redeploy.isPending} error={redeploy.error?.message ?? null} onConfirm={() => redeploy.mutate({ fresh: confirm === 'fresh' })}>
         {confirm === 'fresh'
           ? 'Every service is placed again from scratch and may move to another node. A service with a volume that moves starts with an empty volume.'
           : `Deploys ${saved?.file.name ?? 'the saved Compose file'} again with its saved settings. Services stay on the nodes they run on; images build again as in any deploy.`}
       </ConfirmDialog>
+      <VolumeRiskDialog
+        risks={risks?.list ?? []}
+        open={!!risks}
+        onOpenChange={(o) => !o && setRisks(null)}
+        pending={redeploy.isPending}
+        error={risks ? (redeploy.error?.message ?? null) : null}
+        onReplan={() => redeploy.mutate({ ...risks!.input, pins: keepVolumePlacements(risks!.list, risks!.input.pins ?? {}) })}
+        onDeployAnyway={() => redeploy.mutate({ ...risks!.input, force: true })}
+        replanLabel="Keep volumes and redeploy"
+      />
       <ConfirmDialog open={confirm === 'start' || confirm === 'restart'} onOpenChange={(o) => !o && setConfirm(null)} danger={false} title={confirm === 'start' ? `Start ${stoppedCount} stopped ${stoppedCount === 1 ? 'service' : 'services'}?` : `Restart all services in ${project.name}?`} confirmLabel={confirm === 'start' ? 'Start' : 'Restart'} pending={bulk.isPending} error={bulk.error?.message ?? null} onConfirm={() => bulk.mutate(confirm === 'start' ? 'start' : 'restart')}>
         {confirm === 'start'
           ? 'Each starts again on the node it last ran on, with its data and image still there. No rebuild. A service whose port or capacity was taken meanwhile is refused; redeploy that one.'

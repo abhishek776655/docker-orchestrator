@@ -1,12 +1,14 @@
 import { NavLink, Outlet, useLocation } from 'react-router-dom'
 import { ErrorBoundary } from '@/components/error-boundary'
 import { useQuery } from '@tanstack/react-query'
-import { Activity, Layers, Network, Server, Upload, type LucideIcon } from 'lucide-react'
+import { Activity, LayoutDashboard, Layers, Network, Server, Upload, type LucideIcon } from 'lucide-react'
+import { NotificationBell } from '@/components/notification-bell'
 import { api } from '@/lib/api'
 import { cn } from '@/lib/utils'
 
 const PLATFORM: { to: string; label: string; icon: LucideIcon; end?: boolean }[] = [
-  { to: '/', label: 'Cluster', icon: Network, end: true },
+  { to: '/', label: 'Dashboard', icon: LayoutDashboard, end: true },
+  { to: '/cluster', label: 'Cluster', icon: Network },
   { to: '/nodes', label: 'Nodes', icon: Server },
   { to: '/projects', label: 'Projects', icon: Layers },
   { to: '/deploy', label: 'Deploy', icon: Upload },
@@ -57,7 +59,8 @@ function ConnectionCard() {
 }
 
 const TITLES: Record<string, string> = {
-  '/': 'Cluster',
+  '/': 'Dashboard',
+  '/cluster': 'Cluster',
   '/nodes': 'Nodes',
   '/projects': 'Projects',
   '/deploy': 'Deploy',
@@ -89,9 +92,12 @@ export function AppShell() {
         </div>
       </aside>
       <div className="min-w-0 flex-[1_1_640px]">
-        <header className="flex min-h-14 items-center border-b border-border bg-card px-6 text-sm text-muted-foreground">
-          Platform <span aria-hidden="true">&nbsp;/&nbsp;</span>
-          <span className="font-medium text-foreground">{title}</span>
+        <header className="flex min-h-14 items-center justify-between gap-4 border-b border-border bg-card px-6 text-sm text-muted-foreground">
+          <span>
+            Platform <span aria-hidden="true">&nbsp;/&nbsp;</span>
+            <span className="font-medium text-foreground">{title}</span>
+          </span>
+          <NotificationBell />
         </header>
         <ErrorBoundary resetKey={pathname}>
           <Outlet />

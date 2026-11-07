@@ -102,6 +102,8 @@ export interface ComposeRequest {
   // node id -> services pinned to that node.
   pin_nodes: Record<string, string[]>
   fresh: boolean
+  // Services whose pin_nodes node must be used even if the scheduler rejects it.
+  force?: string[]
 }
 
 export interface PlanWorkload {

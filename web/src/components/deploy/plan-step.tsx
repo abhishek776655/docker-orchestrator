@@ -9,6 +9,9 @@ import type { ComposeFile } from '@/components/deploy/upload-step'
 import { api } from '@/lib/api'
 import type { DeployConfig } from '@/lib/deploy-config'
 import { saveDeploy } from '@/lib/saved-deploys'
+import { VolumeRiskDialog } from '@/components/deploy/volume-risk-dialog'
+import { keepVolumePlacements, volumeRisks, type VolumeRisk } from '@/lib/volume-risk'
+import type { ComposeRequest } from '@/lib/api'
 import { buildRequest, derivePlan, liveState, nodesUsed, pinsFor, type LiveState } from '@/lib/plan'
 
 interface Props {
@@ -66,13 +69,31 @@ export function PlanStep({ compose, config, onChange, onBack }: Props) {
     placeholderData: keepPreviousData,
   })
 
-  const workloadsQ = useQuery({ queryKey: ['workloads'], queryFn: api.workloads, enabled: deployed, refetchInterval: deployed ? 2000 : false })
-  const deploy = useMutation({
-    mutationFn: (fresh: boolean) => {
-      const req = hasPlacements ? effReq : baseReq
-      return api.composeDeploy(fresh ? { ...req, fresh: true } : req)
+  // Where services run now: live status after deploying, and before that,
+  // which node holds each stateful service's volume data.
+  const workloadsQ = useQuery({ queryKey: ['workloads'], queryFn: api.workloads, refetchInterval: deployed ? 2000 : 10000 })
+  const [risks, setRisks] = useState<{ list: VolumeRisk[]; req: ComposeRequest } | null>(null)
+  const requestFor = (fresh: boolean): ComposeRequest => {
+    const req = hasPlacements ? effReq : baseReq
+    return fresh ? { ...req, fresh: true } : req
+  }
+  // Before deploying, plan the exact request once more and look for services
+  // that would start on an empty volume; ask first if there are any.
+  const check = useMutation({
+    mutationFn: async (fresh: boolean) => {
+      const req = requestFor(fresh)
+      const [planned, current] = await Promise.all([api.composePlan(req), api.workloads()])
+      return { req, list: volumeRisks(planned, current) }
     },
+    onSuccess: ({ req, list }) => {
+      if (list.length) setRisks({ req, list })
+      else deploy.mutate(req)
+    },
+  })
+  const deploy = useMutation({
+    mutationFn: (req: ComposeRequest) => api.composeDeploy(req),
     onSuccess: () => {
+      setRisks(null)
       setDeployed(true)
       // Remember what was deployed so the project page can redeploy or edit it.
       saveDeploy(config.project, {
@@ -84,7 +105,7 @@ export function PlanStep({ compose, config, onChange, onBack }: Props) {
   })
 
   const effective = hasPlacements ? (effQ.data ?? null) : null
-  const services = useMemo(() => (base ? derivePlan(base, effective, config) : []), [base, effective, config])
+  const services = useMemo(() => (base ? derivePlan(base, effective, config, workloadsQ.data ?? []) : []), [base, effective, config, workloadsQ.data])
   const states = useMemo(() => {
     const m = new Map<string, LiveState>()
     if (!deployed) return m
@@ -152,17 +173,18 @@ export function PlanStep({ compose, config, onChange, onBack }: Props) {
     return { name: s.name, stage: s.stage, deps: s.deps, state, line: deployed && state !== 'planned' ? LINE[state] : s.node || 'unplaced' }
   })
 
-  function use(service: string, node: string) {
+  function use(service: string, node: string, force = false) {
     const pick = services.find((s) => s.name === service)?.pickNode
     const next = { ...config.placements }
-    if (node === pick) delete next[service]
+    const forced = (config.forced ?? []).filter((s) => s !== service)
+    if (node === pick && !force) delete next[service]
     else next[service] = node
-    onChange({ placements: next })
+    onChange({ placements: next, forced: force ? [...forced, service] : forced })
   }
   function reset(service: string) {
     const next = { ...config.placements }
     delete next[service]
-    onChange({ placements: next })
+    onChange({ placements: next, forced: (config.forced ?? []).filter((s) => s !== service) })
   }
 
   return (
@@ -239,12 +261,28 @@ export function PlanStep({ compose, config, onChange, onBack }: Props) {
         nodes={nodesUsed(services)}
         stages={stages}
         deployed={deployed}
-        deploying={deploy.isPending}
-        error={deploy.error?.message ?? null}
+        deploying={deploy.isPending || check.isPending}
+        error={(risks ? null : deploy.error?.message) ?? check.error?.message ?? null}
         blocked={blocked}
         onBack={onBack}
         fresh={config.fresh}
-        onDeploy={(fresh) => deploy.mutate(fresh)}
+        onDeploy={(fresh) => {
+          deploy.reset()
+          check.mutate(fresh)
+        }}
+      />
+      <VolumeRiskDialog
+        risks={risks?.list ?? []}
+        open={!!risks}
+        onOpenChange={(o) => !o && setRisks(null)}
+        pending={deploy.isPending}
+        error={deploy.error?.message ?? null}
+        onReplan={() => {
+          // Pin each moved service back to its data's node; the plan above updates.
+          onChange({ placements: keepVolumePlacements(risks!.list, config.placements) })
+          setRisks(null)
+        }}
+        onDeployAnyway={() => deploy.mutate(risks!.req)}
       />
     </>
   )

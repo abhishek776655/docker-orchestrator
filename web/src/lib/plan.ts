@@ -1,5 +1,5 @@
 import { parseDocument } from 'yaml'
-import type { ComposeRequest, Decision, PlanResponse } from './api'
+import type { ApiWorkload, ComposeRequest, Decision, PlanResponse } from './api'
 import { summarizeCompose } from './compose-summary'
 import { dependencyClosure, type DeployConfig } from './deploy-config'
 
@@ -37,12 +37,16 @@ export function buildRequest(yaml: string, config: DeployConfig, withPlacements:
     pin_host: config.hostServices.length > 0 ? config.hostServices : null,
     pin_nodes: pinNodes,
     fresh: config.fresh,
+    force: withPlacements ? (config.forced ?? []).filter((s) => s in config.placements) : [],
   }
 }
 
 export interface Candidate {
   node: string
+  // rejected: the scheduler refused it, or its volume data is elsewhere.
+  // A rejected node can still be the one in use when the user chose it anyway.
   outcome: 'selected' | 'eligible' | 'rejected'
+  inUse: boolean // the node this service will run on
   score?: number
   detail: string
   isPick: boolean // the scheduler's own choice
@@ -64,6 +68,7 @@ export interface PlanService {
   score: number | null
   pickNode: string // where the scheduler would put it unaided
   changed: boolean
+  forced: boolean // placed on a node the scheduler rejected, by choice
   kept: boolean // kept on the host in Configuration
   warnings: string[]
   candidates: Candidate[]
@@ -91,24 +96,30 @@ export function stagesOf(workloads: { Service: string; DependsOn?: string[] | nu
   return memo
 }
 
-function candidatesOf(base: Decision | undefined, selected: string): Candidate[] {
+function candidatesOf(base: Decision | undefined, selected: string, dataNode: string): Candidate[] {
   if (!base) return []
+  const volumeElsewhere = (node: string) => (dataNode && node !== dataNode ? `volume data is on ${dataNode}; here it starts with an empty volume` : '')
   const eligible = [...(base.Scores ?? [])]
     .sort((a, b) => b.Total - a.Total)
-    .map((s): Candidate => ({
-      node: s.NodeID,
-      outcome: s.NodeID === selected ? 'selected' : 'eligible',
-      score: s.Total,
-      detail: `CPU ${s.CPUFit.toFixed(2)} · memory ${s.MemoryFit.toFixed(2)} · thermal ${s.ThermalFit.toFixed(2)} · image cache ${s.CacheFit.toFixed(2)}`,
-      isPick: s.NodeID === base.Selected,
-      factors: [
-        { label: 'CPU fit', value: s.CPUFit },
-        { label: 'Memory fit', value: s.MemoryFit },
-        { label: 'Thermal fit', value: s.ThermalFit },
-        { label: 'Image cache', value: s.CacheFit },
-      ],
-    }))
-  const rejected = (base.Rejections ?? []).map((r): Candidate => ({ node: r.NodeID, outcome: 'rejected', detail: r.Reason, isPick: false }))
+    .map((s): Candidate => {
+      const volume = volumeElsewhere(s.NodeID)
+      const inUse = s.NodeID === selected
+      return {
+        node: s.NodeID,
+        outcome: volume ? 'rejected' : inUse ? 'selected' : 'eligible',
+        inUse,
+        score: s.Total,
+        detail: volume || `CPU ${s.CPUFit.toFixed(2)} · memory ${s.MemoryFit.toFixed(2)} · thermal ${s.ThermalFit.toFixed(2)} · image cache ${s.CacheFit.toFixed(2)}`,
+        isPick: s.NodeID === base.Selected,
+        factors: [
+          { label: 'CPU fit', value: s.CPUFit },
+          { label: 'Memory fit', value: s.MemoryFit },
+          { label: 'Thermal fit', value: s.ThermalFit },
+          { label: 'Image cache', value: s.CacheFit },
+        ],
+      }
+    })
+  const rejected = (base.Rejections ?? []).map((r): Candidate => ({ node: r.NodeID, outcome: 'rejected', inUse: r.NodeID === selected, detail: r.Reason, isPick: false }))
   return [...eligible, ...rejected]
 }
 
@@ -117,8 +128,9 @@ function candidatesOf(base: Decision | undefined, selected: string): Candidate[]
  * node) with the effective plan (where services will actually run once changes
  * are applied). They are the same plan when nothing was changed.
  */
-export function derivePlan(base: PlanResponse, effective: PlanResponse | null, config: DeployConfig): PlanService[] {
+export function derivePlan(base: PlanResponse, effective: PlanResponse | null, config: DeployConfig, current: ApiWorkload[] = []): PlanService[] {
   const workloads = base.plan.workloads ?? []
+  const now = new Map(current.map((w) => [`${w.Project}/${w.Service}/${w.Revision}`, w]))
   const stages = stagesOf(workloads)
   const baseBy = new Map((base.decisions ?? []).map((d) => [d.WorkloadKey, d]))
   const effBy = new Map(((effective ?? base).decisions ?? []).map((d) => [d.WorkloadKey, d]))
@@ -131,6 +143,11 @@ export function derivePlan(base: PlanResponse, effective: PlanResponse | null, c
     const node = ed?.Selected ?? ''
     const healthy = new Set(w.DependsOnHealthy ?? [])
     const build = builds.get(w.Service)
+    // Where its volume data lives, for a service with a node-local volume:
+    // the node it runs on now, else the node its data is pinned to.
+    const existing = now.get(key)
+    const persistent = w.Storage.Class === 'node_local_persistent' || existing?.Storage?.Class === 'node_local_persistent'
+    const dataNode = persistent ? existing?.NodeID || w.Storage.PinnedNodeID || '' : ''
     return {
       name: w.Service,
       source: build ? `build ${build.Context}` : w.Image,
@@ -146,9 +163,10 @@ export function derivePlan(base: PlanResponse, effective: PlanResponse | null, c
       score: (ed?.Scores ?? []).find((s) => s.NodeID === node)?.Total ?? null,
       pickNode: bd?.Selected ?? node,
       changed: !!bd && !!ed && bd.Selected !== ed.Selected,
+      forced: (config.forced ?? []).includes(w.Service) && config.placements[w.Service] === node,
       kept: config.hostServices.includes(w.Service),
       warnings: [...(ed?.Warnings ?? [])],
-      candidates: candidatesOf(bd, node),
+      candidates: candidatesOf(bd, node, dataNode),
     }
   })
 }

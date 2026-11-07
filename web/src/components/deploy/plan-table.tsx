@@ -26,7 +26,7 @@ interface Props {
   services: PlanService[]
   states: Map<string, LiveState>
   locked: boolean // true once deployed: placements can no longer change
-  onUse: (service: string, node: string) => void
+  onUse: (service: string, node: string, force?: boolean) => void
   onReset: (service: string) => void
 }
 
@@ -95,7 +95,8 @@ export function PlanTable({ services, states, locked, onUse, onReset }: Props) {
             {rows.map((s) => {
               const isOpen = open.has(s.name)
               const state = states.get(s.name) ?? 'planned'
-              const canChange = !s.kept && s.pinnedTo === '' && !locked
+              // Pinned services can move too: a placement change overrides the pin. Kept-on-host ones change in Configuration.
+              const canChange = !s.kept && !locked
               return (
                 <div key={s.name} className="border-b border-muted">
                   <div role="row" className="grid min-h-[52px] items-center px-4" style={{ gridTemplateColumns: COLS }}>
@@ -118,6 +119,8 @@ export function PlanTable({ services, states, locked, onUse, onReset }: Props) {
                       <span className="font-mono font-medium">{s.node || 'unplaced'}</span>
                       {s.score !== null && <span className="font-mono text-xs text-muted-foreground">{s.score.toFixed(2)}</span>}
                       {s.changed && <Chip tone="info">changed</Chip>}
+                      {s.forced && <Chip tone="warn">forced</Chip>}
+                      {!s.forced && s.candidates.some((c) => c.inUse && c.outcome === 'rejected') && <Chip tone="warn">empty volume</Chip>}
                       {canChange && (
                         <button type="button" onClick={() => toggle(s.name)} className="min-h-11 px-1.5 text-[13px] font-medium text-ok underline">
                           Change
@@ -171,25 +174,31 @@ export function PlanTable({ services, states, locked, onUse, onReset }: Props) {
                           >
                             <span className="truncate font-mono">{c.node}</span>
                             <span>
-                              <Badge tone={c.outcome === 'selected' ? 'ok' : c.outcome === 'eligible' ? 'info' : 'bad'} className="text-[11px]">
-                                {c.outcome}
+                              <Badge tone={c.outcome === 'rejected' ? (c.inUse ? 'warn' : 'bad') : c.outcome === 'selected' ? 'ok' : 'info'} className="text-[11px]">
+                                {c.outcome === 'rejected' && c.inUse ? 'rejected · in use' : c.outcome}
                               </Badge>
                             </span>
                             <span className="font-mono">{c.score !== undefined ? c.score.toFixed(2) : '-'}</span>
                             <span className="text-zinc-700">
                               {c.isPick && <span className="mr-1.5 inline-block rounded bg-ok px-2 py-0.5 text-[11px] font-semibold text-white">★ Scheduler's pick</span>}
+                              {c.outcome === 'rejected' && c.inUse && <span className="mr-1.5 font-medium text-warn-fg">Chosen anyway.</span>}
                               {c.detail}
                             </span>
                             <span className="text-right">
-                              {c.outcome !== 'rejected' && canChange && (
+                              {canChange && c.inUse && (
+                                <Button type="button" variant="outline" className="min-h-11 px-3 text-[13px]" disabled>
+                                  In use
+                                </Button>
+                              )}
+                              {canChange && !c.inUse && (
                                 <Button
                                   type="button"
                                   variant="outline"
-                                  className="min-h-11 px-3 text-[13px]"
-                                  disabled={c.outcome === 'selected'}
-                                  onClick={() => onUse(s.name, c.node)}
+                                  className={cn('min-h-11 px-3 text-[13px]', c.outcome === 'rejected' && 'text-warn-fg')}
+                                  title={c.outcome === 'rejected' ? `Rejected: ${c.detail}. Place it here anyway; it may fail or start without its data.` : undefined}
+                                  onClick={() => onUse(s.name, c.node, c.outcome === 'rejected')}
                                 >
-                                  {c.outcome === 'selected' ? 'Selected' : 'Use here'}
+                                  {c.outcome === 'rejected' ? 'Use anyway' : 'Use here'}
                                 </Button>
                               )}
                             </span>

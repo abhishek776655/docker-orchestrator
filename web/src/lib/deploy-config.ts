@@ -18,6 +18,9 @@ export interface DeployConfig {
   fresh: boolean
   // Placements changed in the plan step: service -> node (pin_nodes).
   placements: Record<string, string>
+  // Services in placements whose node the scheduler rejected and the user
+  // chose anyway (force): the rejection becomes a warning.
+  forced: string[]
 }
 
 export function defaultConfig(summary: ComposeSummary): DeployConfig {
@@ -30,6 +33,7 @@ export function defaultConfig(summary: ComposeSummary): DeployConfig {
     noCache: false,
     fresh: false,
     placements: {},
+    forced: [],
   }
 }
 

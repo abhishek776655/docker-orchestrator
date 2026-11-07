@@ -120,7 +120,7 @@ export function ServicePage() {
       if (!parsed.ok) throw new Error(parsed.error)
       const config = { ...defaultConfig(parsed.summary), ...saved!.config, scope: 'one' as const, onlyService: service, placements: {}, fresh: true }
       const response = await api.composePlan(buildRequest(saved!.file.text, config, false))
-      const row = derivePlan(response, null, config).find((s) => s.name === service)
+      const row = derivePlan(response, null, config, workloadsQ.data ?? []).find((s) => s.name === service)
       if (!row) throw new Error(`${service} is not in the saved Compose file.`)
       return row
     },
@@ -378,7 +378,7 @@ export function ServicePage() {
                 </Button>
               </div>
             </div>
-            <pre className="m-0 max-h-[420px] overflow-auto font-mono text-[12.5px] leading-[1.65] text-zinc-200">
+            <pre className="m-0 min-h-[360px] max-h-[640px] overflow-auto font-mono text-[12.5px] leading-[1.65] text-zinc-200">
               {logsQ.isError ? logsQ.error.message : logsQ.data?.trim() || (logsQ.isPending && detail.status !== 'pending' ? 'Loading…' : 'No logs yet.')}
             </pre>
           </section>

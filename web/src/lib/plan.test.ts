@@ -48,6 +48,12 @@ describe('buildRequest', () => {
     expect(buildRequest('y', config, false).only_service).toBe('')
   })
 
+  it('sends forced services only for placements that exist', () => {
+    const c = { ...config, placements: { api: 'gpu-box' }, forced: ['api', 'web'] }
+    expect(buildRequest('y', c, true).force).toEqual(['api'])
+    expect(buildRequest('y', c, false).force).toEqual([])
+  })
+
   it('groups placement changes by node, only when asked', () => {
     const c = { ...config, placements: { api: 'gpu-box', web: 'gpu-box', db: 'jetson-orin' } }
     expect(buildRequest('y', c, true).pin_nodes).toEqual({ 'gpu-box': ['api', 'web'], 'jetson-orin': ['db'] })
@@ -110,6 +116,18 @@ describe('derivePlan', () => {
       ['gpu-box', 'eligible', false],
       ['nuc-old', 'rejected', false],
     ])
+  })
+
+  it('marks nodes away from a volume\'s data as rejected, and a chosen one as in use', () => {
+    const stateful: PlanResponse = { ...base, plan: { ...base.plan, workloads: [wl('db', { Storage: { Class: 'node_local_persistent', PinnedNodeID: '' } })] }, decisions: [dec('db', 'gpu-box', ['mbp-m3'])] }
+    const now = [{ Project: 'shop', Service: 'db', Revision: 'latest', Image: 'x', Resources: { CPUMillis: 0, MemoryBytes: 0 }, DesiredState: 'running' as const, Status: 'ready', StatusReason: '', NodeID: 'mbp-m3' }]
+    const db = derivePlan(stateful, null, config, now)[0]
+    expect(db.candidates.map((c) => [c.node, c.outcome, c.inUse])).toEqual([
+      ['gpu-box', 'rejected', true],
+      ['mbp-m3', 'eligible', false],
+      ['nuc-old', 'rejected', false],
+    ])
+    expect(db.candidates[0].detail).toContain('volume data is on mbp-m3')
   })
 
   it('shows the changed node as selected and keeps the scheduler pick marked', () => {
