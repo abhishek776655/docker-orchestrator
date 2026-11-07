@@ -65,8 +65,13 @@ token cannot be used twice, so on Machine A get a second one for Machine B:
 
 Copy the newly printed command to Machine B and run it there. The command
 contains the discovered endpoint and certificate fingerprint; neither
-machine needs a separately typed control-plane IP. The default node ID is
-the machine hostname. To choose one explicitly, set `HACO_NODE_ID` before
+machine needs a separately typed control-plane IP. Each machine picks its
+node ID once and saves it in `~/.haco/node-id` (or `$HACO_DATA_DIR/node-id`):
+a readable name from the machine's Computer Name plus a short random suffix,
+e.g. `abhisheks-macbook-air-7f3a`. It never changes afterwards, even when the
+machine's IP address or name changes, so pins, data folders and the saved
+credential stay attached to it. A machine that joined before this existed
+keeps its earlier ID. To choose one explicitly, set `HACO_NODE_ID` before
 running `join`, for example `HACO_NODE_ID=node-b ./bin/agent join '<token>'`.
 
 The join process stores its node credential locally and stays running. To

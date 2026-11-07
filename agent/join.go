@@ -12,46 +12,21 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/abhishek/hardware-aware-container-orchestrator/agentjoin"
 	"github.com/abhishek/hardware-aware-container-orchestrator/netutil"
 )
 
-// DefaultHostNodeID derives a node ID from this machine's own hostname —
-// the default identity for both `hacoctl agent join` on a standalone node
-// and the control plane's own auto-joined host agent, so a node's name is
-// recognizable without the operator having to set HACO_NODE_ID by hand.
-func DefaultHostNodeID() string {
-	host, err := os.Hostname()
-	if err != nil || host == "" {
-		return "node-local"
-	}
-	host = strings.ToLower(host)
-	id := strings.Map(func(r rune) rune {
-		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '_' {
-			return r
-		}
-		return '-'
-	}, host)
-	if !agentjoin.ValidNodeID(id) {
-		return "node-local"
-	}
-	return id
-}
-
-// HostNodeID is DefaultHostNodeID with the HACO_HOST_NODE_ID override
-// applied — the single source of truth every caller uses for "this
-// machine's node ID": cmd/controlplane's auto-join, compose's default
-// stateful-service pin and x-haco-pin-host, and the build-locality check
-// in controlplane.ComposeDeploy all call this instead of each re-deriving
-// it (and each potentially disagreeing after an override).
+// HostNodeID is this machine's node ID — the single source of truth for
+// the agent, the control plane's own auto-joined node, x-haco-pin-host and
+// the build-locality checks. HACO_HOST_NODE_ID overrides it; otherwise it
+// is the permanent ID saved in the data directory (see SavedNodeID).
 func HostNodeID() string {
 	if v := os.Getenv("HACO_HOST_NODE_ID"); v != "" {
 		return v
 	}
-	return DefaultHostNodeID()
+	return SavedNodeID()
 }
 
 type credentialFile struct {

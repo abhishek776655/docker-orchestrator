@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -16,7 +17,7 @@ import (
 )
 
 func main() {
-	nodeID := envOr("HACO_NODE_ID", agent.DefaultHostNodeID())
+	nodeID := envOr("HACO_NODE_ID", agent.SavedNodeID())
 	credentialPath := envOr("HACO_AGENT_CREDENTIAL_FILE", filepath.Join(defaultDataDir(), "agent-credentials", nodeID+".json"))
 	if len(os.Args) == 3 && os.Args[1] == "join" {
 		bundle, err := agentjoin.Decode(os.Args[2])
@@ -62,6 +63,10 @@ func run(cfg agent.Config) {
 
 	a := agent.New(cfg, docker)
 	if err := a.Run(ctx); err != nil {
+		if errors.Is(err, agent.ErrShutdownByControlPlane) {
+			log.Print(err)
+			return
+		}
 		log.Fatalf("agent: %v", err)
 	}
 }
