@@ -56,10 +56,18 @@ func (c Config) nodeLabels() map[string]string {
 
 // Agent is one running node agent instance.
 type Agent struct {
-	cfg    Config
-	docker *Docker
-	http   *http.Client
+	cfg          Config
+	docker       *Docker
+	http         *http.Client
+	transferHTTP *http.Client
 }
+
+const (
+	agentAPIHTTPTimeout = 10 * time.Second
+	// Volume seeds, directory snapshots, and build contexts can be much
+	// larger than API responses, especially when transferring existing DB data.
+	agentTransferHTTPTimeout = 10 * time.Minute
+)
 
 func New(cfg Config, docker *Docker) *Agent {
 	if cfg.HeartbeatPeriod == 0 {
@@ -68,7 +76,10 @@ func New(cfg Config, docker *Docker) *Agent {
 	if cfg.PollPeriod == 0 {
 		cfg.PollPeriod = 2 * time.Second
 	}
-	return &Agent{cfg: cfg, docker: docker, http: pinnedHTTPClient(cfg.TLSFingerprint, 10*time.Second)}
+	apiClient := pinnedHTTPClient(cfg.TLSFingerprint, agentAPIHTTPTimeout)
+	transferClient := *apiClient // share the same transport and certificate pinning
+	transferClient.Timeout = agentTransferHTTPTimeout
+	return &Agent{cfg: cfg, docker: docker, http: apiClient, transferHTTP: &transferClient}
 }
 
 func pinnedHTTPClient(fingerprint string, timeout time.Duration) *http.Client {
@@ -578,7 +589,11 @@ func (a *Agent) doRaw(req *http.Request) (*http.Response, []byte, error) {
 		req.Header.Set("Authorization", "Bearer "+a.cfg.Credential)
 		req.Header.Set("X-HACO-Node-ID", a.cfg.NodeID)
 	}
-	resp, err := a.http.Do(req)
+	client := a.transferHTTP
+	if client == nil { // permits focused tests to inject only the standard client
+		client = a.http
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, nil, err
 	}

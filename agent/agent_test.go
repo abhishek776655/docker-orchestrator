@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/abhishek/hardware-aware-container-orchestrator/model"
 	"github.com/abhishek/hardware-aware-container-orchestrator/store"
@@ -81,6 +82,16 @@ func TestContainerImageMatchesDetectsUpdatedImageBehindSameTag(t *testing.T) {
 	}
 	if !containerImageMatches("sha256:same-image", "sha256:same-image") {
 		t.Fatal("container with the desired image ID should be reusable")
+	}
+}
+
+func TestAgentUsesLongerTimeoutForLargeTransfers(t *testing.T) {
+	a := New(Config{}, nil)
+	if a.http.Timeout != 10*time.Second {
+		t.Fatalf("normal API timeout = %s, want 10s", a.http.Timeout)
+	}
+	if a.transferHTTP.Timeout != 10*time.Minute {
+		t.Fatalf("transfer timeout = %s, want 10m", a.transferHTTP.Timeout)
 	}
 }
 
