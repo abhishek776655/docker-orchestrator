@@ -68,6 +68,10 @@ type Agent struct {
 
 	memMu  sync.Mutex
 	memory map[string]int64 // latest per-workload memory use, sent with each heartbeat
+
+	locks    keyLocks       // one in-flight handler per workload
+	heavy    chan struct{}  // build/pull slots
+	inflight sync.WaitGroup // workload handlers still running
 }
 
 const memorySampleInterval = 10 * time.Second
@@ -89,7 +93,7 @@ func New(cfg Config, docker *Docker) *Agent {
 	apiClient := pinnedHTTPClient(cfg.TLSFingerprint, agentAPIHTTPTimeout)
 	transferClient := *apiClient // share the same transport and certificate pinning
 	transferClient.Timeout = agentTransferHTTPTimeout
-	return &Agent{cfg: cfg, docker: docker, http: apiClient, transferHTTP: &transferClient}
+	return &Agent{cfg: cfg, docker: docker, http: apiClient, transferHTTP: &transferClient, heavy: heavySlotsFromEnv()}
 }
 
 func pinnedHTTPClient(fingerprint string, timeout time.Duration) *http.Client {
@@ -219,9 +223,13 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.pause()
 			return nil
 		case <-shutdown:
+			// workCtx is already cancelled; let in-flight starts unwind before
+			// stopping containers, so none starts one again behind our back.
+			a.inflight.Wait()
 			a.shutdownNode(ctx)
 			return ErrShutdownByControlPlane
 		case newID := <-rename:
+			a.inflight.Wait()
 			return a.renameNode(ctx, newID)
 		case <-poll.C:
 			if workCtx.Err() != nil {
@@ -299,11 +307,19 @@ func (a *Agent) restartContainers(ctx context.Context, keys []string) {
 		if !want[c.WorkloadKey] {
 			continue
 		}
-		if err := a.docker.StopAndRemove(ctx, c.ContainerID); err != nil {
-			log.Printf("restart %s: %v", c.WorkloadKey, err)
-			continue
-		}
-		log.Printf("restart %s: old container removed, recreating", c.WorkloadKey)
+		c := c
+		// Wait for any start of this workload still in progress, in the
+		// background so a long build does not stall the control loop.
+		go func() {
+			l := a.locks.get(c.WorkloadKey)
+			l.Lock()
+			defer l.Unlock()
+			if err := a.docker.StopAndRemove(ctx, c.ContainerID); err != nil {
+				log.Printf("restart %s: %v", c.WorkloadKey, err)
+				return
+			}
+			log.Printf("restart %s: old container removed, recreating", c.WorkloadKey)
+		}()
 	}
 }
 
@@ -424,37 +440,46 @@ func (a *Agent) pollAndExecute(ctx context.Context) error {
 
 	assignedHere, executable := splitAssignments(assignments)
 	for _, rec := range executable {
-		if rec.Status == model.StatusRunning || rec.Status == model.StatusReady {
-			alive, err := a.docker.IsRunning(ctx, rec.Key())
-			if err != nil {
-				log.Printf("liveness check failed for %s: %v", rec.Key(), err)
-				continue
-			}
-			if alive {
-				// Still waiting on its own healthcheck (StatusRunning, not
-				// yet Ready — covers both a Compose healthcheck and one
-				// baked into the image, since HealthStatus doesn't
-				// distinguish the two) — re-check every tick instead of
-				// treating "alive" as "nothing to do", the same as
-				// StatusWaitingDependencies already does for cross-
-				// workload gating. This calls checkHealth directly, not
-				// the full execute() pipeline: re-running execute() would
-				// also redo PullImage/EnsureRunning/WaitRunning every tick
-				// for as long as health is pending, uselessly re-pulling
-				// an unchanged image over and over. Once truly Ready,
-				// rec.Status stops matching StatusRunning and this stops.
-				if rec.Status == model.StatusRunning {
-					a.checkHealth(ctx, rec.Key(), rec.ContainerID)
-				}
-				continue
-			}
-			log.Printf("%s reported %s but its container is gone; re-executing (SRS safe retries)", rec.Key(), rec.Status)
-		}
-		a.execute(ctx, rec)
+		rec := rec
+		// Each workload in its own goroutine; one still being handled from an
+		// earlier tick is skipped and picked up again once it finishes.
+		a.dispatch(rec.Key(), func() { a.handle(ctx, rec) })
 	}
 
 	a.cleanupOrphans(ctx, assignedHere)
 	return nil
+}
+
+// handle advances one assigned workload: health-checks it if it is already
+// running, otherwise (re)starts it.
+func (a *Agent) handle(ctx context.Context, rec store.WorkloadRecord) {
+	if rec.Status == model.StatusRunning || rec.Status == model.StatusReady {
+		alive, err := a.docker.IsRunning(ctx, rec.Key())
+		if err != nil {
+			log.Printf("liveness check failed for %s: %v", rec.Key(), err)
+			return
+		}
+		if alive {
+			// Still waiting on its own healthcheck (StatusRunning, not
+			// yet Ready — covers both a Compose healthcheck and one
+			// baked into the image, since HealthStatus doesn't
+			// distinguish the two) — re-check every tick instead of
+			// treating "alive" as "nothing to do", the same as
+			// StatusWaitingDependencies already does for cross-
+			// workload gating. This calls checkHealth directly, not
+			// the full execute() pipeline: re-running execute() would
+			// also redo PullImage/EnsureRunning/WaitRunning every tick
+			// for as long as health is pending, uselessly re-pulling
+			// an unchanged image over and over. Once truly Ready,
+			// rec.Status stops matching StatusRunning and this stops.
+			if rec.Status == model.StatusRunning {
+				a.checkHealth(ctx, rec.Key(), rec.ContainerID)
+			}
+			return
+		}
+		log.Printf("%s reported %s but its container is gone; re-executing (SRS safe retries)", rec.Key(), rec.Status)
+	}
+	a.execute(ctx, rec)
 }
 
 // splitAssignments keeps failed workloads in the ownership set so cleanup
@@ -516,16 +541,26 @@ func (a *Agent) execute(ctx context.Context, rec store.WorkloadRecord) {
 
 	if rec.RemoteBuild != nil {
 		if needsRemoteBuild(*rec.RemoteBuild, a.docker.HasImage(ctx, rec.Image), a.docker.ImageBuildID(ctx, rec.Image)) {
-			a.report(ctx, key, model.StatusBuilding, "", "")
-			if err := a.buildRemote(ctx, rec); err != nil {
-				a.report(ctx, key, model.StatusFailed, "remote build failed: "+err.Error(), "")
+			err := a.withHeavySlot(ctx, func() error {
+				a.report(ctx, key, model.StatusBuilding, "", "")
+				return a.buildRemote(ctx, rec)
+			})
+			if err != nil {
+				if ctx.Err() == nil {
+					a.report(ctx, key, model.StatusFailed, "remote build failed: "+err.Error(), "")
+				}
 				return
 			}
 		}
 	} else if !rec.SkipPull {
-		a.report(ctx, key, model.StatusPulling, "", "")
-		if err := a.docker.PullImage(ctx, rec.Image, rec.Constraints.Architecture); err != nil {
-			a.report(ctx, key, model.StatusFailed, "pull failed: "+err.Error(), "")
+		err := a.withHeavySlot(ctx, func() error {
+			a.report(ctx, key, model.StatusPulling, "", "")
+			return a.docker.PullImage(ctx, rec.Image, rec.Constraints.Architecture)
+		})
+		if err != nil {
+			if ctx.Err() == nil {
+				a.report(ctx, key, model.StatusFailed, "pull failed: "+err.Error(), "")
+			}
 			return
 		}
 	}
