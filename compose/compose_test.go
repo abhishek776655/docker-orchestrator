@@ -834,6 +834,78 @@ services:
 	}
 }
 
+// TestRootBuildContextDoesNotCaptureUnrelatedBindMounts covers a real bug:
+// a service with `build.context: .` (the project root, common when a
+// Dockerfile needs a top-level file) made matchesAnyBuildContext's "is
+// inside a build context" check true for literally every bind mount in
+// the whole project — so an unrelated service's own data directory (e.g.
+// mysql's ./mysql-data) got force-treated as a live-reload source mount
+// (RemoteDirKey) instead of the ordinary managed-volume path (SeedDirKey),
+// which then 404s at deploy time since nothing ever stashes a snapshot
+// for it.
+func TestBuildSSHIsCarriedNotWarned(t *testing.T) {
+	workingDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workingDir, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	yaml := []byte(`
+services:
+  api:
+    build:
+      context: .
+      ssh:
+        - default
+`)
+	plan, err := compose.Load(context.Background(), "demo", workingDir, yaml)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(plan.Builds) != 1 {
+		t.Fatalf("builds = %+v", plan.Builds)
+	}
+	if path, ok := plan.Builds[0].SSH["default"]; !ok || path != "" {
+		t.Fatalf("build SSH = %+v, want {default: \"\"}", plan.Builds[0].SSH)
+	}
+	for _, w := range plan.Warnings {
+		if strings.Contains(w, "build.ssh") {
+			t.Fatalf("unexpected build.ssh warning now that it's supported: %q", w)
+		}
+	}
+}
+
+func TestRootBuildContextDoesNotCaptureUnrelatedBindMounts(t *testing.T) {
+	workingDir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(workingDir, "mysql-data"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workingDir, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	yaml := []byte(`
+services:
+  rootbuilt:
+    build:
+      context: .
+  mysql:
+    image: mysql:8.0
+    volumes:
+      - "./mysql-data:/var/lib/mysql"
+`)
+	plan, err := compose.Load(context.Background(), "demo", workingDir, yaml)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	var mysql model.Workload
+	for _, wl := range plan.Workloads {
+		if wl.Service == "mysql" {
+			mysql = wl
+		}
+	}
+	if len(mysql.Volumes) != 1 || mysql.Volumes[0].RemoteDirKey != "" || mysql.Volumes[0].HostPath != "" {
+		t.Fatalf("mysql volumes = %+v, want an ordinary managed volume (no RemoteDirKey/HostPath) unaffected by rootbuilt's root build context", mysql.Volumes)
+	}
+}
+
 // TestManagedVolumeWithExistingDataGetsSeedCandidate covers the one-time
 // seed case: a managed data volume (single-service, not a build-context/
 // shared-dir match) whose compose-declared host directory already has

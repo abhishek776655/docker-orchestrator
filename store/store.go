@@ -943,12 +943,17 @@ func (s *Store) ListProjectServiceTargets(ctx context.Context, project string) (
 		}
 		var ports []int
 		_ = json.Unmarshal(containerPortsJSON, &ports)
-		if len(ports) == 0 {
-			continue
+		// A service with no declared ports (a worker, or a database nobody
+		// listed ports for) still has to appear: agents read this list for
+		// depends_on readiness, so dropping it left every dependent waiting
+		// forever on a dependency that was already ready.
+		containerPort := 0
+		if len(ports) > 0 {
+			containerPort = ports[0]
 		}
 		out = append(out, model.ServiceInstance{
 			Project: project, Service: service, NodeID: nodeID,
-			Address: address, ContainerPort: ports[0], Status: model.Status(status),
+			Address: address, ContainerPort: containerPort, Status: model.Status(status),
 		})
 	}
 	return out, rows.Err()

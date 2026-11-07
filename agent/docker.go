@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -288,16 +290,171 @@ func (d *Docker) HasImage(ctx context.Context, ref string) bool {
 	return err == nil
 }
 
+const buildIDLabel = "haco.build.id"
+
+// ImageBuildID returns the haco.build.id label of a local image, or "" if
+// the image is missing or was built without one.
+func (d *Docker) ImageBuildID(ctx context.Context, ref string) string {
+	img, _, err := d.cli.ImageInspectWithRaw(ctx, ref)
+	if err != nil || img.Config == nil {
+		return ""
+	}
+	return img.Config.Labels[buildIDLabel]
+}
+
+// BuildImageWithSSH builds through `docker buildx build` (BuildKit), the
+// only builder that supports RUN --mount=type=ssh; the Engine API's legacy
+// builder used by BuildImage rejects that syntax outright. sshKeys maps
+// each SSH mount ID to its private key, written to a 0600 temp file that
+// is removed when the build ends.
+func (d *Docker) BuildImageWithSSH(ctx context.Context, tarball io.Reader, ref string, spec model.RemoteBuildSpec, sshKeys map[string]string) error {
+	tmp, err := os.MkdirTemp("", "haco-build-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmp)
+	contextDir := filepath.Join(tmp, "context")
+	if err := ExtractTar(contextDir, tarball); err != nil {
+		return fmt.Errorf("unpack build context: %w", err)
+	}
+	keyDir := filepath.Join(tmp, "ssh")
+	if err := os.Mkdir(keyDir, 0o700); err != nil {
+		return err
+	}
+	keyPaths := make(map[string]string, len(sshKeys))
+	for id, key := range sshKeys {
+		p := filepath.Join(keyDir, "key-"+strconv.Itoa(len(keyPaths)))
+		if err := os.WriteFile(p, []byte(key), 0o600); err != nil {
+			return err
+		}
+		keyPaths[id] = p
+	}
+	for _, id := range spec.SSHIDs {
+		if _, ok := keyPaths[id]; !ok {
+			return fmt.Errorf("control plane sent no key for build.ssh %q", id)
+		}
+	}
+
+	dockerBin, err := dockerCLI()
+	if err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, dockerBin, buildxArgs(contextDir, ref, spec, keyPaths)...)
+	// Build-arg values travel via the environment (`--build-arg NAME` with
+	// no value reads it from there) so secrets such as SSH_PRIVATE_KEY
+	// never appear in the process list.
+	cmd.Env = os.Environ()
+	for k, v := range spec.Args {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
+	out := &tailBuffer{max: 20}
+	cmd.Stdout, cmd.Stderr = out, out
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("buildx build %s: %w\n--- last build output ---\n%s", ref, err, out.String())
+	}
+	built, _, err := d.cli.ImageInspectWithRaw(ctx, ref)
+	if err != nil {
+		return fmt.Errorf("inspect built image %s: %w", ref, err)
+	}
+	return validateBuiltPlatform(built, spec.Platform)
+}
+
+func buildxArgs(contextDir, ref string, spec model.RemoteBuildSpec, keyPaths map[string]string) []string {
+	dockerfile := spec.Dockerfile
+	if dockerfile == "" {
+		dockerfile = "Dockerfile"
+	}
+	args := []string{"buildx", "build", "--load", "--pull", "--progress=plain",
+		"-f", filepath.Join(contextDir, dockerfile), "-t", ref}
+	if spec.Platform != "" {
+		args = append(args, "--platform", spec.Platform)
+	}
+	if spec.NoCache {
+		args = append(args, "--no-cache")
+	}
+	if spec.BuildID != "" {
+		args = append(args, "--label", buildIDLabel+"="+spec.BuildID)
+	}
+	ids := make([]string, 0, len(keyPaths))
+	for id := range keyPaths {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		args = append(args, "--ssh", id+"="+keyPaths[id])
+	}
+	names := make([]string, 0, len(spec.Args))
+	for k := range spec.Args {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	for _, k := range names {
+		args = append(args, "--build-arg", k)
+	}
+	return append(args, contextDir)
+}
+
+// dockerCLI finds the docker binary, including Docker Desktop's bundled
+// one for an agent started without it on PATH.
+func dockerCLI() (string, error) {
+	if p, err := exec.LookPath("docker"); err == nil {
+		return p, nil
+	}
+	for _, p := range []string{"/usr/local/bin/docker", "/opt/homebrew/bin/docker", "/Applications/Docker.app/Contents/Resources/bin/docker"} {
+		if _, err := os.Stat(p); err == nil {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("docker CLI not found; build.ssh builds need `docker buildx` on this node")
+}
+
+// tailBuffer keeps the last max lines written to it.
+type tailBuffer struct {
+	max     int
+	lines   []string
+	partial string
+}
+
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	parts := strings.Split(t.partial+string(p), "\n")
+	t.partial = parts[len(parts)-1]
+	for _, l := range parts[:len(parts)-1] {
+		if l = strings.TrimSpace(l); l != "" {
+			t.lines = append(t.lines, l)
+		}
+	}
+	if len(t.lines) > t.max {
+		t.lines = t.lines[len(t.lines)-t.max:]
+	}
+	return len(p), nil
+}
+
+func (t *tailBuffer) String() string {
+	lines := append([]string(nil), t.lines...)
+	if s := strings.TrimSpace(t.partial); s != "" {
+		lines = append(lines, s)
+	}
+	if len(lines) > t.max {
+		lines = lines[len(lines)-t.max:]
+	}
+	return strings.Join(lines, "\n")
+}
+
 // BuildImage builds a RemoteBuild workload's image from a tarball fetched
 // from the control plane (registry-optional builds, multi-machine case) —
 // a plain Docker Engine API build, same mechanics as build.Service.Build
 // but against this agent's own daemon, and never pushed anywhere (there is
 // no registry in this flow by definition).
-func (d *Docker) BuildImage(ctx context.Context, tarball io.Reader, ref, dockerfile string, buildArgs map[string]string, platform string) error {
+func (d *Docker) BuildImage(ctx context.Context, tarball io.Reader, ref string, spec model.RemoteBuildSpec) error {
+	dockerfile, platform := spec.Dockerfile, spec.Platform
 	args := map[string]*string{}
-	for k, v := range buildArgs {
+	for k, v := range spec.Args {
 		v := v
 		args[k] = &v
+	}
+	var labels map[string]string
+	if spec.BuildID != "" {
+		labels = map[string]string{buildIDLabel: spec.BuildID}
 	}
 	resp, err := d.cli.ImageBuild(ctx, tarball, types.ImageBuildOptions{
 		Dockerfile: dockerfile,
@@ -306,6 +463,8 @@ func (d *Docker) BuildImage(ctx context.Context, tarball io.Reader, ref, dockerf
 		Remove:     true,
 		PullParent: true,
 		Platform:   platform,
+		NoCache:    spec.NoCache,
+		Labels:     labels,
 	})
 	if err != nil {
 		return fmt.Errorf("build %s: %w", ref, err)

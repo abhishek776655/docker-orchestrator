@@ -3,8 +3,9 @@
 | Compose feature | MVP behavior | Notes |
 | --- | --- | --- |
 | `image` | Supported | Resolve/pin to digest where practical |
-| `build.context`, `dockerfile`, `args` | Supported | Central build produces immutable image |
-| `build.ssh`, build secrets | Supported | BuildKit mounts only; never image layers |
+| `build.context`, `dockerfile`, `args` | Supported | The context's `.dockerignore` is honored exactly as `docker build` does (the Dockerfile and `.dockerignore` are always kept), so a `context: .` at a monorepo root ships only what it says. With `--no-registry`, the assigned node builds; its image carries a `haco.build.id` fingerprint of the build inputs and is rebuilt whenever that changes, so a source edit reaches the node on the next deploy. `--no-cache` forces a full rebuild there too. File permissions (e.g. an executable entrypoint script) are preserved. |
+| `build.ssh` | Supported with `--no-registry` | Builds that declare `ssh:` run through `docker buildx` (BuildKit) on the assigned node so `RUN --mount=type=ssh` works. `default` uses `SSH_PRIVATE_KEY` from the control plane's environment (an ssh-agent socket can't be forwarded to another node); `id=path` reads that key file. Keys are held in control-plane memory and served only to the assigned node — never stored in SQLite or written into image layers. With a registry configured this is rejected with a clear error. |
+| build secrets | Not yet | Warned at plan time |
 | `environment`, `env_file` | Supported | Resolve at deploy time; redact secrets |
 | `ports` | Supported with validation | Every declared port becomes an internal `ContainerPort`, discoverable via service-name DNS whether or not it is published. Only a port with an explicit `published:` value also becomes a host binding; the real published value is what's reserved/conflict-checked (`Constraints.HostPorts`), and independent host/container port remapping is fully supported — publishing `5600` for a container listening on `5000` binds the agent's container to host port `5600` while the container itself still listens on `5000` (`Workload.PortBindings` pairs the two explicitly). Detect planned node/binding conflicts. |
 | `depends_on` conditions | Supported | Validates the graph and actually gates on the declared condition: `service_started` (default) is satisfied once a dependency is running or ready, `service_healthy` requires it to have actually passed its own healthcheck (StatusReady), not merely be running. `service_completed_successfully` is not evaluated (treated like service_started). |
@@ -19,7 +20,7 @@
 | bind mounts (other directory, data dir) | Supported with policy | Host path is ignored and treated as a managed node-local volume, same as a named volume — correct for a data directory meant to start empty, since it's never read back |
 | `networks` | Supported as logical membership | Maps to discovery/connectivity policy |
 | `secrets` | Supported | Deliver through protected secret handling |
-| CPU/memory limits | Supported | Translate according to approved semantics |
+| CPU/memory limits | Supported | `mem_limit` becomes the container's hard limit; no `mem_limit` means no limit, same as Docker Compose (it used to default to 128MiB, which silently OOM-killed databases). |
 | `restart` | Partial | Map only documented policies |
 | `platform` | Supported | No `platform:` means no hard architecture constraint (schedules onto whatever node is available) rather than assuming amd64. An explicit `platform:` must match the node's own architecture, except an arm64 node is treated as amd64-capable too (Docker Desktop's Rosetta/qemu emulation on Apple Silicon); the reverse isn't assumed. |
 | `extra_hosts`, `host-gateway` | Reject or warn | No implicit equivalent |

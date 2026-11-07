@@ -87,6 +87,73 @@ func (f buildRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error)
 	return f(req)
 }
 
+func TestTarContextKeepsExecutableBit(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "start.sh"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tarball, err := TarContext(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hdr, err := tar.NewReader(tarball).Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hdr.Mode&0o111 == 0 {
+		t.Fatalf("start.sh mode = %o, want the executable bit preserved", hdr.Mode)
+	}
+}
+
+func TestTarBuildContextHonorsDockerignore(t *testing.T) {
+	dir := t.TempDir()
+	write := func(rel, content string) {
+		p := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(".dockerignore", "*\n!firebase.json\n!Cloud\nCloud/*\n!Cloud/functions\nCloud/functions/venv\n")
+	write("firebase.json", "{}")
+	write("firebase/Dockerfile", "FROM scratch\n")
+	write("mysql-data/ibdata1", "big")
+	write("Cloud/other/x.py", "no")
+	write("Cloud/functions/main.py", "yes")
+	write("Cloud/functions/venv/lib.py", "no")
+
+	tarball, err := TarBuildContext(dir, "firebase/Dockerfile")
+	if err != nil {
+		t.Fatalf("TarBuildContext: %v", err)
+	}
+	got := map[string]bool{}
+	tr := tar.NewReader(tarball)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if hdr.Typeflag == tar.TypeReg {
+			got[hdr.Name] = true
+		}
+	}
+	for _, want := range []string{".dockerignore", "firebase.json", "firebase/Dockerfile", "Cloud/functions/main.py"} {
+		if !got[want] {
+			t.Errorf("missing %s; got %v", want, got)
+		}
+	}
+	for _, unwanted := range []string{"mysql-data/ibdata1", "Cloud/other/x.py", "Cloud/functions/venv/lib.py"} {
+		if got[unwanted] {
+			t.Errorf("%s should be excluded by .dockerignore; got %v", unwanted, got)
+		}
+	}
+}
+
 // TestTarContextPreservesEmptyDirectories covers a real bug: a directory
 // with no files of its own (e.g. Postgres's pg_notify, which must exist,
 // empty, for the server to start at all) used to get silently dropped —

@@ -5,9 +5,14 @@ package controlplane
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +42,10 @@ type Service struct {
 	// agent's fetch would mean redeploying, an accepted limitation.
 	buildContextsMu sync.Mutex
 	buildContexts   map[string][]byte
+	// buildSSH holds BuildKit SSH-mount keys (ssh ID -> private key) per
+	// workload key, guarded by buildContextsMu. Memory only, on purpose:
+	// key material must never reach the SQLite store.
+	buildSSH map[string]map[string][]byte
 
 	// volumeSnapshots holds a directory bind mount's content as a tarball,
 	// keyed by workload-key + volume index — the same in-memory, fetch-
@@ -326,6 +335,9 @@ func (svc *Service) resolveBuilds(ctx context.Context, project string, plan *com
 	}
 	for _, b := range plan.Builds {
 		if registry != "" {
+			if len(b.SSH) > 0 {
+				return images, remote, fmt.Errorf("service %s uses build.ssh, which needs BuildKit on the building node; start the control plane with --no-registry so the assigned agent builds it", b.Service)
+			}
 			if svc.builder == nil {
 				return images, remote, fmt.Errorf("service %s requires a build but no builder is configured", b.Service)
 			}
@@ -340,7 +352,7 @@ func (svc *Service) resolveBuilds(ctx context.Context, project string, plan *com
 		if !ok {
 			continue
 		}
-		tarball, err := build.TarContext(b.Context)
+		tarball, err := build.TarBuildContext(b.Context, b.Dockerfile)
 		if err != nil {
 			return images, remote, fmt.Errorf("package build context for %s: %w", b.Service, err)
 		}
@@ -348,11 +360,98 @@ func (svc *Service) resolveBuilds(ctx context.Context, project string, plan *com
 		if err != nil {
 			return images, remote, fmt.Errorf("read build context for %s: %w", b.Service, err)
 		}
+		sshKeys, err := resolveBuildSSHKeys(b)
+		if err != nil {
+			return images, remote, err
+		}
+		spec := &model.RemoteBuildSpec{Dockerfile: b.Dockerfile, Args: b.Args, Platform: b.Platform, NoCache: noCache}
+		for id := range sshKeys {
+			spec.SSHIDs = append(spec.SSHIDs, id)
+		}
+		sort.Strings(spec.SSHIDs)
+		spec.BuildID = buildID(spec, data)
+		if noCache {
+			// A no-cache deploy must rebuild even when nothing changed, so
+			// its ID can never match the image already on the node.
+			spec.BuildID += "-nocache-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+		}
 		images[b.Service] = fmt.Sprintf("%s-%s:%s", project, b.Service, wl.Revision)
-		remote[b.Service] = &model.RemoteBuildSpec{Dockerfile: b.Dockerfile, Args: b.Args, Platform: b.Platform}
+		remote[b.Service] = spec
 		svc.stashBuildContext(wl.Key(), data)
+		svc.stashBuildSSH(wl.Key(), sshKeys)
 	}
 	return images, remote, nil
+}
+
+// resolveBuildSSHKeys loads the private key behind each build.ssh entry:
+// an explicit `id=path` reads that file; compose's `default` (the builder
+// host's ssh-agent under plain `docker compose`) uses SSH_PRIVATE_KEY from
+// this control plane's environment, since an agent socket can't be
+// forwarded to another node's build.
+func resolveBuildSSHKeys(b compose.BuildSpec) (map[string][]byte, error) {
+	if len(b.SSH) == 0 {
+		return nil, nil
+	}
+	keys := make(map[string][]byte, len(b.SSH))
+	for id, path := range b.SSH {
+		if path != "" {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return nil, fmt.Errorf("service %s: read build.ssh key %q: %w", b.Service, id, err)
+			}
+			keys[id] = data
+			continue
+		}
+		key := os.Getenv("SSH_PRIVATE_KEY")
+		if strings.TrimSpace(key) == "" {
+			return nil, fmt.Errorf("service %s: build.ssh %q has no key path and SSH_PRIVATE_KEY is not set in the control plane's environment", b.Service, id)
+		}
+		if !strings.HasSuffix(key, "\n") {
+			key += "\n" // OpenSSH rejects a key file without a trailing newline
+		}
+		keys[id] = []byte(key)
+	}
+	return keys, nil
+}
+
+// buildID fingerprints everything that affects the built image.
+func buildID(spec *model.RemoteBuildSpec, context []byte) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "dockerfile=%s\nplatform=%s\n", spec.Dockerfile, spec.Platform)
+	argKeys := make([]string, 0, len(spec.Args))
+	for k := range spec.Args {
+		argKeys = append(argKeys, k)
+	}
+	sort.Strings(argKeys)
+	for _, k := range argKeys {
+		fmt.Fprintf(h, "arg %s=%s\n", k, spec.Args[k])
+	}
+	for _, id := range spec.SSHIDs {
+		fmt.Fprintf(h, "ssh %s\n", id)
+	}
+	h.Write(context)
+	return hex.EncodeToString(h.Sum(nil))[:20]
+}
+
+func (svc *Service) stashBuildSSH(key string, keys map[string][]byte) {
+	svc.buildContextsMu.Lock()
+	defer svc.buildContextsMu.Unlock()
+	if svc.buildSSH == nil {
+		svc.buildSSH = map[string]map[string][]byte{}
+	}
+	if len(keys) == 0 {
+		delete(svc.buildSSH, key)
+		return
+	}
+	svc.buildSSH[key] = keys
+}
+
+// FetchBuildSSH returns the BuildKit SSH keys stashed for a workload key.
+func (svc *Service) FetchBuildSSH(key string) (map[string][]byte, bool) {
+	svc.buildContextsMu.Lock()
+	defer svc.buildContextsMu.Unlock()
+	keys, ok := svc.buildSSH[key]
+	return keys, ok
 }
 
 // stashBuildContext holds a build-context tarball for an agent to fetch

@@ -64,6 +64,7 @@ func NewAgentHandler(svc *Service) http.Handler {
 	mux.Handle("POST /v1/nodes/{id}/heartbeat", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleHeartbeat)))
 	mux.Handle("GET /v1/agent/{node}/assignments", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleAssignments)))
 	mux.Handle("GET /v1/agent/{node}/build-context/{project}/{service}/{revision}", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleBuildContext)))
+	mux.Handle("GET /v1/agent/{node}/build-ssh/{project}/{service}/{revision}", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleBuildSSH)))
 	mux.Handle("GET /v1/agent/{node}/volume-context/{project}/{service}/{revision}/{index}", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleVolumeContext)))
 	mux.Handle("GET /v1/agent/{node}/volume-seed/{project}/{service}/{revision}/{index}", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleVolumeSeed)))
 	mux.Handle("POST /v1/agent/status", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleReportStatus)))
@@ -366,6 +367,38 @@ func (svc *Service) handleBuildContext(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/x-tar")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
+}
+
+// handleBuildSSH serves a build's BuildKit SSH keys (ID -> key) to the
+// node assigned that workload, with the same ownership check as
+// handleBuildContext.
+func (svc *Service) handleBuildSSH(w http.ResponseWriter, r *http.Request) {
+	nodeID := r.PathValue("node")
+	if authenticated := authenticatedNode(r); authenticated != "" && authenticated != nodeID {
+		writeError(w, http.StatusForbidden, fmt.Errorf("credential is not authorized for node %q", nodeID))
+		return
+	}
+	key := strings.Join([]string{r.PathValue("project"), r.PathValue("service"), r.PathValue("revision")}, "/")
+	rec, err := svc.GetWorkload(r.Context(), key)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err)
+		return
+	}
+	if rec.NodeID != nodeID {
+		writeError(w, http.StatusForbidden, fmt.Errorf("workload %q is not assigned to node %q", key, nodeID))
+		return
+	}
+	keys, ok := svc.FetchBuildSSH(key)
+	if !ok {
+		writeError(w, http.StatusNotFound, fmt.Errorf("no stashed build SSH keys for %q; redeploy so the control plane can load them", key))
+		return
+	}
+	out := make(map[string]string, len(keys))
+	for id, k := range keys {
+		out[id] = string(k)
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, out)
 }
 
 // handleVolumeContext serves a stashed directory bind-mount snapshot to

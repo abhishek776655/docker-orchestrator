@@ -292,7 +292,7 @@ func (a *Agent) execute(ctx context.Context, rec store.WorkloadRecord) {
 	}
 
 	if rec.RemoteBuild != nil {
-		if !a.docker.HasImage(ctx, rec.Image) {
+		if needsRemoteBuild(*rec.RemoteBuild, a.docker.HasImage(ctx, rec.Image), a.docker.ImageBuildID(ctx, rec.Image)) {
 			a.report(ctx, key, model.StatusBuilding, "", "")
 			if err := a.buildRemote(ctx, rec); err != nil {
 				a.report(ctx, key, model.StatusFailed, "remote build failed: "+err.Error(), "")
@@ -395,7 +395,38 @@ func (a *Agent) buildRemote(ctx context.Context, rec store.WorkloadRecord) error
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("fetch build context: control plane returned %s: %s", resp.Status, string(tarball))
 	}
-	return a.docker.BuildImage(ctx, bytes.NewReader(tarball), rec.Image, rec.RemoteBuild.Dockerfile, rec.RemoteBuild.Args, rec.RemoteBuild.Platform)
+	if len(rec.RemoteBuild.SSHIDs) == 0 {
+		return a.docker.BuildImage(ctx, bytes.NewReader(tarball), rec.Image, *rec.RemoteBuild)
+	}
+	sshPath := fmt.Sprintf("/v1/agent/%s/build-ssh/%s/%s/%s", a.cfg.NodeID, rec.Project, rec.Service, rec.Revision)
+	sshReq, err := http.NewRequestWithContext(ctx, http.MethodGet, a.cfg.ControlPlaneURL+sshPath, nil)
+	if err != nil {
+		return err
+	}
+	sshResp, body, err := a.doRaw(sshReq)
+	if err != nil {
+		return err
+	}
+	if sshResp.StatusCode >= 300 {
+		return fmt.Errorf("fetch build ssh keys: control plane returned %s: %s", sshResp.Status, string(body))
+	}
+	var keys map[string]string
+	if err := json.Unmarshal(body, &keys); err != nil {
+		return fmt.Errorf("decode build ssh keys: %w", err)
+	}
+	return a.docker.BuildImageWithSSH(ctx, bytes.NewReader(tarball), rec.Image, *rec.RemoteBuild, keys)
+}
+
+// needsRemoteBuild reports whether this node must (re)build a RemoteBuild
+// image: when it's missing, or when the local copy was built from
+// different inputs (or before a --no-cache deploy). Without the BuildID
+// comparison an existing tag was reused forever, so source changes never
+// reached a node once it had built the image once.
+func needsRemoteBuild(spec model.RemoteBuildSpec, hasImage bool, localBuildID string) bool {
+	if !hasImage {
+		return true
+	}
+	return spec.BuildID != "" && spec.BuildID != localBuildID
 }
 
 // fetchVolumeSnapshots materializes every directory bind mount this

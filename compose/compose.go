@@ -42,6 +42,9 @@ type BuildSpec struct {
 	Dockerfile string
 	Args       map[string]string
 	Platform   string
+	// SSH maps each build.ssh ID to its host key path; "" means the
+	// compose `default` entry.
+	SSH map[string]string
 }
 
 // Plan is the importer's output: a dry-run deployment plan (SRS UC-02,
@@ -148,6 +151,18 @@ func Load(ctx context.Context, project, workingDir string, yaml []byte) (*Plan, 
 	}
 	for _, name := range names {
 		if b := proj.Services[name].Build; b != nil && b.Context != "" {
+			// A build context equal to the project root itself (`context: .`
+			// in the compose file, common when a Dockerfile needs a
+			// top-level file) makes matchesAnyBuildContext's "is inside a
+			// build context" check meaningless: every bind mount anywhere
+			// in the whole project is trivially "inside" the root, so a
+			// single root-context service would force the live-reload
+			// treatment (and so RemoteDirKey instead of the ordinary
+			// managed-volume SeedDirKey path) onto every other service's
+			// data directories too, mysql's ./mysql-data included.
+			if filepath.Clean(b.Context) == filepath.Clean(workingDir) {
+				continue
+			}
 			buildContexts = append(buildContexts, b.Context)
 		}
 	}
@@ -296,8 +311,14 @@ func convertService(project, workingDir, name string, svc types.ServiceConfig, b
 				build.Args[k] = *v
 			}
 		}
-		if len(svc.Build.SSH) > 0 || len(svc.Build.Secrets) > 0 {
-			warnings = append(warnings, fmt.Sprintf("%s: build.ssh/build.secrets are declared but BuildKit secret/SSH mounts are not implemented yet; the build will fail for anything requiring private access (SRS §11, §18.1)", name))
+		if len(svc.Build.SSH) > 0 {
+			build.SSH = map[string]string{}
+			for _, k := range svc.Build.SSH {
+				build.SSH[k.ID] = k.Path
+			}
+		}
+		if len(svc.Build.Secrets) > 0 {
+			warnings = append(warnings, fmt.Sprintf("%s: build.secrets are declared but BuildKit secret mounts are not implemented yet; the build will fail for anything requiring them (SRS §11, §18.1)", name))
 		}
 		// Caught here rather than left to surface mid-deploy: a missing
 		// build context (typo'd path, directory never committed, wrong
@@ -609,7 +630,11 @@ func convertService(project, workingDir, name string, svc types.ServiceConfig, b
 	if svc.CPUS > 0 {
 		wl.Resources.CPUMillis = int64(svc.CPUS * 1000)
 	}
-	wl.Resources.MemoryBytes = 134_217_728 // 128MiB default
+	// No mem_limit in the compose file means no cap at all in real Docker
+	// Compose — MemoryBytes 0 carries that through (Docker's own "no limit"
+	// value, and the scheduler reserves nothing for it). A hardcoded
+	// fallback here (previously 128MiB) silently OOM-kills any real service
+	// that needs more than that, with no error beyond a bare SIGKILL.
 	if svc.MemLimit > 0 {
 		wl.Resources.MemoryBytes = int64(svc.MemLimit)
 	}

@@ -96,6 +96,16 @@ type RemoteBuildSpec struct {
 	Dockerfile string            `json:"dockerfile"`
 	Args       map[string]string `json:"args"`
 	Platform   string            `json:"platform"`
+	NoCache    bool              `json:"no_cache,omitempty"`
+	// BuildID fingerprints this build's inputs and is stamped on the image
+	// as a label; the agent rebuilds whenever its local image carries a
+	// different one, so a source change actually reaches the node instead
+	// of being skipped because an image with the same tag already exists.
+	BuildID string `json:"build_id,omitempty"`
+	// SSHIDs names the BuildKit SSH mounts (RUN --mount=type=ssh) this build
+	// needs. Only the IDs live here: the key material is held in control-
+	// plane memory and fetched over the build-ssh endpoint, never persisted.
+	SSHIDs []string `json:"ssh_ids,omitempty"`
 }
 
 // StoragePolicy pins a workload to a node when it owns node-local

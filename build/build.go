@@ -17,6 +17,8 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/client"
+	"github.com/moby/patternmatcher"
+	"github.com/moby/patternmatcher/ignorefile"
 
 	"github.com/abhishek/hardware-aware-container-orchestrator/compose"
 )
@@ -51,7 +53,7 @@ func (s *Service) Registry() string { return s.registry }
 // already exists locally (e.g. source changed but the Dockerfile/context
 // hash alone wouldn't tell Docker that).
 func (s *Service) Build(ctx context.Context, project, revision string, spec compose.BuildSpec, noCache bool) (string, error) {
-	tarball, err := TarContext(spec.Context)
+	tarball, err := TarBuildContext(spec.Context, spec.Dockerfile)
 	if err != nil {
 		return "", fmt.Errorf("package build context: %w", err)
 	}
@@ -180,6 +182,40 @@ func validateImagePlatform(image types.ImageInspect, requested string) error {
 // client needed, so a control plane with no Docker at all can still do
 // this part.
 func TarContext(dir string) (io.Reader, error) {
+	return tarDir(dir, nil)
+}
+
+// TarBuildContext is TarContext for a Docker build: it honors the
+// context's .dockerignore the way `docker build` does, always keeping the
+// Dockerfile and .dockerignore themselves. Without this, a `context: .`
+// service at a monorepo root ships the whole tree (every repo, every
+// database's data directory) even when .dockerignore narrows it to a few
+// files.
+func TarBuildContext(dir, dockerfile string) (io.Reader, error) {
+	f, err := os.Open(filepath.Join(dir, ".dockerignore"))
+	if os.IsNotExist(err) {
+		return tarDir(dir, nil)
+	}
+	if err != nil {
+		return nil, err
+	}
+	patterns, err := ignorefile.ReadAll(f)
+	f.Close()
+	if err != nil {
+		return nil, fmt.Errorf("read .dockerignore: %w", err)
+	}
+	if dockerfile == "" {
+		dockerfile = "Dockerfile"
+	}
+	patterns = append(patterns, "!"+filepath.ToSlash(filepath.Clean(dockerfile)), "!.dockerignore")
+	pm, err := patternmatcher.New(patterns)
+	if err != nil {
+		return nil, fmt.Errorf("parse .dockerignore: %w", err)
+	}
+	return tarDir(dir, pm)
+}
+
+func tarDir(dir string, pm *patternmatcher.PatternMatcher) (io.Reader, error) {
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
 
@@ -190,6 +226,30 @@ func TarContext(dir string) (io.Reader, error) {
 		rel, err := filepath.Rel(dir, path)
 		if err != nil {
 			return err
+		}
+		if rel != "." && pm != nil {
+			excluded, err := pm.MatchesOrParentMatches(filepath.ToSlash(rel))
+			if err != nil {
+				return err
+			}
+			if excluded {
+				if !info.IsDir() {
+					return nil
+				}
+				// Same rule as Docker's own archiver: an excluded directory
+				// is still walked only if some !exception pattern could
+				// re-include something beneath it.
+				if !pm.Exclusions() {
+					return filepath.SkipDir
+				}
+				dirSlash := filepath.ToSlash(rel) + "/"
+				for _, p := range pm.Patterns() {
+					if p.Exclusion() && strings.HasPrefix(p.String()+"/", dirSlash) {
+						return nil
+					}
+				}
+				return filepath.SkipDir
+			}
 		}
 		if info.IsDir() {
 			if rel == "." {
@@ -207,7 +267,7 @@ func TarContext(dir string) (io.Reader, error) {
 		if err != nil {
 			return err
 		}
-		hdr := &tar.Header{Name: rel, Mode: 0o644, Size: int64(len(data))}
+		hdr := &tar.Header{Name: rel, Mode: int64(info.Mode().Perm() | 0o644), Size: int64(len(data))}
 		if err := tw.WriteHeader(hdr); err != nil {
 			return err
 		}

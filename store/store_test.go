@@ -88,6 +88,37 @@ func TestListReadyServiceInstancesReturnsInternalPort(t *testing.T) {
 	}
 }
 
+func TestListProjectServiceTargetsIncludesPortlessService(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	node := testNode("node-portless")
+	if err := s.UpsertNode(ctx, node); err != nil {
+		t.Fatalf("upsert node: %v", err)
+	}
+	wl := store.WorkloadRecord{
+		Workload: model.Workload{
+			Project:      "demo",
+			Service:      "db",
+			Revision:     "latest",
+			Image:        "postgres:14-alpine",
+			Storage:      model.StoragePolicy{Class: model.Ephemeral},
+			DesiredState: model.DesiredRunning,
+		},
+		Status: model.StatusReady,
+		NodeID: node.ID,
+	}
+	if err := s.CreateWorkload(ctx, wl); err != nil {
+		t.Fatalf("create workload: %v", err)
+	}
+	targets, err := s.ListProjectServiceTargets(ctx, "demo")
+	if err != nil {
+		t.Fatalf("list targets: %v", err)
+	}
+	if len(targets) != 1 || targets[0].Service != "db" || targets[0].Status != model.StatusReady {
+		t.Fatalf("targets = %+v, want the ready port-less db service", targets)
+	}
+}
+
 // TestListReadyServiceInstancesExcludesNonReady covers the review focus:
 // "A failed or waiting workload must disappear from DNS answers
 // immediately."

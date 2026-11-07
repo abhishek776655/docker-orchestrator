@@ -10,6 +10,7 @@ require (
 	github.com/docker/docker v24.0.9+incompatible
 	github.com/docker/go-connections v0.4.0
 	github.com/miekg/dns v1.1.73
+	github.com/moby/patternmatcher v0.6.0
 	golang.org/x/sys v0.49.0
 	modernc.org/sqlite v1.61.1
 )
