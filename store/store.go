@@ -138,6 +138,9 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	_, _ = db.ExecContext(ctx, `ALTER TABLE workloads ADD COLUMN health_check text NOT NULL DEFAULT ''`)
 	_, _ = db.ExecContext(ctx, `ALTER TABLE workloads ADD COLUMN port_bindings text NOT NULL DEFAULT '[]'`)
 	_, _ = db.ExecContext(ctx, `ALTER TABLE nodes ADD COLUMN disabled_by_admin integer NOT NULL DEFAULT 0`)
+	_, _ = db.ExecContext(ctx, `ALTER TABLE nodes ADD COLUMN display_name text NOT NULL DEFAULT ''`)
+	_, _ = db.ExecContext(ctx, `ALTER TABLE nodes ADD COLUMN cpu_limit_millis integer NOT NULL DEFAULT 0`)
+	_, _ = db.ExecContext(ctx, `ALTER TABLE nodes ADD COLUMN memory_limit_bytes integer NOT NULL DEFAULT 0`)
 	return &Store{db: db}, nil
 }
 
@@ -618,9 +621,92 @@ func (s *Store) Metrics(ctx context.Context, project string) (*Metrics, error) {
 	return m, rows.Err()
 }
 
+// capResources applies an operator's limits to detected capacity; a zero
+// limit field leaves that resource uncapped.
+func capResources(detected, limits model.Resources) model.Resources {
+	out := detected
+	if limits.CPUMillis > 0 && limits.CPUMillis < out.CPUMillis {
+		out.CPUMillis = limits.CPUMillis
+	}
+	if limits.MemoryBytes > 0 && limits.MemoryBytes < out.MemoryBytes {
+		out.MemoryBytes = limits.MemoryBytes
+	}
+	return out
+}
+
+// SetNodeDisplayName sets the operator's name for a node; "" clears it.
+func (s *Store) SetNodeDisplayName(ctx context.Context, id, name string) error {
+	return s.updateNode(ctx, id, `UPDATE nodes SET display_name = ? WHERE id = ?`, name, id)
+}
+
+// SetNodeLimits caps how much of a node the scheduler may reserve; zero
+// fields remove that cap. Agents keep reporting detected capacity, so a
+// heartbeat or re-registration never undoes it.
+func (s *Store) SetNodeLimits(ctx context.Context, id string, limits model.Resources) error {
+	return s.updateNode(ctx, id, `UPDATE nodes SET cpu_limit_millis = ?, memory_limit_bytes = ? WHERE id = ?`, limits.CPUMillis, limits.MemoryBytes, id)
+}
+
+func (s *Store) updateNode(ctx context.Context, id, query string, args ...any) error {
+	res, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return fmt.Errorf("%w: node %q", ErrNotFound, id)
+	}
+	return nil
+}
+
+// RestartWorkload asks for a running workload's container to be recreated:
+// it goes back to "assigned" on the same node, and the caller tells that
+// node's agent to remove the old container.
+func (s *Store) RestartWorkload(ctx context.Context, key string) (nodeID string, err error) {
+	now := formatTime(time.Now())
+	if err := s.db.QueryRowContext(ctx, `SELECT node_id FROM workloads WHERE key = ?`, key).Scan(&nodeID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", fmt.Errorf("%w: workload %q", ErrNotFound, key)
+		}
+		return "", err
+	}
+	_, err = s.db.ExecContext(ctx, `
+		UPDATE workloads SET desired_state = 'running', status = 'assigned', status_reason = 'restart requested', updated_at = ?
+		WHERE key = ?`, now, key)
+	if err != nil {
+		return "", err
+	}
+	_, _ = s.db.ExecContext(ctx, `INSERT INTO events (workload_key, node_id, type, message, created_at) VALUES (?, ?, 'status', ?, ?)`, key, nodeID, "assigned: restart requested by operator", now)
+	return nodeID, nil
+}
+
+// StartWorkload runs a stopped workload again on the node it last ran on,
+// so its volume data and cached image are still there. The caller checks
+// the node still has room first.
+func (s *Store) StartWorkload(ctx context.Context, key string) error {
+	now := formatTime(time.Now())
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE workloads SET desired_state = 'running', status = 'assigned', status_reason = 'started by operator', container_id = '', updated_at = ?
+		WHERE key = ? AND node_id != ''`, now, key)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("%w: workload %q (or it was never placed on a node)", ErrNotFound, key)
+	}
+	_, _ = s.db.ExecContext(ctx, `INSERT INTO events (workload_key, type, message, created_at) VALUES (?, 'status', ?, ?)`, key, "assigned: started by operator", now)
+	return nil
+}
+
+// RecordNodeEvent adds a node-level event (no workload), such as an image
+// removal result.
+func (s *Store) RecordNodeEvent(ctx context.Context, nodeID, typ, message string) {
+	_, _ = s.db.ExecContext(ctx, `INSERT INTO events (workload_key, node_id, type, message, created_at) VALUES ('', ?, ?, ?, ?)`, nodeID, typ, message, formatTime(time.Now()))
+}
+
 // ListNodes returns every known node.
 func (s *Store) ListNodes(ctx context.Context) ([]model.Node, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, address, architecture, labels, capabilities, cpu_millis, memory_bytes, availability, disabled_by_admin, heartbeat_at, gpus, thermal, cached_images FROM nodes`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, address, architecture, labels, capabilities, cpu_millis, memory_bytes, availability, disabled_by_admin, heartbeat_at, gpus, thermal, cached_images, display_name, cpu_limit_millis, memory_limit_bytes FROM nodes`)
 	if err != nil {
 		return nil, err
 	}
@@ -631,9 +717,10 @@ func (s *Store) ListNodes(ctx context.Context) ([]model.Node, error) {
 		var n model.Node
 		var labels, caps, gpus, thermal, cachedImages []byte
 		var availability, heartbeatAt string
-		if err := rows.Scan(&n.ID, &n.Address, &n.Architecture, &labels, &caps, &n.Allocatable.CPUMillis, &n.Allocatable.MemoryBytes, &availability, &n.DisabledByAdmin, &heartbeatAt, &gpus, &thermal, &cachedImages); err != nil {
+		if err := rows.Scan(&n.ID, &n.Address, &n.Architecture, &labels, &caps, &n.Detected.CPUMillis, &n.Detected.MemoryBytes, &availability, &n.DisabledByAdmin, &heartbeatAt, &gpus, &thermal, &cachedImages, &n.DisplayName, &n.Limits.CPUMillis, &n.Limits.MemoryBytes); err != nil {
 			return nil, err
 		}
+		n.Allocatable = capResources(n.Detected, n.Limits)
 		n.Availability = model.Availability(availability)
 		n.HeartbeatAt, err = parseTime(heartbeatAt)
 		if err != nil {

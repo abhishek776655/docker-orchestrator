@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -313,5 +314,73 @@ func TestAgentJoinTokenIsOneTimeAndCredentialCanBeRevoked(t *testing.T) {
 	}
 	if ok, err := s.VerifyAgentCredential(ctx, "node-a", "replacement-hash"); err != nil || !ok {
 		t.Fatalf("replacement after revocation = %v, %v; want true, nil", ok, err)
+	}
+}
+
+func TestNodeLimitsCapAllocatableAndSurviveReRegistration(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	n := testNode("node-limit")
+	n.Allocatable = model.Resources{CPUMillis: 8000, MemoryBytes: 16 << 30}
+	if err := s.UpsertNode(ctx, n); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetNodeLimits(ctx, n.ID, model.Resources{CPUMillis: 4000}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetNodeDisplayName(ctx, n.ID, "Studio Mac"); err != nil {
+		t.Fatal(err)
+	}
+	// A restarted agent registers again with its detected capacity.
+	if err := s.UpsertNode(ctx, n); err != nil {
+		t.Fatal(err)
+	}
+	nodes, err := s.ListNodes(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := nodes[0]
+	if got.Allocatable.CPUMillis != 4000 || got.Allocatable.MemoryBytes != 16<<30 {
+		t.Fatalf("allocatable = %+v, want CPU capped to 4000 and memory uncapped", got.Allocatable)
+	}
+	if got.Detected.CPUMillis != 8000 || got.DisplayName != "Studio Mac" {
+		t.Fatalf("detected = %+v, name = %q", got.Detected, got.DisplayName)
+	}
+	if err := s.SetNodeLimits(ctx, "missing", model.Resources{}); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
+func TestStartWorkloadRunsAStoppedOneOnItsNode(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	n := testNode("node-start")
+	if err := s.UpsertNode(ctx, n); err != nil {
+		t.Fatal(err)
+	}
+	wl := store.WorkloadRecord{
+		Workload: model.Workload{Project: "demo", Service: "api", Revision: "latest", Image: "x", Storage: model.StoragePolicy{Class: model.Ephemeral}, DesiredState: model.DesiredRunning},
+		Status:   model.StatusReady, NodeID: n.ID,
+	}
+	if err := s.CreateWorkload(ctx, wl); err != nil {
+		t.Fatal(err)
+	}
+	key := wl.Workload.Key()
+	if err := s.StopWorkload(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.StartWorkload(ctx, key); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetWorkload(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.StatusAssigned || got.DesiredState != model.DesiredRunning || got.NodeID != n.ID {
+		t.Fatalf("after start: status %s desired %s node %s", got.Status, got.DesiredState, got.NodeID)
+	}
+	assigned, _ := s.AssignedWorkloads(ctx, n.ID)
+	if len(assigned) != 1 {
+		t.Fatalf("the node's agent should see it again, got %d assigned", len(assigned))
 	}
 }

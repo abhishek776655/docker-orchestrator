@@ -23,6 +23,20 @@ fi
 
 echo "Installed to $GOBIN"
 
+# The web console (served by 'hacoctl start --web') is built into the
+# control plane's data dir. It needs npm; without it the CLI still works.
+WEB_DEST="${HACO_DATA_DIR:-$HOME/.haco}/web"
+if command -v npm >/dev/null 2>&1; then
+	echo "Building the web console..."
+	(cd web && npm ci --no-audit --no-fund --loglevel=error && npm run build --silent)
+	mkdir -p "$WEB_DEST"
+	rm -rf "${WEB_DEST:?}"/*
+	cp -R web/dist/. "$WEB_DEST/"
+	echo "Web console installed to $WEB_DEST (serve it with 'hacoctl start --web')"
+else
+	echo "npm not found: skipping the web console ('hacoctl start --web' needs it)"
+fi
+
 case ":$PATH:" in
 *":$GOBIN:"*)
 	;;
@@ -37,7 +51,7 @@ cat <<'EOF'
 
 Next steps:
   On this machine (runs the control plane and its own node):
-    hacoctl start
+    hacoctl start            # add --web to also serve the web console
 
   On every OTHER machine you want as a worker node, once the control
   plane above is running (it prints a one-time join command/token too):

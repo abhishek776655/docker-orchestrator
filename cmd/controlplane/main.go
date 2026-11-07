@@ -95,7 +95,12 @@ func main() {
 	go svc.RunReconciler(ctx, reconcileInterval, heartbeatTimeout)
 	log.Printf("reconciler running every %s, heartbeat timeout %s", reconcileInterval, heartbeatTimeout)
 
-	server := &http.Server{Addr: addr, Handler: controlplane.LocalOnly(controlplane.NewHandler(svc))}
+	var operator http.Handler = controlplane.NewHandler(svc)
+	if webDir := os.Getenv("HACO_WEB_DIR"); webDir != "" {
+		operator = controlplane.WithWebUI(operator, webDir)
+		log.Printf("web console served from %s at http://%s/", webDir, addr)
+	}
+	server := &http.Server{Addr: addr, Handler: controlplane.LocalOnly(operator)}
 	agentServer := &http.Server{Addr: agentAddr, Handler: controlplane.NewAgentHandler(svc), TLSConfig: &tls.Config{Certificates: []tls.Certificate{tlsCert}, MinVersion: tls.VersionTLS12}}
 	agentListener, err := net.Listen("tcp", agentAddr)
 	if err != nil {

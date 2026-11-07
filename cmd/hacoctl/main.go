@@ -60,6 +60,10 @@ func main() {
 		err = logs(url, os.Args[2:])
 	case "stop":
 		err = stop(url, os.Args[2:])
+	case "resume":
+		err = resume(url, os.Args[2:])
+	case "restart":
+		err = restart(url, os.Args[2:])
 	case "remove-workload":
 		err = removeWorkload(url, os.Args[2:])
 	case "remove-all-workloads":
@@ -112,13 +116,16 @@ Usage:
   hacoctl status [project] [service] [revision]   table of every workload (optionally filtered to one project), or one workload's full detail once service is named (revision defaults to "latest")
   hacoctl logs   <project> <service> [revision]   live container logs from whichever node runs it (revision defaults to "latest"; --tail N lines, default 200; -f to follow); falls back to the tail captured when a container failed to start
   hacoctl stop   <project> <service> <revision>   stop the workload and remove its container
+  hacoctl resume <project> [service]              start stopped services again on the nodes they last ran on (no rebuild, no rescheduling)
+  hacoctl restart <project> [service]             recreate the containers of running services, in place
   hacoctl remove-workload <project> <service> [revision]   hard-delete that workload's record entirely (revision defaults to "latest"); distinct from stop, which keeps a stopped row
   hacoctl remove-all-workloads [project]          hard-delete every workload record, optionally scoped to one project (--yes skips confirmation)
   hacoctl nodes                                   list registered nodes
   hacoctl node <id>                               one node's full detail
   hacoctl node cordon <id>                        block new workloads from scheduling onto this node (existing ones keep running)
   hacoctl node uncordon <id>                      make this node eligible for new workloads again
-  hacoctl node rename <old-id> <new-id>           rename a node everywhere: database pins, its data folder and credential; its containers are recreated under the new name (its agent must be running; --yes skips confirmation)
+  hacoctl node rename <id> <name>                 give a node a display name (its ID is the machine's permanent identity and never changes)
+  hacoctl node limit <id> --cpus N --memory SIZE  cap what the scheduler may reserve on a node, e.g. --cpus 4 --memory 8GiB (--clear removes the cap)
   hacoctl workloads [project]                     table of every workload, optionally filtered to one project
   hacoctl projects                                list distinct projects with a quick workload-status breakdown
   hacoctl tui [project]                           read-only auto-refreshing terminal dashboard (nodes/workloads/containers/events/metrics/services/projects tabs)
@@ -132,7 +139,7 @@ Usage:
   hacoctl stop-containers [project]               stop every workload's container, optionally filtered to one project (nodes stay joined; --yes skips confirmation)
   hacoctl teardown                                stop every workload and revoke every node credential (--yes skips confirmation)
   hacoctl shutdown                                stop the whole cluster in order: every node's containers (stopped, not removed) and agent, then the control plane; 'hacoctl start' + 'hacoctl agent run' bring the same services back (--yes skips confirmation)
-  hacoctl start                                   start the control plane in the background, with the local build registry on by default (--foreground to run attached, --no-registry to disable the registry, --logs to tail its log right after starting, --tui to launch the dashboard once ready instead — not combinable with each other or --foreground)
+  hacoctl start                                   start the control plane in the background; each node builds its own images (--registry to run the local build registry instead, --web to also serve the web console and print its URL, --foreground to run attached, --logs to tail its log right after starting, --tui to launch the dashboard once ready instead — not combinable with each other or --foreground)
   hacoctl stop-all                                stop the control plane process started by 'hacoctl start'
   hacoctl agent join <token>                      join this machine as a worker node (one-time token from 'hacoctl start')
   hacoctl agent run                                run this machine's already-joined node (reuses the saved credential, no token needed)`)
@@ -1027,45 +1034,107 @@ func node(baseURL string, args []string) error {
 	case len(args) == 2 && args[0] == "uncordon":
 		return post(baseURL, "/v1/admin/nodes/"+neturl.PathEscape(args[1])+"/uncordon", []byte(`{}`))
 	case len(args) >= 1 && args[0] == "rename":
-		return renameNode(baseURL, args[1:])
+		return setNodeName(baseURL, args[1:])
+	case len(args) >= 1 && args[0] == "limit":
+		return setNodeLimits(baseURL, args[1:])
 	default:
 		return nodeDetail(baseURL, args)
 	}
 }
 
-func renameNode(baseURL string, args []string) error {
-	var ids []string
-	yes := false
-	for _, a := range args {
-		if a == "--yes" || a == "-y" {
-			yes = true
-		} else {
-			ids = append(ids, a)
-		}
+// setNodeName sets a node's display name. The node ID is the machine's
+// permanent identity and never changes; only the name shown does.
+func setNodeName(baseURL string, args []string) error {
+	if len(args) < 2 {
+		return fmt.Errorf("usage: hacoctl node rename <node-id> <name>   (\"\" clears the name)")
 	}
-	if len(ids) != 2 {
-		return fmt.Errorf("usage: hacoctl node rename <old-id> <new-id> [--yes]")
-	}
-	oldID, newID := ids[0], ids[1]
-	fmt.Printf("Renaming node %s to %s.\n", oldID, newID)
-	fmt.Println("Its containers are stopped, removed and recreated under the new name (services on it restart once);")
-	fmt.Println("its data folder and credential move with it. Any --pin-node or x-haco-pin-node naming the old ID must be updated by hand.")
-	if !yes && !confirm("Continue?") {
-		return fmt.Errorf("rename aborted")
-	}
-	body, _ := json.Marshal(map[string]string{"new_id": newID})
-	client := &http.Client{Timeout: 10 * time.Minute}
-	resp, err := client.Post(baseURL+"/v1/admin/nodes/"+neturl.PathEscape(oldID)+"/rename", "application/json", bytes.NewReader(body))
-	if err != nil {
+	id, name := args[0], strings.Join(args[1:], " ")
+	body, _ := json.Marshal(map[string]string{"name": name})
+	if err := postQuiet(baseURL, "/v1/admin/nodes/"+neturl.PathEscape(id)+"/name", body); err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("control plane returned %s: %s", resp.Status, string(data))
+	if strings.TrimSpace(name) == "" {
+		fmt.Printf("node %s now shows its ID\n", id)
+	} else {
+		fmt.Printf("node %s is now named %q (its ID stays %s)\n", id, name, id)
 	}
-	fmt.Printf("renamed %s -> %s; its agent is restarting under the new name and will recreate its containers.\n", oldID, newID)
 	return nil
+}
+
+// setNodeLimits caps how much CPU and memory the scheduler may reserve on a
+// node, below what its Docker reports.
+func setNodeLimits(baseURL string, args []string) error {
+	usage := fmt.Errorf("usage: hacoctl node limit <node-id> [--cpus N] [--memory SIZE] | hacoctl node limit <node-id> --clear   (SIZE like 8GiB, 512MiB, 4G)")
+	if len(args) < 2 {
+		return usage
+	}
+	id := args[0]
+	var cpu, mem int64
+	set := false
+	for i := 1; i < len(args); i++ {
+		switch args[i] {
+		case "--clear":
+			set = true
+		case "--cpus":
+			if i+1 >= len(args) {
+				return usage
+			}
+			v, err := strconv.ParseFloat(args[i+1], 64)
+			if err != nil || v <= 0 {
+				return fmt.Errorf("--cpus %q: want a positive number of cores, e.g. 4 or 2.5", args[i+1])
+			}
+			cpu, set, i = int64(v*1000), true, i+1
+		case "--memory":
+			if i+1 >= len(args) {
+				return usage
+			}
+			v, err := parseByteSize(args[i+1])
+			if err != nil {
+				return fmt.Errorf("--memory %q: %w", args[i+1], err)
+			}
+			mem, set, i = v, true, i+1
+		default:
+			return usage
+		}
+	}
+	if !set {
+		return usage
+	}
+	body, _ := json.Marshal(map[string]int64{"cpu_millis": cpu, "memory_bytes": mem})
+	if err := postQuiet(baseURL, "/v1/admin/nodes/"+neturl.PathEscape(id)+"/limits", body); err != nil {
+		return err
+	}
+	describe := func(v int64, f func(int64) string) string {
+		if v == 0 {
+			return "no limit"
+		}
+		return f(v)
+	}
+	fmt.Printf("node %s: CPU %s, memory %s. The scheduler reserves no more than this there; running workloads are not moved.\n", id,
+		describe(cpu, func(v int64) string { return fmt.Sprintf("%.2g cores", float64(v)/1000) }),
+		describe(mem, func(v int64) string { return fmt.Sprintf("%.1f GiB", float64(v)/(1<<30)) }))
+	return nil
+}
+
+// parseByteSize reads sizes like 8GiB, 8G, 512MiB, 512M or a plain byte count.
+func parseByteSize(s string) (int64, error) {
+	t := strings.ToUpper(strings.TrimSpace(s))
+	units := []struct {
+		suffix string
+		mult   float64
+	}{{"TIB", 1 << 40}, {"GIB", 1 << 30}, {"MIB", 1 << 20}, {"KIB", 1 << 10}, {"TB", 1 << 40}, {"GB", 1 << 30}, {"MB", 1 << 20}, {"KB", 1 << 10}, {"T", 1 << 40}, {"G", 1 << 30}, {"M", 1 << 20}, {"K", 1 << 10}, {"B", 1}}
+	mult := 1.0
+	for _, u := range units {
+		if strings.HasSuffix(t, u.suffix) {
+			t, mult = strings.TrimSuffix(t, u.suffix), u.mult
+			break
+		}
+	}
+	v, err := strconv.ParseFloat(strings.TrimSpace(t), 64)
+	if err != nil || v <= 0 {
+		return 0, fmt.Errorf("want a size like 8GiB or 512MiB")
+	}
+	return int64(v * mult), nil
 }
 
 func nodeDetail(baseURL string, args []string) error {
@@ -1347,19 +1416,22 @@ func shutdown(baseURL string, args []string) error {
 // require knowing about a separate `controlplane` binary at all. It
 // no-ops if the control plane is already reachable, and by default
 // detaches into the background with its own log file; --foreground
-// runs it attached to this terminal instead. It also defaults the local
-// build/push registry on (HACO_REGISTRY_ADDR=auto) unless the caller
-// already set HACO_REGISTRY_ADDR or passed --no-registry, so a `build:`
-// service in a compose file works without that env var being set by hand
-// every time.
+// runs it attached to this terminal instead. Without a registry (the
+// default) each node builds its own images from the shipped context;
+// --registry turns on the local build/push registry (HACO_REGISTRY_ADDR=auto)
+// unless the caller already set HACO_REGISTRY_ADDR.
 func start(baseURL string, args []string) error {
-	foreground, registry, showLogs, showTUI := false, true, false, false
+	foreground, registry, showLogs, showTUI, web := false, false, false, false, false
 	for _, a := range args {
 		switch a {
+		case "--web":
+			web = true
 		case "--foreground", "-f":
 			foreground = true
+		case "--registry":
+			registry = true
 		case "--no-registry":
-			registry = false
+			registry = false // the default now; still accepted so old scripts keep working
 		case "--logs":
 			showLogs = true
 		case "--tui":
@@ -1376,8 +1448,24 @@ func start(baseURL string, args []string) error {
 	dataDir := envOr("HACO_DATA_DIR", filepath.Join(homeDir(), ".haco"))
 	logPath := filepath.Join(dataDir, "controlplane.log")
 
+	webDir := ""
+	if web {
+		dir, err := webConsoleDir(dataDir)
+		if err != nil {
+			return err
+		}
+		webDir = dir
+	}
+
 	if controlPlaneUp(baseURL) {
 		fmt.Printf("control plane already running at %s\n", baseURL)
+		if web {
+			if webConsoleUp(baseURL) {
+				fmt.Printf("web console: %s/\n", strings.TrimRight(baseURL, "/"))
+			} else {
+				fmt.Println("the running control plane was started without --web; run 'hacoctl stop-all' then 'hacoctl start --web' to serve the console")
+			}
+		}
 		if showLogs {
 			return tailLogFile(logPath)
 		}
@@ -1395,6 +1483,12 @@ func start(baseURL string, args []string) error {
 	env := os.Environ()
 	if registry && os.Getenv("HACO_REGISTRY_ADDR") == "" {
 		env = append(env, "HACO_REGISTRY_ADDR=auto")
+	}
+	// Only --web serves the console; drop an inherited HACO_WEB_DIR otherwise.
+	env = withoutEnv(env, "HACO_WEB_DIR")
+	if web {
+		env = append(env, "HACO_WEB_DIR="+webDir)
+		fmt.Printf("web console: %s/ (once the control plane is up)\n", strings.TrimRight(baseURL, "/"))
 	}
 
 	if foreground {
@@ -1433,6 +1527,9 @@ func start(baseURL string, args []string) error {
 	for i := 0; i < 20; i++ {
 		if controlPlaneUp(baseURL) {
 			fmt.Printf("control plane ready at %s\n", baseURL)
+			if web {
+				fmt.Printf("web console ready at %s/\n", strings.TrimRight(baseURL, "/"))
+			}
 			if showLogs {
 				return tailLogFile(logPath)
 			}
@@ -1472,6 +1569,41 @@ func stopAll(args []string) error {
 	_ = os.Remove(pidPath)
 	fmt.Printf("control plane stopped (pid %d)\n", pid)
 	return nil
+}
+
+// webConsoleDir finds the built web console: HACO_WEB_DIR when set, else
+// <data dir>/web, which ./install.sh fills when npm is available.
+func webConsoleDir(dataDir string) (string, error) {
+	dir := os.Getenv("HACO_WEB_DIR")
+	if dir == "" {
+		dir = filepath.Join(dataDir, "web")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "index.html")); err != nil {
+		return "", fmt.Errorf("no built web console in %s; run ./install.sh with npm installed (it builds web/ there), or set HACO_WEB_DIR to a folder holding a built console", dir)
+	}
+	return dir, nil
+}
+
+// webConsoleUp reports whether the running control plane serves the
+// console, which it only does when it was started with --web.
+func webConsoleUp(baseURL string) bool {
+	client := http.Client{Timeout: time.Second}
+	resp, err := client.Get(strings.TrimRight(baseURL, "/") + "/")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK && strings.HasPrefix(resp.Header.Get("Content-Type"), "text/html")
+}
+
+func withoutEnv(env []string, key string) []string {
+	out := env[:0:0]
+	for _, kv := range env {
+		if !strings.HasPrefix(kv, key+"=") {
+			out = append(out, kv)
+		}
+	}
+	return out
 }
 
 func controlPlaneUp(baseURL string) bool {
@@ -1584,6 +1716,81 @@ func postQuiet(baseURL, path string, body []byte) error {
 	data, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("%s: %s", resp.Status, string(data))
+	}
+	return nil
+}
+
+// workloadsFor lists a project's workloads, optionally one service's.
+func workloadsFor(baseURL, project, service string) ([]workloadRecordView, error) {
+	var all []workloadRecordView
+	if err := fetchJSON(baseURL, "/v1/workloads?project="+neturl.QueryEscape(project), &all); err != nil {
+		return nil, err
+	}
+	var out []workloadRecordView
+	for _, w := range all {
+		if w.Project == project && (service == "" || w.Service == service) {
+			out = append(out, w)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no workloads for %s", strings.TrimSuffix(project+"/"+service, "/"))
+	}
+	return out, nil
+}
+
+// resume starts stopped (or failed) workloads again where they last ran.
+func resume(baseURL string, args []string) error {
+	if len(args) < 1 || len(args) > 2 {
+		return fmt.Errorf("usage: hacoctl resume <project> [service]")
+	}
+	service := ""
+	if len(args) == 2 {
+		service = args[1]
+	}
+	wl, err := workloadsFor(baseURL, args[0], service)
+	if err != nil {
+		return err
+	}
+	return eachWorkload(baseURL, wl, "start", func(w workloadRecordView) bool { return w.Status == "stopped" || w.Status == "failed" }, "nothing is stopped")
+}
+
+// restart recreates running workloads' containers on their current nodes.
+func restart(baseURL string, args []string) error {
+	if len(args) < 1 || len(args) > 2 {
+		return fmt.Errorf("usage: hacoctl restart <project> [service]")
+	}
+	service := ""
+	if len(args) == 2 {
+		service = args[1]
+	}
+	wl, err := workloadsFor(baseURL, args[0], service)
+	if err != nil {
+		return err
+	}
+	return eachWorkload(baseURL, wl, "restart", func(w workloadRecordView) bool { return w.Status != "stopped" }, "nothing is running; use hacoctl resume")
+}
+
+func eachWorkload(baseURL string, wl []workloadRecordView, action string, want func(workloadRecordView) bool, none string) error {
+	done, failed := 0, 0
+	for _, w := range wl {
+		if !want(w) {
+			continue
+		}
+		path := fmt.Sprintf("/v1/workloads/%s/%s/%s/%s", neturl.PathEscape(w.Project), neturl.PathEscape(w.Service), neturl.PathEscape(w.Revision), action)
+		if err := postQuiet(baseURL, path, []byte(`{}`)); err != nil {
+			fmt.Printf("%s %s/%s: %v\n", action, w.Project, w.Service, err)
+			failed++
+			continue
+		}
+		fmt.Printf("%s %s/%s\n", action, w.Project, w.Service)
+		done++
+	}
+	if done == 0 && failed == 0 {
+		fmt.Println(none)
+		return nil
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d of %d could not %s", failed, done+failed, action)
 	}
 	return nil
 }

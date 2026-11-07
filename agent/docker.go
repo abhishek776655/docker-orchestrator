@@ -257,6 +257,13 @@ func (d *Docker) CachedImages(ctx context.Context) ([]string, error) {
 	return tags, nil
 }
 
+// RemoveImage deletes one image reference. Docker refuses an image that a
+// container still uses; that is left as an error rather than forced.
+func (d *Docker) RemoveImage(ctx context.Context, ref string) error {
+	_, err := d.cli.ImageRemove(ctx, ref, types.ImageRemoveOptions{PruneChildren: true})
+	return err
+}
+
 // PullImage pulls an image reference, draining the progress stream.
 // architecture, when non-empty ("amd64"/"arm64"), requests that platform's
 // manifest explicitly instead of letting Docker default to this daemon's

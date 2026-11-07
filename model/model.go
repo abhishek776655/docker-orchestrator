@@ -39,12 +39,24 @@ type Resources struct {
 // by system-reserved headroom (SRS 9.2) — the scheduler never re-derives
 // that reservation itself.
 type Node struct {
-	ID           string
+	// ID is the machine's permanent identity, picked once on that machine
+	// and saved next to its data (agent.SavedNodeID); it never changes.
+	ID string
+	// DisplayName is the operator's name for the node ("" = show the ID).
+	// Renaming a node changes only this.
+	DisplayName  string
 	Address      string
 	Architecture string
 	Labels       map[string]string
 	Capabilities map[string]bool
-	Allocatable  Resources
+	// Allocatable is what the scheduler may reserve: the detected capacity,
+	// capped by Limits when an operator set one.
+	Allocatable Resources
+	// Detected is the capacity the agent reported, before Limits.
+	Detected Resources
+	// Limits caps how much of this node the scheduler may use
+	// (hacoctl node limit); a zero field means no cap.
+	Limits       Resources
 	Availability Availability
 	// DisabledByAdmin is true once an operator has cordoned this node
 	// (POST .../cordon), independent of heartbeat-driven Availability — so

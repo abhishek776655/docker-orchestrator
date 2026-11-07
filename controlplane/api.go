@@ -32,6 +32,12 @@ func NewHandler(svc *Service) http.Handler {
 	mux.HandleFunc("GET /v1/workloads/{project}/{service}/{revision}/logs", svc.handleGetWorkloadLogs)
 	mux.HandleFunc("POST /v1/workloads/{project}/{service}/{revision}/stop", svc.refuseDuringShutdown(svc.handleStopWorkload))
 	mux.HandleFunc("DELETE /v1/workloads/{project}/{service}/{revision}", svc.handleDeleteWorkload)
+	mux.HandleFunc("POST /v1/workloads/{project}/{service}/{revision}/start", svc.refuseDuringShutdown(svc.handleStartWorkload))
+	mux.HandleFunc("POST /v1/workloads/{project}/{service}/{revision}/restart", svc.refuseDuringShutdown(svc.handleRestartWorkload))
+	mux.HandleFunc("POST /v1/admin/nodes/{id}/name", svc.handleSetNodeName)
+	mux.HandleFunc("POST /v1/admin/nodes/{id}/limits", svc.handleSetNodeLimits)
+	mux.HandleFunc("POST /v1/admin/nodes/{id}/images/remove", svc.handleRemoveNodeImages)
+	mux.HandleFunc("POST /v1/agent/{node}/images-removed", svc.handleImagesRemoved)
 	mux.HandleFunc("DELETE /v1/workloads", svc.handleDeleteWorkloads)
 
 	mux.HandleFunc("GET /v1/agent/{node}/assignments", svc.handleAssignments)
@@ -53,6 +59,7 @@ func NewHandler(svc *Service) http.Handler {
 	mux.HandleFunc("POST /v1/compose/deploy", svc.refuseDuringShutdown(svc.handleComposeDeploy))
 
 	mux.HandleFunc("GET /v1/events", svc.handleListEvents)
+	mux.HandleFunc("GET /v1/fs/dirs", svc.handleListDirs)
 	mux.HandleFunc("GET /v1/metrics", svc.handleMetrics)
 	mux.HandleFunc("POST /v1/admin/join-token", svc.handleIssueJoinToken)
 	mux.HandleFunc("POST /v1/admin/nodes/{id}/revoke", svc.handleRevokeAgent)
@@ -80,6 +87,7 @@ func NewAgentHandler(svc *Service) http.Handler {
 	mux.Handle("POST /v1/agent/{node}/log-response", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleDeliverLiveLogs)))
 	mux.Handle("GET /v1/agent/{node}/control", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleAgentControl)))
 	mux.Handle("POST /v1/agent/{node}/shutdown-done", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleShutdownDone)))
+	mux.Handle("POST /v1/agent/{node}/images-removed", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleImagesRemoved)))
 	mux.Handle("POST /v1/agent/{node}/rename-commit", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleRenameCommit)))
 	mux.Handle("POST /v1/nodes/{id}/pause", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handlePauseNode)))
 	mux.Handle("GET /v1/services/{project}/{service}", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleListServiceInstances)))

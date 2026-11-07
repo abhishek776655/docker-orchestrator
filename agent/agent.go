@@ -179,6 +179,12 @@ func (a *Agent) Run(ctx context.Context) error {
 					rename <- ctl.RenameTo
 					return
 				}
+				if len(ctl.Restart) > 0 {
+					a.restartContainers(ctx, ctl.Restart)
+				}
+				if len(ctl.RemoveImages) > 0 {
+					go a.removeImages(ctx, ctl.RemoveImages)
+				}
 			}
 		}
 	}()
@@ -225,6 +231,55 @@ func (a *Agent) pause() {
 type controlResponse struct {
 	Shutdown bool   `json:"shutdown"`
 	RenameTo string `json:"rename_to"`
+	// Restart lists workloads whose container should be recreated; the
+	// next poll starts a fresh one.
+	Restart []string `json:"restart"`
+	// RemoveImages lists image references to delete from this node.
+	RemoveImages []string `json:"remove_images"`
+}
+
+// restartContainers removes the containers of the given workloads so the
+// next poll recreates them.
+func (a *Agent) restartContainers(ctx context.Context, keys []string) {
+	want := map[string]bool{}
+	for _, k := range keys {
+		want[k] = true
+	}
+	managed, err := a.docker.ManagedContainers(ctx)
+	if err != nil {
+		log.Printf("restart: list containers: %v", err)
+		return
+	}
+	for _, c := range managed {
+		if !want[c.WorkloadKey] {
+			continue
+		}
+		if err := a.docker.StopAndRemove(ctx, c.ContainerID); err != nil {
+			log.Printf("restart %s: %v", c.WorkloadKey, err)
+			continue
+		}
+		log.Printf("restart %s: old container removed, recreating", c.WorkloadKey)
+	}
+}
+
+// removeImages deletes images from this node's Docker and reports the
+// result. An image a container still uses is refused by Docker, not forced.
+func (a *Agent) removeImages(ctx context.Context, refs []string) {
+	res := struct {
+		Removed []string          `json:"removed"`
+		Failed  map[string]string `json:"failed"`
+	}{Failed: map[string]string{}}
+	for _, ref := range refs {
+		if err := a.docker.RemoveImage(ctx, ref); err != nil {
+			res.Failed[ref] = err.Error()
+			continue
+		}
+		res.Removed = append(res.Removed, ref)
+		log.Printf("removed image %s", ref)
+	}
+	if err := a.post(ctx, "/v1/agent/"+a.cfg.NodeID+"/images-removed", res, nil); err != nil {
+		log.Printf("report image removal: %v", err)
+	}
 }
 
 func (a *Agent) controlPoll(ctx context.Context) controlResponse {

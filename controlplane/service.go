@@ -50,6 +50,8 @@ type Service struct {
 	liveLogs liveLogRelay
 	shutdown shutdownState
 	renames  renameState
+	// nodeReqs queues restarts and image deletions for agents' control polls.
+	nodeReqs nodeRequests
 
 	// volumeSnapshots holds a directory bind mount's content as a tarball,
 	// keyed by workload-key + volume index — the same in-memory, fetch-
@@ -340,7 +342,7 @@ func (svc *Service) resolveBuilds(ctx context.Context, project string, plan *com
 	for _, b := range plan.Builds {
 		if registry != "" {
 			if len(b.SSH) > 0 {
-				return images, remote, fmt.Errorf("service %s uses build.ssh, which needs BuildKit on the building node; start the control plane with --no-registry so the assigned agent builds it", b.Service)
+				return images, remote, fmt.Errorf("service %s uses build.ssh, which needs BuildKit on the building node; start the control plane without --registry so the assigned agent builds it", b.Service)
 			}
 			if svc.builder == nil {
 				return images, remote, fmt.Errorf("service %s requires a build but no builder is configured", b.Service)
