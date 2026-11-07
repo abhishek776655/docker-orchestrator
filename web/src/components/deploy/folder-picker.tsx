@@ -12,22 +12,25 @@ interface Props {
   start: string // folder to open at; "" opens the home folder
   machine: string
   onPick: (path: string) => void
+  /** "compose": choose a folder that holds a Compose file, to load that file. */
+  mode?: 'folder' | 'compose'
 }
 
 // Browses folders on the control-plane machine. The browser's own file picker
 // cannot be used: it never reveals absolute paths, and the folder has to be
 // on the control-plane machine, not wherever the browser runs.
-export function FolderPicker({ open, onOpenChange, start, machine, onPick }: Props) {
+export function FolderPicker({ open, onOpenChange, start, machine, onPick, mode = 'folder' }: Props) {
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-2xl">
-        {open && <Browser start={start} machine={machine} onPick={(p) => { onPick(p); onOpenChange(false) }} onCancel={() => onOpenChange(false)} />}
+        {open && <Browser start={start} machine={machine} mode={mode} onPick={(p) => { onPick(p); onOpenChange(false) }} onCancel={() => onOpenChange(false)} />}
       </DialogContent>
     </Dialog>
   )
 }
 
-function Browser({ start, machine, onPick, onCancel }: { start: string; machine: string; onPick: (p: string) => void; onCancel: () => void }) {
+function Browser({ start, machine, mode, onPick, onCancel }: { start: string; machine: string; mode: 'folder' | 'compose'; onPick: (p: string) => void; onCancel: () => void }) {
+  const pickingCompose = mode === 'compose'
   const [path, setPath] = useState(start)
   const [typed, setTyped] = useState(start)
   const q = useQuery({ queryKey: ['dirs', path], queryFn: () => api.listDirs(path), retry: false, staleTime: 10_000 })
@@ -46,9 +49,11 @@ function Browser({ start, machine, onPick, onCancel }: { start: string; machine:
   return (
     <div className="flex min-w-0 flex-col gap-4">
       <div>
-        <DialogTitle className="m-0 text-lg font-semibold">Choose the project folder</DialogTitle>
+        <DialogTitle className="m-0 text-lg font-semibold">{pickingCompose ? 'Choose a Compose file' : 'Choose the project folder'}</DialogTitle>
         <DialogDescription className="m-0 mt-1 text-sm text-muted-foreground">
-          Folders on {machine}, where builds and bind mounts are read. Pick the folder that holds the Compose file.
+          {pickingCompose
+            ? `Folders on ${machine}. Open the folder that holds your Compose file; it also becomes the project folder.`
+            : `Folders on ${machine}, where builds and bind mounts are read. Pick the folder that holds the Compose file.`}
         </DialogDescription>
       </div>
 
@@ -133,7 +138,13 @@ function Browser({ start, machine, onPick, onCancel }: { start: string; machine:
         <span className="min-w-0 truncate font-mono text-[13px] text-muted-foreground">{listing?.path}</span>
         <span className="flex gap-2">
           <Button type="button" variant="outline" onClick={onCancel}>Cancel</Button>
-          <Button type="button" disabled={!listing} onClick={() => listing && onPick(listing.path)}>Use this folder</Button>
+          {pickingCompose ? (
+            <Button type="button" disabled={!listing?.has_compose} onClick={() => listing && onPick(listing.path)}>
+              {listing?.has_compose ? `Use ${listing.compose_file}` : 'No Compose file here'}
+            </Button>
+          ) : (
+            <Button type="button" disabled={!listing} onClick={() => listing && onPick(listing.path)}>Use this folder</Button>
+          )}
         </span>
       </div>
     </div>

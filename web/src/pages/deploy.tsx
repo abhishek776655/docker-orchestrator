@@ -109,7 +109,9 @@ export function DeployPage() {
           compose={compose}
           onLoad={(file) => {
             setCompose(file)
-            setConfig({ ...defaultConfig(file.summary), ...(wantedProject ? { project: wantedProject } : {}) }) // a different file means different choices
+            // A different file means different choices; a file picked on the
+            // control-plane machine also says which folder it came from.
+            setConfig({ ...defaultConfig(file.summary), ...(file.dir ? { workingDir: file.dir } : {}), ...(wantedProject ? { project: wantedProject } : {}) })
           }}
           onClear={() => {
             setCompose(null)

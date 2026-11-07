@@ -1,7 +1,11 @@
 import { useRef, useState, type DragEvent } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { FileText, Upload } from 'lucide-react'
+import { FolderPicker } from '@/components/deploy/folder-picker'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
+import { api } from '@/lib/api'
+import { LABEL_ROLE } from '@/lib/cluster'
 import { describeSummary, formatBytes, summarizeCompose, type ComposeSummary } from '@/lib/compose-summary'
 import { cn } from '@/lib/utils'
 
@@ -10,6 +14,8 @@ export interface ComposeFile {
   size: number
   text: string
   summary: ComposeSummary
+  /** Folder on the control-plane machine the file was picked from; unknown for uploads. */
+  dir?: string
 }
 
 const MAX_BYTES = 1024 * 1024
@@ -28,8 +34,12 @@ export function UploadStep({ compose, onLoad, onClear, onContinue }: Props) {
   const [dragging, setDragging] = useState(false)
   const [pasting, setPasting] = useState(false)
   const [pasted, setPasted] = useState('')
+  const [picking, setPicking] = useState(false)
+  const nodesQ = useQuery({ queryKey: ['nodes'], queryFn: api.nodes })
+  const host = nodesQ.data?.find((n) => n.Labels?.[LABEL_ROLE] === 'host')
+  const hostName = host ? host.DisplayName || host.ID : 'the control-plane machine'
 
-  function accept(name: string, text: string) {
+  function accept(name: string, text: string, dir?: string) {
     const result = summarizeCompose(text)
     if (!result.ok) {
       setError(result.error)
@@ -38,7 +48,16 @@ export function UploadStep({ compose, onLoad, onClear, onContinue }: Props) {
     setError(null)
     setPasting(false)
     setPasted('')
-    onLoad({ name, size: new Blob([text]).size, text, summary: result.summary })
+    onLoad({ name, size: new Blob([text]).size, text, summary: result.summary, dir })
+  }
+
+  async function pickFromMachine(dir: string) {
+    try {
+      const file = await api.readCompose(dir)
+      accept(file.name, file.yaml, file.dir)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
   }
 
   async function readFile(file: File | undefined) {
@@ -58,6 +77,7 @@ export function UploadStep({ compose, onLoad, onClear, onContinue }: Props) {
 
   return (
     <Card className="flex max-w-[640px] flex-col gap-4 p-6">
+      <FolderPicker open={picking} onOpenChange={setPicking} start="" machine={hostName} mode="compose" onPick={(dir) => void pickFromMachine(dir)} />
       <div>
         <h2 className="m-0 text-lg font-semibold">Upload your Compose file</h2>
         <p className="m-0 mt-1 text-muted-foreground">We read the services, dependencies and build settings. Nothing starts until you deploy.</p>
@@ -99,6 +119,11 @@ export function UploadStep({ compose, onLoad, onClear, onContinue }: Props) {
             <button type="button" className="min-h-6 text-ok underline" onClick={() => setPasting(true)}>
               paste YAML
             </button>
+            {' '}or{' '}
+            <button type="button" className="min-h-6 text-ok underline" onClick={() => setPicking(true)}>
+              choose it on {hostName}
+            </button>
+            {' '}(also fills in the project folder)
           </span>
         </div>
       )}

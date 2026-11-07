@@ -1,6 +1,7 @@
 package controlplane
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -56,5 +57,44 @@ func TestWithWebUIRoutes(t *testing.T) {
 		if got := rec.Body.String(); got != want {
 			t.Errorf("%s: body = %q, want %q", path, got, want)
 		}
+	}
+}
+
+func TestReadComposeReturnsFileAndItsFolder(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "compose.yaml"), []byte("services:\n  web:\n    image: nginx\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "secrets.env"), []byte("TOKEN=x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	(&Service{}).handleReadCompose(rec, httptest.NewRequest(http.MethodGet, "/v1/fs/compose?dir="+root+"/", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	var got map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["dir"] != filepath.Clean(root) || got["name"] != "compose.yaml" || got["yaml"] == "" {
+		t.Fatalf("response = %+v", got)
+	}
+}
+
+func TestReadComposeOnlyEverOpensComposeFiles(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "secrets.env"), []byte("TOKEN=x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	(&Service{}).handleReadCompose(rec, httptest.NewRequest(http.MethodGet, "/v1/fs/compose?dir="+filepath.Join(root, "secrets.env"), nil))
+	if rec.Code == http.StatusOK {
+		t.Fatalf("a non-compose path must never be read: %s", rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	(&Service{}).handleReadCompose(rec, httptest.NewRequest(http.MethodGet, "/v1/fs/compose?dir="+root, nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("folder without a compose file: status = %d, want 404", rec.Code)
 	}
 }

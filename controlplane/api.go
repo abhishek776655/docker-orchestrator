@@ -62,6 +62,7 @@ func NewHandler(svc *Service) http.Handler {
 
 	mux.HandleFunc("GET /v1/events", svc.handleListEvents)
 	mux.HandleFunc("GET /v1/fs/dirs", svc.handleListDirs)
+	mux.HandleFunc("GET /v1/fs/compose", svc.handleReadCompose)
 	mux.HandleFunc("GET /v1/metrics", svc.handleMetrics)
 	mux.HandleFunc("POST /v1/admin/join-token", svc.handleIssueJoinToken)
 	mux.HandleFunc("POST /v1/admin/nodes/{id}/revoke", svc.handleRevokeAgent)

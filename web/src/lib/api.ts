@@ -294,6 +294,13 @@ export const api = {
     if (!res.ok) throw await errorFrom(res)
     return (await res.json()) as DirListing
   },
+  // The compose file directly inside a folder on the control-plane machine,
+  // with that folder's absolute path (which a browser upload can't provide).
+  readCompose: async (dir: string): Promise<{ dir: string; name: string; yaml: string }> => {
+    const res = await fetch(`/v1/fs/compose?dir=${encodeURIComponent(dir)}`)
+    if (!res.ok) throw await errorFrom(res)
+    return (await res.json()) as { dir: string; name: string; yaml: string }
+  },
   issueJoinToken: () =>
     request<JoinBundle>('/v1/admin/join-token', {
       method: 'POST',

@@ -71,6 +71,51 @@ func listDirs(path string) (*dirListing, error) {
 	return out, nil
 }
 
+// maxComposeBytes matches the console's own upload limit.
+const maxComposeBytes = 1 << 20
+
+// composeIn reads the compose file directly inside dir, so the console can
+// load it and know which folder it came from (a browser upload can't say).
+// Only the standard compose file names are ever opened.
+func composeIn(dir string) (name string, data []byte, err error) {
+	listing, err := listDirs(dir)
+	if err != nil {
+		return "", nil, err
+	}
+	if !listing.HasCompose {
+		return "", nil, fmt.Errorf("no compose file in %s: %w", listing.Path, os.ErrNotExist)
+	}
+	path := filepath.Join(listing.Path, listing.ComposeFile)
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", nil, err
+	}
+	if info.Size() > maxComposeBytes {
+		return "", nil, fmt.Errorf("%s is %d bytes, over the %d-byte limit", path, info.Size(), maxComposeBytes)
+	}
+	data, err = os.ReadFile(path)
+	return listing.ComposeFile, data, err
+}
+
+func (svc *Service) handleReadCompose(w http.ResponseWriter, r *http.Request) {
+	name, data, err := composeIn(r.URL.Query().Get("dir"))
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, os.ErrNotExist) {
+			status = http.StatusNotFound
+		} else if errors.Is(err, os.ErrPermission) {
+			status = http.StatusForbidden
+		}
+		writeError(w, status, err)
+		return
+	}
+	dir := r.URL.Query().Get("dir")
+	if listing, err := listDirs(dir); err == nil {
+		dir = listing.Path
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"dir": dir, "name": name, "yaml": string(data)})
+}
+
 func (svc *Service) handleListDirs(w http.ResponseWriter, r *http.Request) {
 	listing, err := listDirs(r.URL.Query().Get("path"))
 	if err != nil {
