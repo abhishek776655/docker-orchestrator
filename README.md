@@ -1,179 +1,224 @@
-# Hardware-Aware Container Orchestrator
+# haco: hardware-aware container orchestrator
 
-A two-node, self-hostable platform that deploys a validated subset of Docker Compose workloads across Linux Docker hosts.
+Run a Docker Compose project across the machines you already have. haco
+turns a few laptops, desktops or small servers on one network into a single
+cluster: you hand it a `docker-compose.yml`, and it places every service on
+the machine that fits it best, by CPU, memory, GPU, temperature, cached
+images and where its data already lives. Then it builds, starts and watches
+the services in dependency order.
 
-The first delivery is a deterministic scheduler simulator. It establishes placement safety and explainability before the project controls real containers.
+No Kubernetes, no YAML rewrite, no registry to run. One control plane, one
+agent per machine, a CLI and a web console.
 
-## Delivery order
+## Features
 
-1. M0: architecture decisions and contracts
-2. M1: scheduler simulator
-3. M2: single-node execution
-4. M3: two-node discovery, connectivity, and gateway
-5. M4-M7: Compose builds, storage/dev workflow, operations, and hardware-aware scoring
+**Scheduling**
+- Places services by hard rules first (architecture, GPU, free CPU and
+  memory, host ports, cordoned or offline nodes, pins), then scores the
+  rest on CPU fit, memory fit, thermal headroom and image cache.
+- Explains every decision: each node's score, or the reason it was rejected.
+- Respects `depends_on` and `condition: service_healthy`; services start in
+  stages.
+- Keeps stateful services next to their data. A service with a named volume
+  stays on the node that holds it, and every console deploy warns before a
+  service would start on an empty volume.
+- Operator overrides: keep services on the control-plane machine, pin a
+  service to a node, place a service on a node the scheduler rejected, or
+  cap how much of a node the scheduler may use.
 
-## Planning documents
+**Compose support**
+- Builds `build:` services on the node that runs them, from the shipped
+  build context (honors `.dockerignore`, build args and `build.ssh`). An
+  optional local registry is available with `--registry`.
+- Images, ports, environment, env files, healthchecks, named volumes and
+  bind mounts. Bind-mounted folders are copied to whichever node runs the
+  service.
+- Service names resolve across machines, so `http://auth:5100` works from
+  any node.
+- See the [Compose compatibility matrix](docs/compose-compatibility-matrix.md)
+  for the exact subset.
 
-- [M0 baseline](docs/planning/m0-baseline.md)
-- [Initial architecture decisions](docs/adr/0001-initial-architecture-decisions.md)
-- [Core contracts](docs/contracts/core-contracts.md)
+**Operations**
+- Machines join with a one-time token over mutual TLS; each keeps a
+  permanent node ID and can be given a display name.
+- Heartbeats and a reconciler: workloads on a lost node are rescheduled,
+  while stateful ones are never silently duplicated.
+- Start, stop, restart, redeploy and remove projects or single services;
+  live logs from whichever node runs a container.
+- Node maintenance: cordon, rename, resource limits, delete cached images
+  or old volume data, revoke or remove a node.
+- A clean cluster shutdown that brings the same services back on restart.
+
+**Web console** (`hacoctl start --web`)
+- Dashboard with what needs attention, a notification bell for new failures.
+- Cluster topology: the control-plane machine in the middle, nodes around
+  it with their OS, state and temperature, and machines on the network that
+  have not joined yet.
+- Deploy wizard: upload a Compose file, pick the project folder, choose
+  what to keep on the host, then review the plan and dependency graph,
+  change placements and deploy with live status.
+- Project, service and node pages; a searchable, paginated event history.
+
+## Requirements
+
+- Docker on every machine (Docker Desktop, Colima, Rancher Desktop or plain
+  Docker on Linux). The socket is found automatically.
+- Go 1.26 or newer to build.
+- Node.js and npm, only for the web console.
+- Machines on the same network. The control plane listens on
+  `127.0.0.1:8099` for operators and on port `8443` for agents.
+
+## Install
+
+On every machine you want in the cluster:
+
+```bash
+git clone https://github.com/abhishek776655/docker-orchestrator.git
+cd docker-orchestrator
+./install.sh
+```
+
+This installs `controlplane`, `agent` and `hacoctl` into `$(go env GOPATH)/bin`
+and, when npm is available, builds the web console into `~/.haco/web`.
+Make sure that bin folder is on your `PATH`.
+
+## Quick start
+
+**1. Start the control plane** on the machine that will run it:
+
+```bash
+hacoctl start --web
+```
+
+It prints the web console URL (`http://localhost:8099/`) and a one-time
+join command. The control-plane machine joins the cluster as a node by
+itself.
+
+**2. Join the other machines.** On each one, paste the join command
+(get a fresh one any time from **Add node** in the console or
+`hacoctl join-token`; tokens expire after 10 minutes):
+
+```bash
+hacoctl agent join '<token>'
+```
+
+Later restarts need no token:
+
+```bash
+hacoctl agent run
+```
+
+**3. Deploy a Compose project.** From the console's **Deploy** page, or:
+
+```bash
+hacoctl plan myapp ./docker-compose.yml
+```
+
+```bash
+hacoctl deploy myapp ./docker-compose.yml
+```
+
+`plan` is a dry run that shows where each service would go and why.
+`deploy` builds, places and starts everything, then shows live status until
+every service is ready or failed.
+
+## Everyday commands
+
+| Task | Command |
+| --- | --- |
+| Start the control plane (with the web console) | `hacoctl start --web` |
+| Stop the control plane | `hacoctl stop-all` |
+| Dry-run a deploy | `hacoctl plan <project> <compose.yml>` |
+| Deploy or redeploy | `hacoctl deploy <project> <compose.yml>` |
+| Deploy one service and what it depends on | `hacoctl deploy <project> <compose.yml> --service <name>` |
+| Let the scheduler place everything again | `hacoctl deploy <project> <compose.yml> --fresh` |
+| Keep services on the control-plane machine | `--pin-host db,cache` on plan or deploy |
+| Pin services to a node | `--pin-node <node-id>=api,web` on plan or deploy |
+| Projects and workloads | `hacoctl projects`, `hacoctl status [project]` |
+| Live logs | `hacoctl logs <project> <service> -f` |
+| Stop / start again / restart | `hacoctl stop <project> <service> latest`, `hacoctl resume <project> [service]`, `hacoctl restart <project> [service]` |
+| Remove a project | `hacoctl remove-all-workloads <project>` |
+| Nodes | `hacoctl nodes`, `hacoctl node <id>` |
+| Cordon / uncordon a node | `hacoctl node cordon <id>`, `hacoctl node uncordon <id>` |
+| Name a node | `hacoctl node rename <id> "Studio Mac"` |
+| Cap a node's resources | `hacoctl node limit <id> --cpus 4 --memory 8GiB` |
+| Remove a node | `hacoctl remove-node <id>` |
+| Terminal dashboard | `hacoctl tui` |
+| Audit events | `hacoctl events [project]` |
+| Shut the whole cluster down | `hacoctl shutdown` |
+
+Run `hacoctl help` for every command and flag.
+
+## Compose extensions
+
+Optional `x-haco-*` keys on a service adjust placement without changing how
+Docker reads the file:
+
+| Key | Effect |
+| --- | --- |
+| `x-haco-pin-host: true` | Always run on the control-plane machine |
+| `x-haco-pin-node: <node-id>` | Always run on that node |
+| `x-haco-place-anywhere: true` | Opt out of the automatic bind-mount handling; place it like any other service |
+| `x-haco-allow-fresh-volume: true` | If its data's node is lost, reschedule onto an empty volume instead of failing |
+| `x-haco-bind-host-path: true` | Also ship other bind-mounted folders with the service (mounted live when it is pinned to the control-plane machine) |
+
+## How it works
+
+```
+             operator: hacoctl / web console
+                          |
+                          v
+   +-------------------- control plane --------------------+
+   |  Compose importer -> scheduler -> SQLite state         |
+   |  reconciler, build context store, service registry     |
+   +--------------------------------------------------------+
+            ^ mTLS                ^ mTLS               ^ mTLS
+            |                     |                    |
+        agent (host)          agent (node)         agent (node)
+        Docker                Docker               Docker
+```
+
+- The **control plane** parses the Compose file, schedules each service and
+  stores desired state in an embedded SQLite file (`~/.haco/control-plane.db`).
+- Each **agent** heartbeats with its capacity, temperature and cached
+  images, polls for its assigned workloads, builds or pulls images, runs
+  the containers and reports status back.
+- The **reconciler** watches heartbeats and moves work off lost nodes.
+
+## Configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `HACO_CONTROLPLANE_URL` | `http://localhost:8099` | Where `hacoctl` finds the control plane |
+| `HACO_LISTEN_ADDR` | `127.0.0.1:8099` | Operator API and web console address |
+| `HACO_AGENT_LISTEN_ADDR` | `:8443` | Agent API (mTLS) |
+| `HACO_DATA_DIR` | `~/.haco` | Database, credentials, TLS identity, volumes |
+| `HACO_NODE_ID` | saved in `~/.haco/node-id` | Override this machine's node ID |
+| `HACO_REGISTRY_ADDR` | unset | Use a build registry (`auto` starts a local one) |
+
+## Developing
+
+```bash
+go test ./...
+```
+
+```bash
+cd web && npm install && npm test && npm run dev
+```
+
+The dev server proxies `/v1` to `http://127.0.0.1:8099` (override with `HACO_API`).
+
+## Documentation
+
 - [Compose compatibility matrix](docs/compose-compatibility-matrix.md)
-- [M1 scheduler backlog](docs/planning/m1-scheduler-simulator.md)
-- [M2 single-node execution](docs/planning/m2-single-node-execution.md)
-- [M3 two-node connectivity](docs/planning/m3-two-node-connectivity.md)
-- [M4 Compose importer and builds](docs/planning/m4-compose-importer-and-builds.md)
-- [M5 storage and dev workflow](docs/planning/m5-storage-and-dev-workflow.md)
-- [M6 reconciliation and operations](docs/planning/m6-reconciliation-and-operations.md)
+- [Joining machines over a LAN](docs/testing/agent-join.md)
+- [Service-name DNS](docs/testing/service-name-dns.md)
 - [Backup and restore](docs/operations/backup-and-restore.md)
-- [Service-name DNS plan](docs/superpowers/plans/2026-10-19-service-name-dns.md) · [testing notes](docs/testing/service-name-dns.md)
-- [M7 hardware-aware scheduling](docs/planning/m7-hardware-aware-scheduling.md)
-- [Roadmap (post-M7)](docs/planning/roadmap.md)
-- [SQLite migration](docs/planning/sqlite-migration.md) (roadmap item 1, done)
-- [Bootstrap/CLI ergonomics](docs/planning/bootstrap-ergonomics.md) (roadmap item 2, done)
+- [Architecture decisions](docs/adr/0001-initial-architecture-decisions.md) and [core contracts](docs/contracts/core-contracts.md)
+- [Roadmap](docs/planning/roadmap.md) and the milestone plans in [docs/planning](docs/planning)
 
-## Running the MVP
+## Not goals
 
-This brings up the full M0-M7 path — control plane, two simulated nodes,
-a registry, and a real Compose deployment with a build, a dependency, and
-persistent storage. See [examples/mvp-demo](examples/mvp-demo) for the
-Compose file used below.
-
-> **One machine, two simulated nodes.** There's no second physical/VM host
-> here, so "two nodes" are two agent processes against the same Docker
-> daemon, told apart by `HACO_NODE_ID`/`HACO_NODE_ADDRESS` (both agents
-> would otherwise auto-detect the *same* machine IP, so on one box you
-> must set `HACO_NODE_ADDRESS` explicitly per agent, as below). On two
-> real machines, skip `HACO_NODE_ADDRESS` entirely — the agent
-> auto-detects its own outbound LAN IP — see "Two real machines" below.
-> Known limitations of this single-daemon simulation (and the few others,
-> like the 1:1 host/container port binding and service-name DNS needing a
-> free port 53) are documented in the `docs/planning/m2`...`m7` files.
-
-### 1. Build the binaries
-
-```bash
-go build -o bin/controlplane ./cmd/controlplane
-go build -o bin/agent ./cmd/agent
-go build -o bin/hacoctl ./cmd/hacoctl   # thin CLI over the control-plane API, used below
-```
-
-There are no other dependencies to install by hand: metadata storage is an
-embedded SQLite file (`~/.haco/control-plane.db` by default, override with
-`HACO_DB_PATH`), the Docker socket is auto-detected (plain Linux, Docker
-Desktop, Rancher Desktop, Colima, rootless Docker all work without setting
-`DOCKER_HOST` — only needed for a nonstandard setup), and the local
-registry container is started automatically, below.
-
-### 2. Start the control plane
-
-```bash
-HACO_REGISTRY_ADDR=localhost:5050 ./bin/controlplane &
-```
-
-This one command starts a local `registry:2` container for you (reused on
-later runs), the build service, and the reconciler — then prints a
-one-time agent join command; copy it, it's needed in the next step (it
-expires after 10 minutes).
-
-### 3. Join a node
-
-Agents authenticate via a one-time join token (mTLS after that) rather
-than a bare URL — paste the command the control plane printed:
-
-```bash
-./bin/agent join '<token the control plane printed>'
-```
-
-For a second simulated node on this same machine, give it a distinct ID
-(the credential is saved per node ID under `~/.haco/agent-credentials/`):
-
-```bash
-HACO_NODE_ID=node-b ./bin/agent join '<a fresh token — run hacoctl join-token>'
-```
-
-```bash
-./bin/hacoctl nodes
-```
-
-(On real hosts, the agent runs on its own machine with no `DOCKER_HOST`
-override needed, and auto-detects its own LAN address.)
-
-### 4. Validate the Compose project (dry run, no side effects)
-
-```bash
-./bin/hacoctl plan mvpdemo examples/mvp-demo/docker-compose.yml
-```
-
-Check `Rejections` is empty before continuing — a non-empty list means
-something in the Compose file isn't supported yet (see
-[compose-compatibility-matrix.md](docs/compose-compatibility-matrix.md)).
-
-### 5. Deploy it
-
-```bash
-./bin/hacoctl deploy mvpdemo examples/mvp-demo/docker-compose.yml
-```
-
-This builds `api` from source, pushes it to the local registry, and
-schedules both services — `cache` (Redis, pinned with node-local
-persistent storage) and `api` (depends on `cache`, gated until it's
-ready). Redeploying the same project+service+revision later is safe — it
-replaces the previous attempt rather than conflicting with it, even if
-that attempt never finished.
-
-### 6. Check it's running
-
-```bash
-./bin/hacoctl status mvpdemo cache latest
-./bin/hacoctl status mvpdemo api latest
-curl -s http://localhost:8099/v1/services/mvpdemo/cache   # the service registry
-curl -s http://localhost:9090/                            # the deployed api, directly
-```
-
-### 7. Try the operational endpoints
-
-```bash
-./bin/hacoctl events    # audit trail
-./bin/hacoctl metrics   # node/workload counts
-```
-
-### 8. Prove reconciliation (optional)
-
-Kill `node-a`'s agent process, wait ~15s past the heartbeat timeout, and
-watch `cache` (pinned, stateful) get marked `failed` — never silently
-duplicated — while any ephemeral workload on it gets rescheduled to
-`node-b` automatically. `GET /v1/events` shows the whole sequence.
-
-### 9. Clean up
-
-```bash
-pkill -f bin/controlplane; pkill -f bin/agent
-docker rm -f haco-mvpdemo-cache-latest haco-mvpdemo-api-latest haco-registry
-rm -rf ~/.haco   # metadata db, agent credentials, TLS identity, node-local volumes
-```
-
-### Two real machines
-
-Use the [agent join and LAN test guide](docs/testing/agent-join.md). The
-control plane prints a one-time `./bin/agent join '<token>'` command that
-contains its detected LAN endpoint and pinned TLS certificate. Copying that
-command is the only onboarding step on the other machine; no control-plane
-IP is typed separately. The guide covers ports, registry trust, token
-renewal/revocation, and the Compose service-name test.
-
-### A smaller single-call example
-
-For a one-off workload without Compose:
-
-```bash
-curl -X POST http://localhost:8099/v1/workloads -H 'Content-Type: application/json' -d '{
-  "project": "demo", "service": "web", "revision": "r1",
-  "image": "nginx:alpine", "cpu_millis": 250, "memory_bytes": 67108864,
-  "architecture": "amd64", "container_ports": [80], "host_ports": [80]
-}'
-curl http://localhost:8099/v1/workloads/demo/web/r1
-```
-
-## Explicit non-goals for the first release
-
-Kubernetes compatibility, transparent container migration, arbitrary database failover, custom overlay networking, and GPU-aware placement are deferred until the two-node core is proven.
+Kubernetes compatibility, live container migration, database failover and
+custom overlay networks are out of scope. haco aims to be the simplest way
+to run one Compose project across a handful of machines you own.
