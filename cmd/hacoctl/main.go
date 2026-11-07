@@ -1525,6 +1525,8 @@ func logs(baseURL string, args []string) error {
 
 const logsUsage = "usage: hacoctl logs <project> <service> [revision] [--tail N] [-f]"
 
+const followWindow = 1000
+
 func fetchLogs(client *http.Client, baseURL string, args []string, output io.Writer) error {
 	var positional []string
 	tail, follow := 200, false
@@ -1555,12 +1557,17 @@ func fetchLogs(client *http.Client, baseURL string, args []string, output io.Wri
 	if len(positional) == 3 {
 		revision = positional[2]
 	}
-	path := fmt.Sprintf("/v1/workloads/%s/%s/%s/logs?tail=%d",
-		neturl.PathEscape(positional[0]), neturl.PathEscape(positional[1]), neturl.PathEscape(revision), tail)
+	path := fmt.Sprintf("/v1/workloads/%s/%s/%s/logs?tail=",
+		neturl.PathEscape(positional[0]), neturl.PathEscape(positional[1]), neturl.PathEscape(revision))
 
 	var last string
+	window := tail
 	for {
-		text, live, err := getLogs(client, baseURL+path)
+		text, live, err := getLogs(client, baseURL+path+strconv.Itoa(window))
+		// --tail only shapes the first screen; after that each poll needs a
+		// window wide enough to hold everything logged since the previous
+		// one, or lines between polls are silently skipped.
+		window = max(tail, followWindow)
 		if err != nil {
 			return err
 		}

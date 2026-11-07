@@ -47,6 +47,36 @@ func TestLogsDefaultsRevisionAndPassesTail(t *testing.T) {
 	}
 }
 
+func TestLogsFollowDoesNotDropLinesBetweenPolls(t *testing.T) {
+	calls := 0
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls++
+		var body, source string
+		switch calls {
+		case 1:
+			if r.URL.Query().Get("tail") != "2" {
+				t.Errorf("first fetch tail = %s, want 2", r.URL.Query().Get("tail"))
+			}
+			body, source = "t1 a\nt2 b\n", "live"
+		default:
+			if got := r.URL.Query().Get("tail"); got != "1000" {
+				t.Errorf("follow fetch tail = %s, want 1000", got)
+			}
+			// Five new lines since the last poll; the container then stops.
+			body, source = "t1 a\nt2 b\nt3 c\nt4 d\nt5 e\nt6 f\nt7 g\n", "captured"
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"X-Haco-Logs-Source": []string{source}}, Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
+	})
+	var out bytes.Buffer
+	err := fetchLogs(&http.Client{Transport: transport}, "http://cp", []string{"demo", "api", "--tail", "2", "-f"}, &out)
+	if err == nil || !strings.Contains(err.Error(), "nothing to follow") {
+		t.Fatalf("err = %v, want follow to stop once the container is gone", err)
+	}
+	if want := "t1 a\nt2 b\nt3 c\nt4 d\nt5 e\nt6 f\nt7 g\n"; out.String() != want {
+		t.Fatalf("output = %q, want every line exactly once: %q", out.String(), want)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
