@@ -222,3 +222,7 @@ The dev server proxies `/v1` to `http://127.0.0.1:8099` (override with `HACO_API
 Kubernetes compatibility, live container migration, database failover and
 custom overlay networks are out of scope. haco aims to be the simplest way
 to run one Compose project across a handful of machines you own.
+
+## License
+
+[MIT](LICENSE) © 2026 Abhishek Pandey
