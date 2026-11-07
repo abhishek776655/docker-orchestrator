@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -137,6 +138,24 @@ func ExtractTar(dst string, r io.Reader) error {
 				return err
 			}
 			f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(hdr.Mode))
+			if err != nil && os.IsPermission(err) {
+				// The file already exists but this (non-root) agent can't
+				// write it: a container running as root wrote it into the
+				// bind-mounted directory (e.g. Python's __pycache__/*.pyc),
+				// so it's root-owned. Replace it if the parent directory
+				// lets us; otherwise leave the container's copy in place —
+				// it's generated output, and failing the whole deploy over
+				// it is worse than keeping a stale cache file.
+				if rmErr := os.Remove(path); rmErr == nil {
+					f, err = os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, os.FileMode(hdr.Mode))
+				}
+				if err != nil && os.IsPermission(err) {
+					if _, statErr := os.Lstat(path); statErr == nil {
+						log.Printf("extract: leaving %s as is: not writable by the agent (owned by a container user?)", path)
+						continue
+					}
+				}
+			}
 			if err != nil {
 				return err
 			}

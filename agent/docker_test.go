@@ -216,3 +216,49 @@ func TestExtractTarHealsStaleFileAtDestination(t *testing.T) {
 		t.Fatalf("real.txt = %q, err = %v, want \"real content\"", got, err)
 	}
 }
+
+// TestExtractTarToleratesUnwritableExistingFiles covers a Linux-only
+// failure: a root-run container wrote files (Python's __pycache__/*.pyc)
+// into the bind-mounted volume dir, and the non-root agent's next
+// re-extract died with "permission denied". A read-only file in a writable
+// directory must be replaced; one in a directory the agent can't modify
+// must be left alone rather than failing the whole extract.
+func TestExtractTarToleratesUnwritableExistingFiles(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses file permissions")
+	}
+	dst := filepath.Join(t.TempDir(), "vol")
+	if err := os.MkdirAll(filepath.Join(dst, "locked"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"ro.txt", "locked/a.pyc"} {
+		if err := os.WriteFile(filepath.Join(dst, f), []byte("old"), 0o444); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Chmod(filepath.Join(dst, "locked"), 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(filepath.Join(dst, "locked"), 0o755) })
+
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for _, f := range []string{"ro.txt", "locked/a.pyc", "other.txt"} {
+		if err := tw.WriteHeader(&tar.Header{Name: f, Mode: 0o644, Size: 3}); err != nil {
+			t.Fatal(err)
+		}
+		tw.Write([]byte("new"))
+	}
+	tw.Close()
+
+	if err := ExtractTar(dst, &buf); err != nil {
+		t.Fatalf("ExtractTar: %v", err)
+	}
+	want := map[string]string{"ro.txt": "new", "locked/a.pyc": "old", "other.txt": "new"}
+	for f, w := range want {
+		got, err := os.ReadFile(filepath.Join(dst, f))
+		if err != nil || string(got) != w {
+			t.Errorf("%s = %q, err = %v, want %q", f, got, err, w)
+		}
+	}
+}
