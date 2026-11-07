@@ -8,7 +8,7 @@ import { Card } from '@/components/ui/card'
 import { api, type ApiNode } from '@/lib/api'
 import { sinceLabel, statusTone } from '@/lib/cluster'
 import { defaultConfig } from '@/lib/deploy-config'
-import { derivePlan, requestLabel, buildRequest, type Candidate } from '@/lib/plan'
+import { candidateTags, derivePlan, requestLabel, buildRequest, tiedWithPick, type Candidate } from '@/lib/plan'
 import { loadDeploy } from '@/lib/saved-deploys'
 import { summarizeCompose } from '@/lib/compose-summary'
 import { deriveService, lifecycle, type LifecycleStep } from '@/lib/service'
@@ -36,17 +36,20 @@ function Section({ title, aside, children }: { title: string; aside?: React.Reac
   )
 }
 
-function CandidateCard({ c }: { c: Candidate }) {
+function CandidateCard({ c, runsOn }: { c: Candidate; runsOn: string }) {
   return (
     <div className={cn('flex flex-col gap-2.5 rounded-lg border px-4 py-3.5', c.isPick ? 'border-ok' : 'border-border')}>
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className="flex items-center gap-2.5">
+        <span className="flex flex-wrap items-center gap-2">
           <span className={`${mono} font-medium`}>{c.node}</span>
-          <Badge tone={c.outcome === 'rejected' ? 'bad' : c.isPick ? 'ok' : 'info'}>{c.outcome === 'rejected' ? 'rejected' : c.isPick ? "scheduler's pick" : 'eligible'}</Badge>
+          {candidateTags(c, runsOn).map((t) => (
+            <Badge key={t.label} tone={t.tone}>{t.label}</Badge>
+          ))}
         </span>
         {c.score !== undefined && <span className={`${mono} font-medium`}>total {c.score.toFixed(2)}</span>}
       </div>
-      {c.outcome === 'rejected' && <p className="m-0 text-[13px] text-bad-fg">{c.detail}</p>}
+      {c.rejectedBy === 'scheduler' && <p className="m-0 text-[13px] text-bad-fg">{c.detail}</p>}
+      {c.rejectedBy === 'volume' && <p className="m-0 text-[13px] text-warn-fg">The scheduler accepts this node, but {c.detail}.</p>}
       {(c.factors ?? []).map((f) => (
         <div key={f.label} className="flex items-center gap-3 text-[13px]">
           <span className="w-24 flex-none text-muted-foreground">{f.label}</span>
@@ -426,8 +429,14 @@ export function ServicePage() {
                       Its volume data lives on one node. Running it on another node would start with an empty volume.
                     </p>
                   )}
+                  {tiedWithPick(row.candidates).length > 0 && (
+                    <p className="m-0 text-[13px] text-muted-foreground">
+                      That is a tie: <span className={mono}>{tiedWithPick(row.candidates).join(', ')}</span> scored the same. The scheduler breaks ties by node name, so the pick
+                      is not a real preference.
+                    </p>
+                  )}
                   {row.candidates.length === 0 && <p className="m-0 text-[13px] text-muted-foreground">No scoring details came back for this service.</p>}
-                  {row.candidates.map((c) => <CandidateCard key={c.node} c={c} />)}
+                  {row.candidates.map((c) => <CandidateCard key={c.node} c={c} runsOn={detail.node} />)}
                 </>
               )}
             </div>

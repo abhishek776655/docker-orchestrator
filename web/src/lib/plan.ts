@@ -48,6 +48,10 @@ export interface Candidate {
   // rejected: the scheduler refused it, or its volume data is elsewhere.
   // A rejected node can still be the one in use when the user chose it anyway.
   outcome: 'selected' | 'eligible' | 'rejected'
+  // Why it counts as rejected: the scheduler refused the node, or the
+  // scheduler accepted it but the service's volume data is on another node
+  // (it would start empty there). Only "scheduler" is a real rejection.
+  rejectedBy?: 'scheduler' | 'volume'
   inUse: boolean // the node this service will run on
   score?: number
   detail: string
@@ -109,6 +113,7 @@ function candidatesOf(base: Decision | undefined, selected: string, dataNode: st
       return {
         node: s.NodeID,
         outcome: volume ? 'rejected' : inUse ? 'selected' : 'eligible',
+        rejectedBy: volume ? 'volume' : undefined,
         inUse,
         score: s.Total,
         detail: volume || `CPU ${s.CPUFit.toFixed(2)} · memory ${s.MemoryFit.toFixed(2)} · thermal ${s.ThermalFit.toFixed(2)} · image cache ${s.CacheFit.toFixed(2)}`,
@@ -121,8 +126,36 @@ function candidatesOf(base: Decision | undefined, selected: string, dataNode: st
         ],
       }
     })
-  const rejected = (base.Rejections ?? []).map((r): Candidate => ({ node: r.NodeID, outcome: 'rejected', inUse: r.NodeID === selected, detail: r.Reason, isPick: false }))
+  const rejected = (base.Rejections ?? []).map((r): Candidate => ({ node: r.NodeID, outcome: 'rejected', rejectedBy: 'scheduler', inUse: r.NodeID === selected, detail: r.Reason, isPick: false }))
   return [...eligible, ...rejected]
+}
+
+export type CandidateTag = { label: string; tone: 'ok' | 'info' | 'bad' | 'warn' }
+
+/**
+ * The labels a node gets when comparing placements. They stack: the
+ * scheduler's pick can also be where the service runs now, or a node it
+ * would start empty on. "eligible" only when nothing else applies.
+ */
+export function candidateTags(c: Candidate, runsOn: string): CandidateTag[] {
+  const tags: CandidateTag[] = []
+  if (c.isPick) tags.push({ label: "scheduler's pick", tone: 'ok' })
+  if (runsOn && c.node === runsOn) tags.push({ label: 'runs here now', tone: 'info' })
+  if (c.rejectedBy === 'scheduler') tags.push({ label: 'rejected by scheduler', tone: 'bad' })
+  if (c.rejectedBy === 'volume') tags.push({ label: 'would start empty', tone: 'warn' })
+  if (tags.length === 0) tags.push({ label: 'eligible', tone: 'info' })
+  return tags
+}
+
+/**
+ * The nodes that scored exactly as well as the scheduler's pick. The
+ * scheduler breaks such ties by node name, so the pick among them is not a
+ * real preference.
+ */
+export function tiedWithPick(candidates: Candidate[]): string[] {
+  const pick = candidates.find((c) => c.isPick)
+  if (!pick || pick.score === undefined) return []
+  return candidates.filter((c) => !c.isPick && c.rejectedBy !== 'scheduler' && c.score !== undefined && c.score.toFixed(2) === pick.score!.toFixed(2)).map((c) => c.node)
 }
 
 /**

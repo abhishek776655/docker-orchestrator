@@ -2,7 +2,33 @@ import { describe, expect, it } from 'vitest'
 import type { Decision, PlanResponse, PlanWorkload } from './api'
 import { defaultConfig, type DeployConfig } from './deploy-config'
 import { parse } from 'yaml'
-import { buildRequest, derivePlan, liveState, nodesUsed, pinsFor, pruneToScope, requestLabel, stagesOf } from './plan'
+import { buildRequest, candidateTags, derivePlan, liveState, nodesUsed, pinsFor, pruneToScope, requestLabel, stagesOf, tiedWithPick, type Candidate } from './plan'
+
+describe('candidate tags when comparing nodes', () => {
+  // The case from the service page: the scheduler picks the EliteBook on a
+  // tie, mysql runs on the Mac where its data is.
+  const elite: Candidate = { node: 'elitebook', outcome: 'rejected', rejectedBy: 'volume', inUse: false, score: 0.93, detail: 'volume data is on mac', isPick: true }
+  const mac: Candidate = { node: 'mac', outcome: 'eligible', inUse: false, score: 0.93, detail: '', isPick: false }
+  const refused: Candidate = { node: 'm1', outcome: 'rejected', rejectedBy: 'scheduler', inUse: false, detail: 'host port 3306 already reserved', isPick: false }
+  const labels = (c: Candidate) => candidateTags(c, 'mac').map((t) => t.label)
+
+  it("never calls the scheduler's own pick rejected", () => {
+    expect(labels(elite)).toEqual(["scheduler's pick", 'would start empty'])
+  })
+  it('marks where the service runs now', () => {
+    expect(labels(mac)).toEqual(['runs here now'])
+  })
+  it('keeps real scheduler rejections distinct', () => {
+    expect(labels(refused)).toEqual(['rejected by scheduler'])
+  })
+  it('falls back to eligible', () => {
+    expect(candidateTags({ ...mac, node: 'other' }, 'mac').map((t) => t.label)).toEqual(['eligible'])
+  })
+  it('reports nodes tied with the pick, ignoring refused ones', () => {
+    expect(tiedWithPick([elite, mac, { ...refused, score: 0.93 }])).toEqual(['mac'])
+    expect(tiedWithPick([elite, { ...mac, score: 0.7 }])).toEqual([])
+  })
+})
 
 function wl(service: string, over: Partial<PlanWorkload> = {}): PlanWorkload {
   return {
