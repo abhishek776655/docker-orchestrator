@@ -47,6 +47,8 @@ type Service struct {
 	// key material must never reach the SQLite store.
 	buildSSH map[string]map[string][]byte
 
+	liveLogs liveLogRelay
+
 	// volumeSnapshots holds a directory bind mount's content as a tarball,
 	// keyed by workload-key + volume index — the same in-memory, fetch-
 	// once idea as buildContexts, but for a directory mount

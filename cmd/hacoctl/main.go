@@ -108,7 +108,7 @@ Usage:
                                                    --pin-host <service,...>: override storage affinity for this call only, no Compose file changes needed — only the named services (e.g. a database, and whichever service you're actively live-editing) pin to this control-plane host; every other service schedules anywhere, even one that bind-mounts its own source (overrides compose.go's own auto-pin heuristic)
                                                    --pin-node <node-id>=<service,...>: same override, but pins the named services to that specific node instead of the control-plane host — repeatable for multiple nodes; combines with --pin-host in the same call
   hacoctl status [project] [service] [revision]   table of every workload (optionally filtered to one project), or one workload's full detail once service is named (revision defaults to "latest")
-  hacoctl logs   <project> <service> <revision>   latest captured container log tail
+  hacoctl logs   <project> <service> [revision]   live container logs from whichever node runs it (revision defaults to "latest"; --tail N lines, default 200; -f to follow); falls back to the tail captured when a container failed to start
   hacoctl stop   <project> <service> <revision>   stop the workload and remove its container
   hacoctl remove-workload <project> <service> [revision]   hard-delete that workload's record entirely (revision defaults to "latest"); distinct from stop, which keeps a stopped row
   hacoctl remove-all-workloads [project]          hard-delete every workload record, optionally scoped to one project (--yes skips confirmation)
@@ -1523,23 +1523,99 @@ func logs(baseURL string, args []string) error {
 	return fetchLogs(http.DefaultClient, baseURL, args, os.Stdout)
 }
 
+const logsUsage = "usage: hacoctl logs <project> <service> [revision] [--tail N] [-f]"
+
 func fetchLogs(client *http.Client, baseURL string, args []string, output io.Writer) error {
-	if len(args) != 3 {
-		return fmt.Errorf("usage: hacoctl logs <project> <service> <revision>")
+	var positional []string
+	tail, follow := 200, false
+	for i := 0; i < len(args); i++ {
+		switch a := args[i]; {
+		case a == "-f" || a == "--follow":
+			follow = true
+		case a == "--tail" || a == "-n":
+			if i+1 >= len(args) {
+				return fmt.Errorf(logsUsage)
+			}
+			n, err := strconv.Atoi(args[i+1])
+			if err != nil || n <= 0 {
+				return fmt.Errorf("--tail needs a positive number, got %q", args[i+1])
+			}
+			tail = n
+			i++
+		case strings.HasPrefix(a, "-"):
+			return fmt.Errorf("unknown flag %s\n%s", a, logsUsage)
+		default:
+			positional = append(positional, a)
+		}
 	}
-	path := fmt.Sprintf("/v1/workloads/%s/%s/%s/logs",
-		neturl.PathEscape(args[0]), neturl.PathEscape(args[1]), neturl.PathEscape(args[2]))
-	resp, err := client.Get(baseURL + path)
+	if len(positional) < 2 || len(positional) > 3 {
+		return fmt.Errorf(logsUsage)
+	}
+	revision := "latest"
+	if len(positional) == 3 {
+		revision = positional[2]
+	}
+	path := fmt.Sprintf("/v1/workloads/%s/%s/%s/logs?tail=%d",
+		neturl.PathEscape(positional[0]), neturl.PathEscape(positional[1]), neturl.PathEscape(revision), tail)
+
+	var last string
+	for {
+		text, live, err := getLogs(client, baseURL+path)
+		if err != nil {
+			return err
+		}
+		lines := strings.SplitAfter(text, "\n")
+		start := 0
+		if last != "" {
+			// Docker timestamps every line, so the last line printed marks
+			// where new output begins; if it scrolled out of the window,
+			// print the whole window.
+			for i := len(lines) - 1; i >= 0; i-- {
+				if lines[i] == last {
+					start = i + 1
+					break
+				}
+			}
+		}
+		for _, l := range lines[start:] {
+			if strings.HasSuffix(l, "\n") {
+				_, _ = io.WriteString(output, l)
+				last = l
+			}
+		}
+		if !follow {
+			if n := len(lines); n > 0 && !strings.HasSuffix(lines[n-1], "\n") {
+				_, _ = io.WriteString(output, lines[n-1])
+			}
+			return nil
+		}
+		if !live {
+			return fmt.Errorf("container isn't running; nothing to follow")
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// getLogs returns the log text and whether it came live from the node (as
+// opposed to the tail captured when the container failed to start).
+func getLogs(client *http.Client, url string) (string, bool, error) {
+	resp, err := client.Get(url)
 	if err != nil {
-		return err
+		return "", false, err
 	}
 	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
-		data, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("control plane returned %s: %s", resp.Status, string(data))
+		return "", false, fmt.Errorf("control plane returned %s: %s", resp.Status, string(data))
 	}
-	_, err = io.Copy(output, resp.Body)
-	return err
+	live := resp.Header.Get("X-Haco-Logs-Source") != "captured"
+	if !live {
+		if reason := resp.Header.Get("X-Haco-Live-Error"); reason != "" {
+			fmt.Fprintf(os.Stderr, "(live logs unavailable: %s)\n", reason)
+		}
+		fmt.Fprintln(os.Stderr, "(showing logs captured when the container failed to start)")
+	}
+	return string(data), live, nil
 }
 
 func get(baseURL, path string) error {

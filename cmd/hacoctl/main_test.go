@@ -31,6 +31,22 @@ func TestLogsFetchesAndPrintsWorkloadLogTail(t *testing.T) {
 	}
 }
 
+func TestLogsDefaultsRevisionAndPassesTail(t *testing.T) {
+	transport := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/v1/workloads/demo/api/latest/logs" || r.URL.Query().Get("tail") != "30" {
+			t.Errorf("request = %s", r.URL)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"X-Haco-Logs-Source": []string{"live"}}, Body: io.NopCloser(strings.NewReader("a\nb\n")), Request: r}, nil
+	})
+	var out bytes.Buffer
+	if err := fetchLogs(&http.Client{Transport: transport}, "http://cp", []string{"demo", "api", "--tail", "30"}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != "a\nb\n" {
+		t.Fatalf("output = %q", out.String())
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

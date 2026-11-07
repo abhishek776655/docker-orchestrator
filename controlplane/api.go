@@ -36,6 +36,8 @@ func NewHandler(svc *Service) http.Handler {
 
 	mux.HandleFunc("GET /v1/agent/{node}/assignments", svc.handleAssignments)
 	mux.HandleFunc("POST /v1/agent/status", svc.handleReportStatus)
+	mux.HandleFunc("GET /v1/agent/{node}/log-requests", svc.handleTakeLiveLogRequests)
+	mux.HandleFunc("POST /v1/agent/{node}/log-response", svc.handleDeliverLiveLogs)
 
 	mux.HandleFunc("GET /v1/services/{project}/{service}", svc.handleListServiceInstances)
 	mux.HandleFunc("GET /v1/services/{project}", svc.handleListProjectServices)
@@ -68,6 +70,8 @@ func NewAgentHandler(svc *Service) http.Handler {
 	mux.Handle("GET /v1/agent/{node}/volume-context/{project}/{service}/{revision}/{index}", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleVolumeContext)))
 	mux.Handle("GET /v1/agent/{node}/volume-seed/{project}/{service}/{revision}/{index}", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleVolumeSeed)))
 	mux.Handle("POST /v1/agent/status", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleReportStatus)))
+	mux.Handle("GET /v1/agent/{node}/log-requests", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleTakeLiveLogRequests)))
+	mux.Handle("POST /v1/agent/{node}/log-response", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleDeliverLiveLogs)))
 	mux.Handle("GET /v1/services/{project}/{service}", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleListServiceInstances)))
 	mux.Handle("GET /v1/services/{project}", svc.joinManager.authenticateAgent(http.HandlerFunc(svc.handleListProjectServices)))
 	return logRequests(mux)
@@ -628,8 +632,31 @@ func (svc *Service) handleReportStatus(w http.ResponseWriter, r *http.Request) {
 
 func (svc *Service) handleGetWorkloadLogs(w http.ResponseWriter, r *http.Request) {
 	key := strings.Join([]string{r.PathValue("project"), r.PathValue("service"), r.PathValue("revision")}, "/")
+	var liveErr error
+	if r.URL.Query().Get("live") != "0" {
+		tail := 200
+		if v, err := strconv.Atoi(r.URL.Query().Get("tail")); err == nil && v > 0 {
+			tail = min(v, 5000)
+		}
+		live, err := svc.RequestLiveLogs(r.Context(), key, tail)
+		if err == nil {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.Header().Set("X-Haco-Logs-Source", "live")
+			_, _ = io.WriteString(w, live)
+			return
+		}
+		if errors.Is(err, store.ErrNotFound) {
+			writeError(w, http.StatusNotFound, err)
+			return
+		}
+		liveErr = err
+	}
 	logs, err := svc.GetWorkloadLogs(r.Context(), key)
 	if errors.Is(err, store.ErrNotFound) {
+		if liveErr != nil {
+			writeError(w, http.StatusNotFound, fmt.Errorf("no logs for workload %q: %v; and nothing was captured at a failure either", key, liveErr))
+			return
+		}
 		writeError(w, http.StatusNotFound, fmt.Errorf("no container logs found for workload %q", key))
 		return
 	}
@@ -638,6 +665,10 @@ func (svc *Service) handleGetWorkloadLogs(w http.ResponseWriter, r *http.Request
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("X-Haco-Logs-Source", "captured")
+	if liveErr != nil {
+		w.Header().Set("X-Haco-Live-Error", strings.ReplaceAll(liveErr.Error(), "\n", " "))
+	}
 	_, _ = io.WriteString(w, logs)
 }
 

@@ -145,6 +145,21 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 	}()
 
+	// Live-log requests also get their own loop: pollAndExecute can be
+	// stuck in a long build, and `hacoctl logs` shouldn't wait on it.
+	go func() {
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				a.serveLiveLogRequests(ctx)
+			}
+		}
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
