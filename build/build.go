@@ -187,12 +187,21 @@ func TarContext(dir string) (io.Reader, error) {
 		if err != nil {
 			return err
 		}
-		if info.IsDir() {
-			return nil
-		}
 		rel, err := filepath.Rel(dir, path)
 		if err != nil {
 			return err
+		}
+		if info.IsDir() {
+			if rel == "." {
+				return nil // the root itself needs no entry
+			}
+			// A directory still needs its own tar entry even with no files
+			// of its own directly inside it — e.g. Postgres's pg_notify,
+			// which must exist (empty) for the server to start at all.
+			// Skipping directory entries entirely (as this used to) loses
+			// any such empty directory on extraction, since nothing else
+			// in the tarball references it.
+			return tw.WriteHeader(&tar.Header{Name: rel + "/", Typeflag: tar.TypeDir, Mode: 0o755})
 		}
 		data, err := os.ReadFile(path)
 		if err != nil {

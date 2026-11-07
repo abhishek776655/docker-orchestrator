@@ -1,6 +1,8 @@
 package build
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"io"
 	"net/http"
@@ -83,4 +85,51 @@ type buildRoundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f buildRoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+// TestTarContextPreservesEmptyDirectories covers a real bug: a directory
+// with no files of its own (e.g. Postgres's pg_notify, which must exist,
+// empty, for the server to start at all) used to get silently dropped —
+// TarContext only ever wrote an entry for the files it walked past, never
+// for a directory itself, so an empty one left nothing in the tarball to
+// recreate it on extraction. Fixed by emitting a tar.TypeDir header for
+// every directory, not just ones containing files.
+func TestTarContextPreservesEmptyDirectories(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "empty-subdir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "has-a-file.txt"), []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tarball, err := TarContext(dir)
+	if err != nil {
+		t.Fatalf("TarContext: %v", err)
+	}
+	data, err := io.ReadAll(tarball)
+	if err != nil {
+		t.Fatalf("read tarball: %v", err)
+	}
+
+	var sawEmptyDir bool
+	tr := tar.NewReader(bytes.NewReader(data))
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read tar entry: %v", err)
+		}
+		if strings.TrimSuffix(hdr.Name, "/") == "empty-subdir" {
+			if hdr.Typeflag != tar.TypeDir {
+				t.Fatalf("empty-subdir entry type = %v, want TypeDir", hdr.Typeflag)
+			}
+			sawEmptyDir = true
+		}
+	}
+	if !sawEmptyDir {
+		t.Fatalf("expected a tar entry for the empty subdirectory, found none")
+	}
 }

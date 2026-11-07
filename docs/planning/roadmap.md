@@ -398,3 +398,13 @@ Found by actually running `hacoctl plan`/`deploy` against a real,
   picked up again, and crucially, real data the service has since written
   into the managed volume is never overwritten by a stale seed on a
   later restart.
+- **`build.TarContext` silently dropped empty directories**: it only ever
+  wrote a tar entry for the files it walked past, never for a directory
+  itself — harmless for a Docker build context (an empty directory rarely
+  matters to `COPY . .`), but broke a database's required empty
+  directories once the same function started packaging managed-volume
+  seeds: a real Postgres `db` seeded from existing local data failed with
+  `could not open directory "pg_notify": No such file or directory`,
+  since nothing in the tarball referenced that directory at all. Fixed by
+  emitting a `tar.TypeDir` entry for every directory walked, not just ones
+  containing files.
