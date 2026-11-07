@@ -88,6 +88,39 @@ func TestListReadyServiceInstancesReturnsInternalPort(t *testing.T) {
 	}
 }
 
+func TestActiveReservationsNameEachPortHolder(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	n := testNode("node-res")
+	if err := s.UpsertNode(ctx, n); err != nil {
+		t.Fatal(err)
+	}
+	for _, svc := range []struct {
+		name   string
+		port   int
+		status model.Status
+	}{{"metaapi", 5600, model.StatusReady}, {"old", 7000, model.StatusStopped}} {
+		wl := store.WorkloadRecord{
+			Workload: model.Workload{Project: "demo", Service: svc.name, Revision: "latest", Image: "x",
+				Constraints: model.Constraints{HostPorts: []int{svc.port}}, Storage: model.StoragePolicy{Class: model.Ephemeral}, DesiredState: model.DesiredRunning},
+			Status: svc.status, NodeID: n.ID,
+		}
+		if err := s.CreateWorkload(ctx, wl); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, ports, err := s.ActiveReservations(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ports[n.ID][5600]; got != "demo/metaapi/latest" {
+		t.Fatalf("holder of 5600 = %q, want demo/metaapi/latest", got)
+	}
+	if _, held := ports[n.ID][7000]; held {
+		t.Fatal("a stopped workload must not hold its port")
+	}
+}
+
 func TestListProjectServiceTargetsIncludesPortlessService(t *testing.T) {
 	s := openTestStore(t)
 	ctx := context.Background()

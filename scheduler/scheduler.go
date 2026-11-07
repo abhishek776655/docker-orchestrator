@@ -7,6 +7,7 @@ package scheduler
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/abhishek/hardware-aware-container-orchestrator/model"
 )
@@ -32,7 +33,7 @@ type nodeState struct {
 	reservedCPU  int64
 	reservedMem  int64
 	reservedVRAM int64
-	usedPorts    map[int]bool
+	usedPorts    map[int]string // host port -> key of the workload holding it
 }
 
 // Scheduler holds cluster state: the known nodes and the reservations
@@ -56,7 +57,7 @@ func NewWithWeights(nodes []model.Node, weights Weights) *Scheduler {
 		nodes:   make(map[string]*nodeState, len(nodes)),
 	}
 	for _, n := range nodes {
-		s.nodes[n.ID] = &nodeState{node: n, usedPorts: make(map[int]bool)}
+		s.nodes[n.ID] = &nodeState{node: n, usedPorts: make(map[int]string)}
 		s.order = append(s.order, n.ID)
 	}
 	// Deterministic regardless of input order.
@@ -68,15 +69,17 @@ func NewWithWeights(nodes []model.Node, weights Weights) *Scheduler {
 // workloads scheduled in a previous process (e.g. recovered from
 // persistent storage at startup, SRS NFR-001). It must be called before
 // any Schedule call on this instance.
-func (s *Scheduler) SeedReservation(nodeID string, res model.Resources, hostPorts []int) {
+// hostPorts maps each held host port to the key of the workload holding
+// it, so a conflict can name the holder.
+func (s *Scheduler) SeedReservation(nodeID string, res model.Resources, hostPorts map[int]string) {
 	ns, ok := s.nodes[nodeID]
 	if !ok {
 		return
 	}
 	ns.reservedCPU += res.CPUMillis
 	ns.reservedMem += res.MemoryBytes
-	for _, p := range hostPorts {
-		ns.usedPorts[p] = true
+	for p, holder := range hostPorts {
+		ns.usedPorts[p] = holder
 	}
 }
 
@@ -188,12 +191,27 @@ func (s *Scheduler) reject(ns *nodeState, w model.Workload) (string, bool) {
 	}
 
 	for _, p := range w.Constraints.HostPorts {
-		if ns.usedPorts[p] {
-			return fmt.Sprintf("host port %d already reserved", p), true
+		if holder, taken := ns.usedPorts[p]; taken {
+			return portTakenReason(p, holder, w), true
 		}
 	}
 
 	return "", false
+}
+
+// portTakenReason names who holds the port. When the holder is this same
+// service under a different project name, it's almost always a redeploy
+// planned with the wrong project name, which would start a second copy.
+func portTakenReason(port int, holder string, w model.Workload) string {
+	if holder == "" {
+		return fmt.Sprintf("host port %d already reserved", port)
+	}
+	reason := fmt.Sprintf("host port %d already reserved by %s", port, holder)
+	parts := strings.SplitN(holder, "/", 3)
+	if len(parts) == 3 && parts[1] == w.Service && parts[0] != w.Project {
+		reason += fmt.Sprintf(" (the same service deployed under project %q; use that project name to update it rather than starting a second copy)", parts[0])
+	}
+	return reason
 }
 
 // architectureCompatible reports whether a workload requiring arch can run
@@ -304,6 +322,6 @@ func (s *Scheduler) reserve(ns *nodeState, w model.Workload) {
 		ns.reservedVRAM += w.Constraints.GPU.VRAMBytes
 	}
 	for _, p := range w.Constraints.HostPorts {
-		ns.usedPorts[p] = true
+		ns.usedPorts[p] = w.Key()
 	}
 }

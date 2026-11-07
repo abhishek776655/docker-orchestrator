@@ -454,3 +454,56 @@ func TestCacheFitPrefersNodeWithImageAlready(t *testing.T) {
 		t.Fatalf("expected node-warm (has the image cached), got %s", decision.Selected)
 	}
 }
+
+func portRejection(t *testing.T, d *model.Decision, nodeID string) string {
+	t.Helper()
+	for _, r := range d.Rejections {
+		if r.NodeID == nodeID {
+			return r.Reason
+		}
+	}
+	t.Fatalf("no rejection for %s: %+v", nodeID, d.Rejections)
+	return ""
+}
+
+func TestPortConflictNamesHolderAndHintsAtProjectName(t *testing.T) {
+	s := scheduler.New([]model.Node{node("node-a", "arm64", 4000, 8_000_000_000), node("node-b", "arm64", 4000, 8_000_000_000)})
+	s.SeedReservation("node-a", model.Resources{}, map[int]string{5600: "dockerizelocalhost/metaapi/latest"})
+
+	sameService := testdata.SmallWorkload("dockerize-localhost", "metaapi")
+	sameService.Constraints.HostPorts = []int{5600}
+	d, err := s.Schedule(sameService)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reason := portRejection(t, d, "node-a")
+	if !strings.Contains(reason, "reserved by dockerizelocalhost/metaapi/latest") || !strings.Contains(reason, `project "dockerizelocalhost"`) {
+		t.Fatalf("reason = %q, want the holder and a project-name hint", reason)
+	}
+	if d.Selected != "node-b" {
+		t.Fatalf("selected %s, want node-b", d.Selected)
+	}
+
+	other := testdata.SmallWorkload("dockerize-localhost", "gateway")
+	other.Constraints.HostPorts = []int{5600}
+	d2, _ := s.Schedule(other)
+	reason = portRejection(t, d2, "node-a")
+	if !strings.Contains(reason, "reserved by dockerizelocalhost/metaapi/latest") || strings.Contains(reason, "use that project name") {
+		t.Fatalf("reason = %q, want the holder but no hint for an unrelated service", reason)
+	}
+}
+
+func TestPortConflictWithinOneBatchNamesEarlierService(t *testing.T) {
+	s := scheduler.New([]model.Node{node("node-a", "arm64", 4000, 8_000_000_000)})
+	first := testdata.SmallWorkload("p", "api")
+	first.Constraints.HostPorts = []int{8080}
+	if _, err := s.Schedule(first); err != nil {
+		t.Fatal(err)
+	}
+	second := testdata.SmallWorkload("p", "admin")
+	second.Constraints.HostPorts = []int{8080}
+	d, _ := s.Schedule(second)
+	if reason := portRejection(t, d, "node-a"); !strings.Contains(reason, "reserved by "+first.Key()) {
+		t.Fatalf("reason = %q, want it to name %s", reason, first.Key())
+	}
+}

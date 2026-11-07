@@ -659,7 +659,9 @@ func (s *Store) ListNodes(ctx context.Context) ([]model.Node, error) {
 // redeploy must not see its own prior attempt's reservation as taken,
 // since that attempt is about to be replaced, not added to (see
 // CreateWorkload's ON CONFLICT). Pass "" to exclude nothing.
-func (s *Store) ActiveReservations(ctx context.Context, excludeKey string) (map[string]model.Resources, map[string][]int, error) {
+// Ports are returned per node as host port -> the key of the workload
+// holding it, so a conflict can name its holder.
+func (s *Store) ActiveReservations(ctx context.Context, excludeKey string) (map[string]model.Resources, map[string]map[int]string, error) {
 	return s.ActiveReservationsExcluding(ctx, []string{excludeKey})
 }
 
@@ -667,14 +669,14 @@ func (s *Store) ActiveReservations(ctx context.Context, excludeKey string) (map[
 // batch of keys at once — used when dry-run planning several workloads
 // together, so each one's own existing (pre-replan) reservation doesn't
 // double-count against the very placement being recomputed for it.
-func (s *Store) ActiveReservationsExcluding(ctx context.Context, excludeKeys []string) (map[string]model.Resources, map[string][]int, error) {
+func (s *Store) ActiveReservationsExcluding(ctx context.Context, excludeKeys []string) (map[string]model.Resources, map[string]map[int]string, error) {
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(excludeKeys)), ",")
 	args := make([]any, len(excludeKeys))
 	for i, k := range excludeKeys {
 		args[i] = k
 	}
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT node_id, cpu_millis, memory_bytes, host_ports FROM workloads
+		SELECT key, node_id, cpu_millis, memory_bytes, host_ports FROM workloads
 		WHERE node_id != '' AND status NOT IN ('failed', 'stopped') AND key NOT IN (`+placeholders+`)
 	`, args...)
 	if err != nil {
@@ -683,12 +685,12 @@ func (s *Store) ActiveReservationsExcluding(ctx context.Context, excludeKeys []s
 	defer rows.Close()
 
 	cpuMem := map[string]model.Resources{}
-	ports := map[string][]int{}
+	ports := map[string]map[int]string{}
 	for rows.Next() {
-		var nodeID string
+		var key, nodeID string
 		var res model.Resources
 		var hostPortsJSON []byte
-		if err := rows.Scan(&nodeID, &res.CPUMillis, &res.MemoryBytes, &hostPortsJSON); err != nil {
+		if err := rows.Scan(&key, &nodeID, &res.CPUMillis, &res.MemoryBytes, &hostPortsJSON); err != nil {
 			return nil, nil, err
 		}
 		acc := cpuMem[nodeID]
@@ -698,7 +700,12 @@ func (s *Store) ActiveReservationsExcluding(ctx context.Context, excludeKeys []s
 
 		var p []int
 		_ = json.Unmarshal(hostPortsJSON, &p)
-		ports[nodeID] = append(ports[nodeID], p...)
+		if len(p) > 0 && ports[nodeID] == nil {
+			ports[nodeID] = map[int]string{}
+		}
+		for _, port := range p {
+			ports[nodeID][port] = key
+		}
 	}
 	return cpuMem, ports, rows.Err()
 }
