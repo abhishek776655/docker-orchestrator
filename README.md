@@ -48,6 +48,21 @@ hacoctl deploy myapp ./docker-compose.yml   # build, place, start, show live sta
 Details on each step are under [Install](#install) and
 [Setting up a cluster](#setting-up-a-cluster) below.
 
+## Requirements
+
+- Docker on every machine (Docker Desktop, Colima, Rancher Desktop or plain
+  Docker on Linux). The socket is found automatically.
+- Go 1.26 or newer to build.
+- Node.js and npm, only for the web console.
+- Machines on the same network. The control plane listens on
+  `127.0.0.1:8099` for operators and on port `8443` for agents.
+
+## Install
+
+`./install.sh` installs `controlplane`, `agent` and `hacoctl` into
+`$(go env GOPATH)/bin` and, when npm is available, builds the web console
+into `~/.haco/web`. Make sure that bin folder is on your `PATH`.
+
 ## Features
 
 **Scheduling**
@@ -96,21 +111,6 @@ Details on each step are under [Install](#install) and
   what to keep on the host, then review the plan and dependency graph,
   change placements and deploy with live status.
 - Project, service and node pages; a searchable, paginated event history.
-
-## Requirements
-
-- Docker on every machine (Docker Desktop, Colima, Rancher Desktop or plain
-  Docker on Linux). The socket is found automatically.
-- Go 1.26 or newer to build.
-- Node.js and npm, only for the web console.
-- Machines on the same network. The control plane listens on
-  `127.0.0.1:8099` for operators and on port `8443` for agents.
-
-## Install
-
-`./install.sh` installs `controlplane`, `agent` and `hacoctl` into
-`$(go env GOPATH)/bin` and, when npm is available, builds the web console
-into `~/.haco/web`. Make sure that bin folder is on your `PATH`.
 
 ## Setting up a cluster
 
