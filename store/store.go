@@ -334,6 +334,14 @@ func (s *Store) UncordonNode(ctx context.Context, nodeID string) error {
 	return nil
 }
 
+// PauseNode records that a node's agent stopped cleanly. Only an available
+// node is paused: a cordoned node stays cordoned. MarkStaleNodesUnavailable
+// only demotes 'available' nodes, so a paused one is never failed over.
+func (s *Store) PauseNode(ctx context.Context, nodeID string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE nodes SET availability = 'paused' WHERE id = ? AND availability = 'available' AND disabled_by_admin = 0`, nodeID)
+	return err
+}
+
 // MarkStaleNodesUnavailable excludes nodes from new placements once their
 // heartbeat is older than timeout (SRS FR-015).
 func (s *Store) MarkStaleNodesUnavailable(ctx context.Context, timeout time.Duration) error {

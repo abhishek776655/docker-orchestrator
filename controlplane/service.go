@@ -48,6 +48,7 @@ type Service struct {
 	buildSSH map[string]map[string][]byte
 
 	liveLogs liveLogRelay
+	shutdown shutdownState
 
 	// volumeSnapshots holds a directory bind mount's content as a tarball,
 	// keyed by workload-key + volume index — the same in-memory, fetch-

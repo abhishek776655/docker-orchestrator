@@ -80,6 +80,8 @@ func main() {
 		err = stopContainers(url, os.Args[2:])
 	case "teardown":
 		err = teardown(url, os.Args[2:])
+	case "shutdown":
+		err = shutdown(url, os.Args[2:])
 	case "start":
 		err = start(url, os.Args[2:])
 	case "stop-all":
@@ -128,6 +130,7 @@ Usage:
   hacoctl remove-node <node-id> [--force]         hard-delete that node record and its credential (refused if it still has a non-terminal workload assigned, unless --force)
   hacoctl stop-containers [project]               stop every workload's container, optionally filtered to one project (nodes stay joined; --yes skips confirmation)
   hacoctl teardown                                stop every workload and revoke every node credential (--yes skips confirmation)
+  hacoctl shutdown                                stop the whole cluster in order: every node's containers (stopped, not removed) and agent, then the control plane; 'hacoctl start' + 'hacoctl agent run' bring the same services back (--yes skips confirmation)
   hacoctl start                                   start the control plane in the background, with the local build registry on by default (--foreground to run attached, --no-registry to disable the registry, --logs to tail its log right after starting, --tui to launch the dashboard once ready instead — not combinable with each other or --foreground)
   hacoctl stop-all                                stop the control plane process started by 'hacoctl start'
   hacoctl agent join <token>                      join this machine as a worker node (one-time token from 'hacoctl start')
@@ -1212,6 +1215,92 @@ func teardown(baseURL string, args []string) error {
 		}
 		fmt.Printf("revoked %s\n", n.ID)
 	}
+	return nil
+}
+
+// shutdown stops the whole cluster in order — every node's containers and
+// agent, then the control plane — so that `hacoctl start` and
+// `hacoctl agent run` bring the same services back on the same nodes.
+func shutdown(baseURL string, args []string) error {
+	yes := false
+	for _, a := range args {
+		if a == "--yes" || a == "-y" {
+			yes = true
+		}
+	}
+	var nodeList []nodeView
+	if err := fetchJSON(baseURL, "/v1/nodes", &nodeList); err != nil {
+		return fmt.Errorf("list nodes: %w", err)
+	}
+	var wl []workloadRecordView
+	if err := fetchJSON(baseURL, "/v1/workloads", &wl); err != nil {
+		return fmt.Errorf("list workloads: %w", err)
+	}
+	perNode := map[string]int{}
+	for _, w := range wl {
+		if w.Status == "running" || w.Status == "ready" {
+			perNode[w.NodeID]++
+		}
+	}
+	fmt.Println("This will stop:")
+	for _, n := range nodeList {
+		switch n.Availability {
+		case "available", "disabled":
+			fmt.Printf("  %-14s %d running service(s) and its agent\n", n.ID, perNode[n.ID])
+		default:
+			fmt.Printf("  %-14s skipped: node is %s (can't be reached)\n", n.ID, n.Availability)
+		}
+	}
+	fmt.Println("  and the control plane.")
+	fmt.Println("Containers are stopped, not removed; `hacoctl start` here and `hacoctl agent run` on each other node bring them back.")
+	if !yes && !confirm("Shut down the cluster?") {
+		return fmt.Errorf("shutdown aborted")
+	}
+
+	client := &http.Client{Timeout: 10 * time.Minute}
+	resp, err := client.Post(baseURL+"/v1/admin/shutdown", "application/json", bytes.NewReader([]byte(`{}`)))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("control plane returned %s: %s", resp.Status, string(data))
+	}
+	var report struct {
+		Nodes map[string]struct {
+			Stopped []string `json:"stopped"`
+			Errors  []string `json:"errors"`
+		} `json:"nodes"`
+		NotReached map[string]string `json:"not_reached"`
+	}
+	if err := json.Unmarshal(data, &report); err != nil {
+		return fmt.Errorf("decode shutdown report: %w", err)
+	}
+	ids := make([]string, 0, len(report.Nodes))
+	for id := range report.Nodes {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		r := report.Nodes[id]
+		fmt.Printf("%s: stopped %d container(s)\n", id, len(r.Stopped))
+		for _, e := range r.Errors {
+			fmt.Printf("  error: %s\n", e)
+		}
+	}
+	for id, why := range report.NotReached {
+		fmt.Printf("%s: NOT stopped: %s\n", id, why)
+	}
+	for i := 0; i < 20 && controlPlaneUp(baseURL); i++ {
+		time.Sleep(500 * time.Millisecond)
+	}
+	if controlPlaneUp(baseURL) {
+		fmt.Println("control plane is still up; stop it with `hacoctl stop-all`")
+		return nil
+	}
+	_ = os.Remove(filepath.Join(envOr("HACO_DATA_DIR", filepath.Join(homeDir(), ".haco")), "controlplane.pid"))
+	fmt.Println("control plane stopped. Bring everything back with `hacoctl start` here, then `hacoctl agent run` on each other node.")
 	return nil
 }
 

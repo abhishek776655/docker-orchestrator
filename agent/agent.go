@@ -13,6 +13,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -128,6 +129,13 @@ func (a *Agent) Run(ctx context.Context) error {
 	defer heartbeat.Stop()
 	defer poll.Stop()
 
+	// workCtx governs assignment execution only: a cluster shutdown cancels
+	// it first so an in-flight build or start aborts promptly instead of
+	// holding the shutdown up for the length of a build.
+	workCtx, stopWork := context.WithCancel(ctx)
+	defer stopWork()
+	shutdown := make(chan struct{})
+
 	// Heartbeats get their own goroutine. pollAndExecute can block for
 	// minutes on an image pull or build; if the heartbeat shared its loop, a
 	// busy but healthy node would go silent, be marked unavailable after the
@@ -145,8 +153,8 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 	}()
 
-	// Live-log requests also get their own loop: pollAndExecute can be
-	// stuck in a long build, and `hacoctl logs` shouldn't wait on it.
+	// Control requests (live logs, cluster shutdown) get their own loop:
+	// pollAndExecute can be stuck in a long build and must not delay them.
 	go func() {
 		t := time.NewTicker(time.Second)
 		defer t.Stop()
@@ -156,6 +164,11 @@ func (a *Agent) Run(ctx context.Context) error {
 				return
 			case <-t.C:
 				a.serveLiveLogRequests(ctx)
+				if a.shutdownRequested(ctx) {
+					stopWork()
+					close(shutdown)
+					return
+				}
 			}
 		}
 	}()
@@ -163,13 +176,79 @@ func (a *Agent) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			a.pause()
 			return nil
+		case <-shutdown:
+			a.shutdownNode(ctx)
+			return ErrShutdownByControlPlane
 		case <-poll.C:
-			if err := a.pollAndExecute(ctx); err != nil {
+			if workCtx.Err() != nil {
+				continue
+			}
+			if err := a.pollAndExecute(workCtx); err != nil && workCtx.Err() == nil {
 				log.Printf("poll/execute failed: %v", err)
 			}
 		}
 	}
+}
+
+// ErrShutdownByControlPlane is returned by Run after a cluster shutdown
+// (`hacoctl shutdown`) stopped this node's containers.
+var ErrShutdownByControlPlane = errors.New("shut down by control plane (hacoctl shutdown); run `hacoctl agent run` to bring this node and its services back")
+
+const shutdownStatusReason = "stopped by cluster shutdown; restarts when this node's agent returns"
+
+// pause tells the control plane this agent is stopping cleanly, so the node
+// is held rather than failed over; containers are left running.
+func (a *Agent) pause() {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := a.post(ctx, "/v1/nodes/"+a.cfg.NodeID+"/pause", map[string]any{}, nil); err != nil {
+		log.Printf("could not tell the control plane node %s is pausing (it will be treated as unavailable after the heartbeat timeout): %v", a.cfg.NodeID, err)
+		return
+	}
+	log.Printf("node %s paused; its containers keep running", a.cfg.NodeID)
+}
+
+func (a *Agent) shutdownRequested(ctx context.Context) bool {
+	var resp struct {
+		Shutdown bool `json:"shutdown"`
+	}
+	if err := a.get(ctx, "/v1/agent/"+a.cfg.NodeID+"/control", &resp); err != nil {
+		return false // older control plane without this endpoint, or a transient error
+	}
+	return resp.Shutdown
+}
+
+// shutdownNode stops (not removes) every running container this agent
+// manages, marks each workload to run again when the agent returns, and
+// confirms to the control plane.
+func (a *Agent) shutdownNode(ctx context.Context) {
+	log.Printf("cluster shutdown requested: stopping this node's containers")
+	var res struct {
+		Stopped []string `json:"stopped"`
+		Errors  []string `json:"errors,omitempty"`
+	}
+	managed, err := a.docker.ManagedContainers(ctx)
+	if err != nil {
+		res.Errors = append(res.Errors, err.Error())
+	}
+	for _, c := range managed {
+		if !c.Running {
+			continue
+		}
+		if err := a.docker.StopContainer(ctx, c.ContainerID); err != nil {
+			res.Errors = append(res.Errors, c.WorkloadKey+": "+err.Error())
+			continue
+		}
+		a.report(ctx, c.WorkloadKey, model.StatusAssigned, shutdownStatusReason, "")
+		res.Stopped = append(res.Stopped, c.WorkloadKey)
+		log.Printf("stopped %s", c.WorkloadKey)
+	}
+	if err := a.post(ctx, "/v1/agent/"+a.cfg.NodeID+"/shutdown-done", res, nil); err != nil {
+		log.Printf("confirm shutdown to control plane: %v", err)
+	}
+	a.pause()
 }
 
 func (a *Agent) register(ctx context.Context) error {
@@ -466,14 +545,31 @@ func (a *Agent) fetchVolumeSnapshots(ctx context.Context, rec store.WorkloadReco
 		if err != nil {
 			return err
 		}
+		hostPath := a.docker.VolumeHostPath(rec.Key(), v.ContainerPath)
+		if resp.StatusCode == http.StatusNotFound {
+			// Snapshots live only in control-plane memory, so a control
+			// plane restarted since the deploy (e.g. after hacoctl
+			// shutdown) no longer has one. The copy already extracted here
+			// is that same deploy's snapshot, so reuse it.
+			if hasEntries(hostPath) {
+				log.Printf("%s: control plane no longer holds the %s snapshot (restarted since deploy); reusing this node's copy", rec.Key(), v.ContainerPath)
+				continue
+			}
+			return fmt.Errorf("volume snapshot %s: the control plane restarted since this was deployed and no longer has it, and this node has no copy; redeploy to send it again", v.ContainerPath)
+		}
 		if resp.StatusCode >= 300 {
 			return fmt.Errorf("fetch volume snapshot %s: control plane returned %s: %s", v.ContainerPath, resp.Status, string(tarball))
 		}
-		if err := ExtractTar(a.docker.VolumeHostPath(rec.Key(), v.ContainerPath), bytes.NewReader(tarball)); err != nil {
+		if err := ExtractTar(hostPath, bytes.NewReader(tarball)); err != nil {
 			return fmt.Errorf("extract volume snapshot %s: %w", v.ContainerPath, err)
 		}
 	}
 	return nil
+}
+
+func hasEntries(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	return err == nil && len(entries) > 0
 }
 
 // fetchVolumeSeeds adopts a managed volume's one-time seed content

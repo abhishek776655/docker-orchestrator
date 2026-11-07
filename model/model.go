@@ -12,6 +12,11 @@ const (
 	Available   Availability = "available"
 	Unavailable Availability = "unavailable"
 	Disabled    Availability = "disabled"
+	// Paused means the node's agent stopped cleanly (Ctrl-C, upgrade, or
+	// cluster shutdown) and said so. Its containers are left as they are,
+	// and unlike Unavailable nothing is rescheduled or failed; the node
+	// returns to Available when its agent registers again.
+	Paused Availability = "paused"
 )
 
 // StorageClass mirrors the spec's storage classes (see SRS 10.1). Only
@@ -196,8 +201,8 @@ type Workload struct {
 	// original M2 simplification.
 	PortBindings []PortBinding
 	Storage      StoragePolicy
-	Volumes        []VolumeMount
-	DesiredState   DesiredState
+	Volumes      []VolumeMount
+	DesiredState DesiredState
 	// DependsOn lists logical service names (another workload's Service
 	// field) that must have at least one ready instance before this
 	// workload is started (SRS 7.1 depends_on, FR-014, UC-05).

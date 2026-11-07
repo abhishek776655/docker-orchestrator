@@ -53,7 +53,7 @@ func main() {
 	defer s.Close()
 	log.Printf("metadata stored at %s", dbPath)
 
-	svc := controlplane.New(s)
+	svc := controlplane.New(s).WithShutdownHook(stop)
 	dataDir := envOr("HACO_DATA_DIR", defaultDataDir())
 	port := 8443
 	if _, p, err := net.SplitHostPort(agentAddr); err == nil {
@@ -106,6 +106,12 @@ func main() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		// The host's own agent stops with this process and couldn't
+		// reach the closing listeners to pause itself, so pause it here:
+		// its containers keep running and must not be failed over.
+		if err := s.PauseNode(shutdownCtx, agent.HostNodeID()); err != nil {
+			log.Printf("pause host node: %v", err)
+		}
 		_ = server.Shutdown(shutdownCtx)
 	}()
 	go func() {

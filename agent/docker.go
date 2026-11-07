@@ -706,6 +706,15 @@ func containerHostsMatch(hostConfig *container.HostConfig, expected []string) bo
 type ManagedContainer struct {
 	WorkloadKey string
 	ContainerID string
+	Running     bool
+}
+
+// StopContainer stops a container gracefully (SIGTERM, then SIGKILL after
+// 30 s so databases get time to flush) and keeps it, so a later start
+// reuses it as-is.
+func (d *Docker) StopContainer(ctx context.Context, containerID string) error {
+	timeout := 30
+	return d.cli.ContainerStop(ctx, containerID, container.StopOptions{Timeout: &timeout})
 }
 
 // ManagedContainers lists every container this agent has created (via its
@@ -723,7 +732,7 @@ func (d *Docker) ManagedContainers(ctx context.Context) ([]ManagedContainer, err
 	}
 	out := make([]ManagedContainer, 0, len(containers))
 	for _, c := range containers {
-		out = append(out, ManagedContainer{WorkloadKey: c.Labels[keyLabel], ContainerID: c.ID})
+		out = append(out, ManagedContainer{WorkloadKey: c.Labels[keyLabel], ContainerID: c.ID, Running: c.State == "running"})
 	}
 	return out, nil
 }
