@@ -238,6 +238,36 @@ type Workload struct {
 	// lets DependsOnHealthy mean something for whatever depends on this
 	// workload.
 	HealthCheck *HealthCheck
+	// Runtime holds container settings that change how the container runs
+	// but play no part in placement.
+	Runtime Runtime
+}
+
+// Runtime is the set of Compose container settings the agent applies when
+// it creates the container. The zero value means Docker's defaults.
+type Runtime struct {
+	// WorkingDir is compose `working_dir:`; empty keeps the image's own.
+	WorkingDir string `json:"working_dir,omitempty"`
+	// Restart is compose `restart:` (or deploy.restart_policy). An empty
+	// Name means the service set no policy at all.
+	Restart RestartPolicy `json:"restart,omitempty"`
+	// ExtraHosts are compose `extra_hosts:` entries as "name:address".
+	// The address may be Docker's own "host-gateway", which Docker resolves
+	// to the host the container runs on.
+	ExtraHosts []string `json:"extra_hosts,omitempty"`
+}
+
+// IsZero reports whether r asks for nothing beyond Docker's defaults.
+func (r Runtime) IsZero() bool {
+	return r.WorkingDir == "" && r.Restart.Name == "" && len(r.ExtraHosts) == 0
+}
+
+// RestartPolicy mirrors Docker's restart policy. Name is one of "no",
+// "always", "unless-stopped" or "on-failure"; MaxRetries applies only to
+// "on-failure", where 0 means retry forever.
+type RestartPolicy struct {
+	Name       string `json:"name,omitempty"`
+	MaxRetries int    `json:"max_retries,omitempty"`
 }
 
 // HealthCheck is the Docker-native subset of a Compose healthcheck: block
@@ -267,6 +297,11 @@ type VolumeMount struct {
 	// when the workload is pinned to the same machine this path was
 	// resolved on; compose.go enforces that at plan time.
 	HostPath string `json:"host_path,omitempty"`
+	// DockerSocket marks a HostPath that is the Docker API socket. Such a
+	// workload always runs on the control-plane host, and the agent mounts
+	// the path as-is without checking it exists (Docker Desktop serves
+	// /var/run/docker.sock from its VM even when the Mac has no such file).
+	DockerSocket bool `json:"docker_socket,omitempty"`
 	// FileContent, when non-empty, is the literal bytes of a single-file
 	// bind mount (e.g. a small ./config.json the container reads) read
 	// once at plan time and carried with the workload itself — unlike

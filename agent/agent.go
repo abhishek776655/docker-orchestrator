@@ -477,6 +477,26 @@ func (a *Agent) handle(ctx context.Context, rec store.WorkloadRecord) {
 			}
 			return
 		}
+		if rec.Runtime.Restart.Name != "" {
+			// The service chose a restart policy, and Docker has already
+			// applied it: a container that is still stopped is meant to
+			// stay stopped (restart: "no", a clean exit under on-failure,
+			// or retries used up). Report it instead of starting it again.
+			exited, err := a.docker.Exited(ctx, rec.Key())
+			if err != nil {
+				log.Printf("exit check failed for %s: %v", rec.Key(), err)
+				return
+			}
+			if exited != nil {
+				logs, logErr := a.docker.ContainerLogs(ctx, exited.ContainerID)
+				if logErr != nil {
+					log.Printf("collect logs for %s failed: %v", rec.Key(), logErr)
+				}
+				reason := fmt.Sprintf("exited with code %d (restart: %s)", exited.ExitCode, rec.Runtime.Restart.Name)
+				a.reportWithLogs(ctx, rec.Key(), model.StatusFailed, reason, exited.ContainerID, logs)
+				return
+			}
+		}
 		log.Printf("%s reported %s but its container is gone; re-executing (SRS safe retries)", rec.Key(), rec.Status)
 	}
 	a.execute(ctx, rec)
@@ -538,6 +558,7 @@ func (a *Agent) execute(ctx context.Context, rec store.WorkloadRecord) {
 		a.report(ctx, key, model.StatusWaitingDependencies, "waiting for: "+strings.Join(rec.DependsOn, ", "), "")
 		return
 	}
+	extraHosts = append(extraHosts, rec.Runtime.ExtraHosts...)
 
 	if rec.RemoteBuild != nil {
 		if needsRemoteBuild(*rec.RemoteBuild, a.docker.HasImage(ctx, rec.Image), a.docker.ImageBuildID(ctx, rec.Image)) {

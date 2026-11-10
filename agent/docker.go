@@ -35,6 +35,9 @@ const (
 	managedLabel = "haco.managed"
 	keyLabel     = "haco.workload.key"
 	nodeLabel    = "haco.node.id"
+	// runtimeLabel records the model.Runtime a container was created
+	// with, so a redeploy that changes it recreates the container.
+	runtimeLabel = "haco.runtime"
 )
 
 // Docker wraps the subset of the Docker Engine API the M2 agent needs:
@@ -182,10 +185,14 @@ func ExtractTar(dst string, r io.Reader) error {
 // mounts fine via `-v`/Binds.
 func (d *Docker) prepareVolumes(w model.Workload) ([]string, []string, error) {
 	if w.Storage.Class != model.NodeLocalPersistent {
-		if len(w.Volumes) > 0 {
-			return nil, nil, fmt.Errorf("volumes declared but storage class is %q, not node_local_persistent", w.Storage.Class)
+		// Single-file mounts (secrets, configs, small bind-mounted files)
+		// carry their content with the workload, so they need no storage
+		// on the node; any other volume does.
+		for _, v := range w.Volumes {
+			if v.FileContent == nil {
+				return nil, nil, fmt.Errorf("volumes declared but storage class is %q, not node_local_persistent", w.Storage.Class)
+			}
 		}
-		return nil, nil, nil
 	}
 
 	var binds []string
@@ -200,7 +207,7 @@ func (d *Docker) prepareVolumes(w model.Workload) ([]string, []string, error) {
 			// Re-checked here too, since plan-time validation ran on
 			// whichever process handled that request; this is the process
 			// that actually starts the container.
-			if _, err := os.Stat(v.HostPath); err != nil {
+			if _, err := os.Stat(v.HostPath); err != nil && !v.DockerSocket {
 				return nil, nil, fmt.Errorf("bind mount host path %s: %w", v.HostPath, err)
 			}
 			hostPath = v.HostPath
@@ -611,7 +618,7 @@ func (d *Docker) EnsureRunning(ctx context.Context, w model.Workload, extraHosts
 		if err != nil {
 			return "", warnings, fmt.Errorf("inspect workload image %s: %w", w.Image, err)
 		}
-		if !containerImageMatches(existing.Image, image.ID) || !containerHostsMatch(existing.HostConfig, extraHosts) {
+		if !containerImageMatches(existing.Image, image.ID) || !containerHostsMatch(existing.HostConfig, extraHosts) || !containerRuntimeMatches(existing.Config, w.Runtime) {
 			// The workload key (and therefore its container name) stays the
 			// same across redeploys. A mutable tag such as :latest can now
 			// point at a different image, so remove the old container before
@@ -670,10 +677,12 @@ func (d *Docker) EnsureRunning(ctx context.Context, w model.Workload, extraHosts
 			Cmd:          w.Command,
 			Env:          env,
 			ExposedPorts: exposed,
+			WorkingDir:   w.Runtime.WorkingDir,
 			Labels: map[string]string{
 				managedLabel: "true",
 				keyLabel:     w.Key(),
 				nodeLabel:    d.nodeID,
+				runtimeLabel: runtimeLabelValue(w.Runtime),
 			},
 			Healthcheck: healthConfigFor(w.HealthCheck),
 		},
@@ -681,6 +690,10 @@ func (d *Docker) EnsureRunning(ctx context.Context, w model.Workload, extraHosts
 			PortBindings: bindings,
 			Binds:        binds,
 			ExtraHosts:   extraHosts,
+			RestartPolicy: container.RestartPolicy{
+				Name:              w.Runtime.Restart.Name,
+				MaximumRetryCount: w.Runtime.Restart.MaxRetries,
+			},
 			Resources: container.Resources{
 				NanoCPUs: w.Resources.CPUMillis * 1_000_000,
 				Memory:   w.Resources.MemoryBytes,
@@ -739,6 +752,46 @@ func (d *Docker) HealthStatus(ctx context.Context, containerID string) (status s
 
 func containerImageMatches(containerImageID, desiredImageID string) bool {
 	return containerImageID != "" && containerImageID == desiredImageID
+}
+
+// runtimeLabelValue is "" for the zero Runtime, so containers created
+// before this label existed still match a workload that sets nothing.
+func runtimeLabelValue(r model.Runtime) string {
+	if r.IsZero() {
+		return ""
+	}
+	b, _ := json.Marshal(r)
+	return string(b)
+}
+
+func containerRuntimeMatches(cfg *container.Config, r model.Runtime) bool {
+	var have string
+	if cfg != nil {
+		have = cfg.Labels[runtimeLabel]
+	}
+	return have == runtimeLabelValue(r)
+}
+
+// ExitState describes a workload container that exists but has stopped.
+type ExitState struct {
+	ContainerID string
+	ExitCode    int
+}
+
+// Exited reports whether the workload's container exists and has stopped
+// for good: not running, and not waiting on Docker to restart it.
+func (d *Docker) Exited(ctx context.Context, workloadKey string) (*ExitState, error) {
+	info, err := d.cli.ContainerInspect(ctx, ContainerName(workloadKey))
+	if client.IsErrNotFound(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if info.State == nil || info.State.Running || info.State.Restarting {
+		return nil, nil
+	}
+	return &ExitState{ContainerID: info.ID, ExitCode: info.State.ExitCode}, nil
 }
 
 func containerHostsMatch(hostConfig *container.HostConfig, expected []string) bool {

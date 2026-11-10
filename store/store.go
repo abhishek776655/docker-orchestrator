@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS workloads (
 	depends_on           text NOT NULL DEFAULT '[]',
 	depends_on_healthy   text NOT NULL DEFAULT '[]',
 	health_check         text NOT NULL DEFAULT '',
+	runtime              text NOT NULL DEFAULT '',
 	desired_state        text NOT NULL,
 	status               text NOT NULL,
 	status_reason        text NOT NULL DEFAULT '',
@@ -137,6 +138,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	_, _ = db.ExecContext(ctx, `ALTER TABLE workloads ADD COLUMN depends_on_healthy text NOT NULL DEFAULT '[]'`)
 	_, _ = db.ExecContext(ctx, `ALTER TABLE workloads ADD COLUMN health_check text NOT NULL DEFAULT ''`)
 	_, _ = db.ExecContext(ctx, `ALTER TABLE workloads ADD COLUMN port_bindings text NOT NULL DEFAULT '[]'`)
+	_, _ = db.ExecContext(ctx, `ALTER TABLE workloads ADD COLUMN runtime text NOT NULL DEFAULT ''`)
 	_, _ = db.ExecContext(ctx, `ALTER TABLE nodes ADD COLUMN disabled_by_admin integer NOT NULL DEFAULT 0`)
 	_, _ = db.ExecContext(ctx, `ALTER TABLE nodes ADD COLUMN display_name text NOT NULL DEFAULT ''`)
 	_, _ = db.ExecContext(ctx, `ALTER TABLE nodes ADD COLUMN cpu_limit_millis integer NOT NULL DEFAULT 0`)
@@ -403,7 +405,7 @@ func (s *Store) MarkStaleNodesUnavailable(ctx context.Context, timeout time.Dura
 // FR-015).
 func (s *Store) WorkloadsOnUnavailableNodes(ctx context.Context) ([]WorkloadRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT w.project, w.service, w.revision, w.image, w.command, w.env, w.cpu_millis, w.memory_bytes, w.architecture, w.host_ports, w.container_ports, w.port_bindings, w.storage_class, w.storage_pinned_node, w.storage_allow_fresh_volume, w.constraint_pinned_node, w.skip_pull, w.remote_build, w.volumes, w.depends_on, w.depends_on_healthy, w.health_check, w.desired_state, w.status, w.status_reason, w.node_id, w.container_id
+		SELECT w.project, w.service, w.revision, w.image, w.command, w.env, w.cpu_millis, w.memory_bytes, w.architecture, w.host_ports, w.container_ports, w.port_bindings, w.storage_class, w.storage_pinned_node, w.storage_allow_fresh_volume, w.constraint_pinned_node, w.skip_pull, w.remote_build, w.volumes, w.depends_on, w.depends_on_healthy, w.health_check, w.runtime, w.desired_state, w.status, w.status_reason, w.node_id, w.container_id
 		FROM workloads w
 		JOIN nodes n ON n.id = w.node_id
 		WHERE n.availability = 'unavailable' AND w.status NOT IN ('failed', 'stopped')
@@ -831,6 +833,11 @@ func (s *Store) CreateWorkload(ctx context.Context, w WorkloadRecord) error {
 		b, _ := json.Marshal(w.HealthCheck)
 		healthCheck = string(b)
 	}
+	var runtime string
+	if !w.Runtime.IsZero() {
+		b, _ := json.Marshal(w.Runtime)
+		runtime = string(b)
+	}
 	now := formatTime(time.Now())
 	// ON CONFLICT: redeploying the same project/service/revision (the
 	// common case — rerunning `haco deploy`, or retrying after a
@@ -839,8 +846,8 @@ func (s *Store) CreateWorkload(ctx context.Context, w WorkloadRecord) error {
 	// stale fields behind. container_id is reset so the agent doesn't
 	// mistake a new spec for an already-running old container.
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO workloads (key, project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, port_bindings, storage_class, storage_pinned_node, storage_allow_fresh_volume, constraint_pinned_node, skip_pull, remote_build, volumes, depends_on, depends_on_healthy, health_check, desired_state, status, status_reason, node_id, container_id, created_at, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		INSERT INTO workloads (key, project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, port_bindings, storage_class, storage_pinned_node, storage_allow_fresh_volume, constraint_pinned_node, skip_pull, remote_build, volumes, depends_on, depends_on_healthy, health_check, runtime, desired_state, status, status_reason, node_id, container_id, created_at, updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT (key) DO UPDATE SET
 			image = excluded.image,
 			command = excluded.command,
@@ -861,13 +868,14 @@ func (s *Store) CreateWorkload(ctx context.Context, w WorkloadRecord) error {
 			depends_on = excluded.depends_on,
 			depends_on_healthy = excluded.depends_on_healthy,
 			health_check = excluded.health_check,
+			runtime = excluded.runtime,
 			desired_state = excluded.desired_state,
 			status = excluded.status,
 			status_reason = excluded.status_reason,
 			node_id = excluded.node_id,
 			container_id = '',
 			updated_at = excluded.updated_at
-	`, w.Key(), w.Project, w.Service, w.Revision, w.Image, command, env, w.Resources.CPUMillis, w.Resources.MemoryBytes, w.Constraints.Architecture, hostPorts, containerPorts, portBindings, string(w.Storage.Class), w.Storage.PinnedNodeID, w.Storage.AllowFreshVolumeOnReschedule, w.Constraints.PinnedNodeID, w.SkipPull, remoteBuild, volumes, dependsOn, dependsOnHealthy, healthCheck, string(w.DesiredState), string(w.Status), w.StatusReason, w.NodeID, w.ContainerID, now, now)
+	`, w.Key(), w.Project, w.Service, w.Revision, w.Image, command, env, w.Resources.CPUMillis, w.Resources.MemoryBytes, w.Constraints.Architecture, hostPorts, containerPorts, portBindings, string(w.Storage.Class), w.Storage.PinnedNodeID, w.Storage.AllowFreshVolumeOnReschedule, w.Constraints.PinnedNodeID, w.SkipPull, remoteBuild, volumes, dependsOn, dependsOnHealthy, healthCheck, runtime, string(w.DesiredState), string(w.Status), w.StatusReason, w.NodeID, w.ContainerID, now, now)
 	return err
 }
 
@@ -952,7 +960,7 @@ func (s *Store) UpdateStatus(ctx context.Context, key string, status model.Statu
 // GetWorkload returns one workload by key.
 func (s *Store) GetWorkload(ctx context.Context, key string) (*WorkloadRecord, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, port_bindings, storage_class, storage_pinned_node, storage_allow_fresh_volume, constraint_pinned_node, skip_pull, remote_build, volumes, depends_on, depends_on_healthy, health_check, desired_state, status, status_reason, node_id, container_id
+		SELECT project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, port_bindings, storage_class, storage_pinned_node, storage_allow_fresh_volume, constraint_pinned_node, skip_pull, remote_build, volumes, depends_on, depends_on_healthy, health_check, runtime, desired_state, status, status_reason, node_id, container_id
 		FROM workloads WHERE key = ?
 	`, key)
 	rec, err := scanWorkload(row)
@@ -966,7 +974,7 @@ func (s *Store) GetWorkload(ctx context.Context, key string) (*WorkloadRecord, e
 // project (empty string means all projects), ordered for stable display.
 func (s *Store) ListWorkloads(ctx context.Context, project string) ([]WorkloadRecord, error) {
 	query := `
-		SELECT project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, port_bindings, storage_class, storage_pinned_node, storage_allow_fresh_volume, constraint_pinned_node, skip_pull, remote_build, volumes, depends_on, depends_on_healthy, health_check, desired_state, status, status_reason, node_id, container_id
+		SELECT project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, port_bindings, storage_class, storage_pinned_node, storage_allow_fresh_volume, constraint_pinned_node, skip_pull, remote_build, volumes, depends_on, depends_on_healthy, health_check, runtime, desired_state, status, status_reason, node_id, container_id
 		FROM workloads
 	`
 	var args []any
@@ -999,7 +1007,7 @@ func (s *Store) ListWorkloads(ctx context.Context, project string) ([]WorkloadRe
 // up. This is the agent's pull-based assignment feed (SRS 6.2).
 func (s *Store) AssignedWorkloads(ctx context.Context, nodeID string) ([]WorkloadRecord, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, port_bindings, storage_class, storage_pinned_node, storage_allow_fresh_volume, constraint_pinned_node, skip_pull, remote_build, volumes, depends_on, depends_on_healthy, health_check, desired_state, status, status_reason, node_id, container_id
+		SELECT project, service, revision, image, command, env, cpu_millis, memory_bytes, architecture, host_ports, container_ports, port_bindings, storage_class, storage_pinned_node, storage_allow_fresh_volume, constraint_pinned_node, skip_pull, remote_build, volumes, depends_on, depends_on_healthy, health_check, runtime, desired_state, status, status_reason, node_id, container_id
 		FROM workloads WHERE node_id = ? AND status <> 'stopped'
 	`, nodeID)
 	if err != nil {
@@ -1117,8 +1125,8 @@ func scanWorkload(row scannable) (*WorkloadRecord, error) {
 func scanWorkloadRow(row scannable) (*WorkloadRecord, error) {
 	var rec WorkloadRecord
 	var command, env, hostPorts, containerPorts, portBindings, volumes, dependsOn, dependsOnHealthy []byte
-	var storageClass, status, remoteBuild, healthCheck string
-	if err := row.Scan(&rec.Project, &rec.Service, &rec.Revision, &rec.Image, &command, &env, &rec.Resources.CPUMillis, &rec.Resources.MemoryBytes, &rec.Constraints.Architecture, &hostPorts, &containerPorts, &portBindings, &storageClass, &rec.Storage.PinnedNodeID, &rec.Storage.AllowFreshVolumeOnReschedule, &rec.Constraints.PinnedNodeID, &rec.SkipPull, &remoteBuild, &volumes, &dependsOn, &dependsOnHealthy, &healthCheck, (*string)(&rec.DesiredState), &status, &rec.StatusReason, &rec.NodeID, &rec.ContainerID); err != nil {
+	var storageClass, status, remoteBuild, healthCheck, runtime string
+	if err := row.Scan(&rec.Project, &rec.Service, &rec.Revision, &rec.Image, &command, &env, &rec.Resources.CPUMillis, &rec.Resources.MemoryBytes, &rec.Constraints.Architecture, &hostPorts, &containerPorts, &portBindings, &storageClass, &rec.Storage.PinnedNodeID, &rec.Storage.AllowFreshVolumeOnReschedule, &rec.Constraints.PinnedNodeID, &rec.SkipPull, &remoteBuild, &volumes, &dependsOn, &dependsOnHealthy, &healthCheck, &runtime, (*string)(&rec.DesiredState), &status, &rec.StatusReason, &rec.NodeID, &rec.ContainerID); err != nil {
 		return nil, err
 	}
 	rec.Status = model.Status(status)
@@ -1139,6 +1147,9 @@ func scanWorkloadRow(row scannable) (*WorkloadRecord, error) {
 	if healthCheck != "" {
 		rec.HealthCheck = &model.HealthCheck{}
 		_ = json.Unmarshal([]byte(healthCheck), rec.HealthCheck)
+	}
+	if runtime != "" {
+		_ = json.Unmarshal([]byte(runtime), &rec.Runtime)
 	}
 	return &rec, nil
 }

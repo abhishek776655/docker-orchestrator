@@ -560,7 +560,7 @@ func (svc *Service) resolveVolumeSnapshots(plan *compose.Plan) error {
 		}
 		for j := range wl.Volumes {
 			v := &wl.Volumes[j]
-			if v.HostPath == "" {
+			if v.HostPath == "" || v.DockerSocket {
 				continue
 			}
 			tarball, err := build.TarContext(v.HostPath)

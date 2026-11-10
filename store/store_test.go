@@ -384,3 +384,40 @@ func TestStartWorkloadRunsAStoppedOneOnItsNode(t *testing.T) {
 		t.Fatalf("the node's agent should see it again, got %d assigned", len(assigned))
 	}
 }
+
+func TestWorkloadRuntimeRoundTrips(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	node := testNode("node-runtime")
+	if err := s.UpsertNode(ctx, node); err != nil {
+		t.Fatalf("upsert node: %v", err)
+	}
+	want := model.Runtime{
+		WorkingDir: "/antora",
+		Restart:    model.RestartPolicy{Name: "on-failure", MaxRetries: 3},
+		ExtraHosts: []string{"host.docker.internal:host-gateway"},
+	}
+	wl := store.WorkloadRecord{
+		Workload: model.Workload{
+			Project:      "demo",
+			Service:      "docs",
+			Revision:     "r1",
+			Image:        "antora",
+			Storage:      model.StoragePolicy{Class: model.Ephemeral},
+			DesiredState: model.DesiredRunning,
+			Runtime:      want,
+		},
+		Status: model.StatusAssigned,
+		NodeID: node.ID,
+	}
+	if err := s.CreateWorkload(ctx, wl); err != nil {
+		t.Fatalf("create workload: %v", err)
+	}
+	got, err := s.GetWorkload(ctx, wl.Key())
+	if err != nil {
+		t.Fatalf("get workload: %v", err)
+	}
+	if got.Runtime.WorkingDir != want.WorkingDir || got.Runtime.Restart != want.Restart || len(got.Runtime.ExtraHosts) != 1 || got.Runtime.ExtraHosts[0] != want.ExtraHosts[0] {
+		t.Fatalf("runtime = %+v, want %+v", got.Runtime, want)
+	}
+}

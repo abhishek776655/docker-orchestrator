@@ -8,9 +8,11 @@ package compose
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -87,10 +89,11 @@ func (p *Plan) CanDeploy() bool {
 // Load parses and validates a Compose file's bytes into a Plan. workingDir
 // is used to resolve relative build contexts and env_file paths.
 func Load(ctx context.Context, project, workingDir string, yaml []byte) (*Plan, error) {
+	env := interpolationEnvironment(workingDir)
 	details := types.ConfigDetails{
 		WorkingDir:  workingDir,
 		ConfigFiles: []types.ConfigFile{{Filename: "docker-compose.yml", Content: yaml}},
-		Environment: interpolationEnvironment(workingDir),
+		Environment: env,
 	}
 
 	proj, err := loader.LoadWithContext(ctx, details, loader.WithSkipValidation)
@@ -98,7 +101,6 @@ func Load(ctx context.Context, project, workingDir string, yaml []byte) (*Plan, 
 		return nil, fmt.Errorf("parse compose file: %w", err)
 	}
 	proj.Name = project
-
 
 	plan := &Plan{
 		Project: project,
@@ -108,9 +110,7 @@ func Load(ctx context.Context, project, workingDir string, yaml []byte) (*Plan, 
 		},
 	}
 
-	if len(proj.Configs) > 0 || len(proj.Secrets) > 0 {
-		plan.Warnings = append(plan.Warnings, "top-level configs/secrets are declared but not yet delivered to containers; pass equivalent values via environment for now")
-	}
+	objs := fileObjects{secrets: proj.Secrets, configs: proj.Configs, env: env}
 
 	names := make([]string, 0, len(proj.Services))
 	for name := range proj.Services {
@@ -181,7 +181,7 @@ func Load(ctx context.Context, project, workingDir string, yaml []byte) (*Plan, 
 	for _, name := range names {
 		svc := proj.Services[name]
 		analyzeServicePorts(&plan.Networking, unpublishedPortIssues, hasPublishedPort, name, svc)
-		wl, build, warnings, rejections := convertService(project, workingDir, name, svc, buildContexts, sharedBindDirs)
+		wl, build, warnings, rejections := convertService(project, workingDir, name, svc, buildContexts, sharedBindDirs, objs)
 		plan.Warnings = append(plan.Warnings, warnings...)
 		plan.Rejections = append(plan.Rejections, rejections...)
 		plan.Workloads = append(plan.Workloads, wl)
@@ -231,6 +231,12 @@ func interpolationEnvironment(workingDir string) types.Mapping {
 			env[k] = v
 		}
 	}
+	// `docker compose` runs from the project folder, so ${PWD} there is the
+	// project folder. The control plane runs from wherever it was started,
+	// so its own PWD would point somewhere unrelated.
+	if workingDir != "" {
+		env["PWD"] = workingDir
+	}
 	return env
 }
 
@@ -276,7 +282,7 @@ func recommendOverlay(networking *NetworkRecommendation, reason string) {
 	networking.Reasons = append(networking.Reasons, reason)
 }
 
-func convertService(project, workingDir, name string, svc types.ServiceConfig, buildContexts []string, sharedBindDirs map[string]bool) (model.Workload, *BuildSpec, []string, []string) {
+func convertService(project, workingDir, name string, svc types.ServiceConfig, buildContexts []string, sharedBindDirs map[string]bool, objs fileObjects) (model.Workload, *BuildSpec, []string, []string) {
 	var warnings, rejections []string
 	// No platform: build for the architecture of whichever node builds it,
 	// as `docker compose build` would. Each node builds its own image, so
@@ -466,8 +472,19 @@ func convertService(project, workingDir, name string, svc types.ServiceConfig, b
 	// the comment below on cases 2-4 for why.
 	wl.Storage.Class = model.Ephemeral
 	hasVolume := false
+	seeded := false
 	var forcedPinNode string
 	for _, v := range svc.Volumes {
+		if v.Type == "bind" && isDockerSocket(v) {
+			// Whatever it starts through the socket runs on that machine's
+			// Docker and is handed paths from the compose folder, so it only
+			// works on the machine holding that folder: this one.
+			hasVolume = true
+			forcedPinNode = agent.HostNodeID()
+			wl.Volumes = append(wl.Volumes, model.VolumeMount{ContainerPath: v.Target, ReadOnly: v.ReadOnly, HostPath: v.Source, DockerSocket: true})
+			warnings = append(warnings, fmt.Sprintf("%s: mounts the Docker socket, so it always runs on the control-plane host; containers it starts through the socket are not managed by haco and don't get haco's service-name entries", name))
+			continue
+		}
 		switch v.Type {
 		case "bind", "volume":
 			hasVolume = true
@@ -593,7 +610,9 @@ func convertService(project, workingDir, name string, svc types.ServiceConfig, b
 			// resolveVolumeSeeds converts it to an actual stash key (or
 			// clears it, if there's nothing worth seeding) before the
 			// workload is ever persisted or sent to an agent.
-			wl.Volumes = append(wl.Volumes, model.VolumeMount{ContainerPath: v.Target, ReadOnly: v.ReadOnly, SeedDirKey: candidateSeedPath(v)})
+			seed := candidateSeedPath(v)
+			seeded = seeded || seed != ""
+			wl.Volumes = append(wl.Volumes, model.VolumeMount{ContainerPath: v.Target, ReadOnly: v.ReadOnly, SeedDirKey: seed})
 		default:
 			warnings = append(warnings, fmt.Sprintf("%s: volume type %q is not evaluated for storage affinity", name, v.Type))
 		}
@@ -644,6 +663,18 @@ func convertService(project, workingDir, name string, svc types.ServiceConfig, b
 	if svc.MemLimit > 0 {
 		wl.Resources.MemoryBytes = int64(svc.MemLimit)
 	}
+	// deploy.resources.limits is the newer spelling of cpus/mem_limit;
+	// `docker compose` applies it too. The top-level keys win when both
+	// are set.
+	if svc.Deploy != nil && svc.Deploy.Resources.Limits != nil {
+		lim := svc.Deploy.Resources.Limits
+		if svc.CPUS == 0 && lim.NanoCPUs > 0 {
+			wl.Resources.CPUMillis = int64(float32(lim.NanoCPUs) * 1000)
+		}
+		if svc.MemLimit == 0 && lim.MemoryBytes > 0 {
+			wl.Resources.MemoryBytes = int64(lim.MemoryBytes)
+		}
+	}
 
 	// No explicit platform: leave Architecture unset (no hard constraint) so
 	// the workload can schedule onto whatever node is available, rather than
@@ -657,19 +688,251 @@ func convertService(project, workingDir, name string, svc types.ServiceConfig, b
 		}
 	}
 
-	if len(svc.ExtraHosts) > 0 {
-		rejections = append(rejections, fmt.Sprintf("%s: extra_hosts/host-gateway has no platform equivalent yet", name))
+	wl.Runtime.WorkingDir = svc.WorkingDir
+
+	// Passed straight to Docker, which understands "host-gateway" itself and
+	// resolves it to the host the container lands on — so
+	// host.docker.internal:host-gateway works on whichever node runs it.
+	wl.Runtime.ExtraHosts = svc.ExtraHosts.AsList(":")
+	sort.Strings(wl.Runtime.ExtraHosts)
+
+	policy, warning := restartPolicy(svc)
+	wl.Runtime.Restart = policy
+	if warning != "" {
+		warnings = append(warnings, fmt.Sprintf("%s: %s", name, warning))
 	}
 
-	if svc.Restart != "" {
-		warnings = append(warnings, fmt.Sprintf("%s: restart policy %q is recorded but not enforced by the agent yet (SRS FR restart: partial)", name, svc.Restart))
+	files, fileProblems := fileMounts(name, svc, objs)
+	wl.Volumes = append(wl.Volumes, files...)
+	rejections = append(rejections, fileProblems...)
+
+	if seeded && runtime.GOOS == "darwin" && isMySQLImage(svc.Image) {
+		// MySQL data created on a macOS folder records
+		// lower_case_table_names=2, which MySQL refuses to start with on a
+		// case-sensitive (Linux) filesystem.
+		if wl.Constraints.RequiredLabels == nil {
+			wl.Constraints.RequiredLabels = map[string]string{}
+		}
+		wl.Constraints.RequiredLabels["os"] = "darwin"
+		warnings = append(warnings, fmt.Sprintf("%s: its data is seeded from this Mac, and MySQL data created on macOS (lower_case_table_names=2) won't start on a Linux node; keeping it on macOS nodes", name))
 	}
 
-	if len(svc.Secrets) > 0 {
-		warnings = append(warnings, fmt.Sprintf("%s: secrets are declared but not delivered through a secret store yet; pass equivalent values via environment for now", name))
-	}
+	warnings = append(warnings, ignoredKeyWarnings(name, svc)...)
 
 	return wl, build, warnings, rejections
+}
+
+// fileObjects are the project's top-level secrets and configs, which
+// services refer to by name.
+type fileObjects struct {
+	secrets types.Secrets
+	configs types.Configs
+	env     types.Mapping
+}
+
+// fileMounts turns a service's secrets and configs into single-file mounts
+// whose content travels with the workload, the same way a single-file bind
+// mount does: secrets land under /run/secrets/<name>, configs at /<name>
+// unless the service gives a target.
+func fileMounts(name string, svc types.ServiceConfig, objs fileObjects) ([]model.VolumeMount, []string) {
+	var mounts []model.VolumeMount
+	var problems []string
+	add := func(kind, source, target, defaultDir string, obj types.FileObjectConfig, ok bool) {
+		if !ok {
+			problems = append(problems, fmt.Sprintf("%s: %s %q is not defined at the top level", name, kind, source))
+			return
+		}
+		if target == "" {
+			target = source
+		}
+		if !strings.HasPrefix(target, "/") {
+			target = defaultDir + target
+		}
+		data, err := fileObjectContent(obj, objs.env)
+		if err != nil {
+			problems = append(problems, fmt.Sprintf("%s: %s %q: %v", name, kind, source, err))
+			return
+		}
+		if len(data) > maxInlineBindFileBytes {
+			problems = append(problems, fmt.Sprintf("%s: %s %q is %d bytes, over the %d-byte limit", name, kind, source, len(data), maxInlineBindFileBytes))
+			return
+		}
+		mounts = append(mounts, model.VolumeMount{ContainerPath: target, ReadOnly: true, FileContent: data})
+	}
+	for _, s := range svc.Secrets {
+		obj, ok := objs.secrets[s.Source]
+		add("secret", s.Source, s.Target, "/run/secrets/", types.FileObjectConfig(obj), ok)
+	}
+	for _, c := range svc.Configs {
+		obj, ok := objs.configs[c.Source]
+		add("config", c.Source, c.Target, "/", types.FileObjectConfig(obj), ok)
+	}
+	return mounts, problems
+}
+
+func fileObjectContent(obj types.FileObjectConfig, env types.Mapping) ([]byte, error) {
+	switch {
+	case bool(obj.External):
+		return nil, fmt.Errorf("external secrets and configs live in a Swarm store haco doesn't have")
+	case obj.File != "":
+		data, err := os.ReadFile(obj.File)
+		if err != nil {
+			return nil, err
+		}
+		if len(data) == 0 {
+			// os.ReadFile of an empty file gives nil, which would read as
+			// "no file content" further on.
+			data = []byte{}
+		}
+		return data, nil
+	case obj.Environment != "":
+		v, ok := env[obj.Environment]
+		if !ok {
+			return nil, fmt.Errorf("environment variable %s is not set", obj.Environment)
+		}
+		return []byte(v), nil
+	case obj.Content != "":
+		return []byte(obj.Content), nil
+	default:
+		return nil, fmt.Errorf("has no file, environment or content")
+	}
+}
+
+// restartPolicy maps compose `restart:` (or, when that is unset,
+// deploy.restart_policy) onto Docker's restart policy.
+func restartPolicy(svc types.ServiceConfig) (model.RestartPolicy, string) {
+	if svc.Restart != "" {
+		kind, count, _ := strings.Cut(svc.Restart, ":")
+		switch kind {
+		case "no", "always", "unless-stopped":
+			return model.RestartPolicy{Name: kind}, ""
+		case "on-failure":
+			n := 0
+			if count != "" {
+				var err error
+				if n, err = strconv.Atoi(count); err != nil || n < 0 {
+					return model.RestartPolicy{}, fmt.Sprintf("restart %q has an invalid retry count; ignored", svc.Restart)
+				}
+			}
+			return model.RestartPolicy{Name: "on-failure", MaxRetries: n}, ""
+		default:
+			return model.RestartPolicy{}, fmt.Sprintf("restart %q is not a known policy; ignored", svc.Restart)
+		}
+	}
+	if svc.Deploy == nil || svc.Deploy.RestartPolicy == nil {
+		return model.RestartPolicy{}, ""
+	}
+	rp := svc.Deploy.RestartPolicy
+	switch rp.Condition {
+	case "none":
+		return model.RestartPolicy{Name: "no"}, ""
+	case "on-failure":
+		p := model.RestartPolicy{Name: "on-failure"}
+		if rp.MaxAttempts != nil {
+			p.MaxRetries = int(*rp.MaxAttempts)
+		}
+		return p, ""
+	case "", "any":
+		return model.RestartPolicy{Name: "always"}, ""
+	default:
+		return model.RestartPolicy{}, fmt.Sprintf("deploy.restart_policy condition %q is not known; ignored", rp.Condition)
+	}
+}
+
+func isMySQLImage(image string) bool {
+	repo := image
+	if i := strings.LastIndex(repo, "/"); i >= 0 {
+		repo = repo[i+1:]
+	}
+	repo, _, _ = strings.Cut(repo, ":")
+	return repo == "mysql" || repo == "mariadb" || repo == "mysql-server" || repo == "percona-server"
+}
+
+func hasDockerSocket(wl model.Workload) bool {
+	for _, v := range wl.Volumes {
+		if v.DockerSocket {
+			return true
+		}
+	}
+	return false
+}
+
+// isDockerSocket reports whether a bind mount gives the container the
+// Docker API socket.
+func isDockerSocket(v types.ServiceVolumeConfig) bool {
+	return filepath.Base(v.Source) == "docker.sock" || filepath.Base(v.Target) == "docker.sock"
+}
+
+// handledKeys are the service keys the importer turns into workload
+// settings. quietKeys are ignored on purpose because they make no
+// difference here (names, labels, logging, compose's own network setup).
+var (
+	handledKeys = map[string]bool{
+		"image": true, "build": true, "command": true, "environment": true, "env_file": true,
+		"ports": true, "expose": true, "depends_on": true, "healthcheck": true, "volumes": true,
+		"cpus": true, "mem_limit": true, "platform": true, "extra_hosts": true, "restart": true,
+		"secrets": true, "configs": true, "working_dir": true, "deploy": true,
+	}
+	quietKeys = map[string]bool{
+		"name": true, "container_name": true, "networks": true, "labels": true, "annotations": true,
+		"logging": true, "log_driver": true, "log_opt": true, "tty": true, "stdin_open": true,
+		"pull_policy": true, "profiles": true, "attach": true, "links": true, "develop": true,
+		"hostname": true, "domainname": true,
+	}
+)
+
+// ignoredKeyWarnings names every key the service sets that haco neither
+// applies nor knowingly ignores, so nothing is dropped without a word.
+func ignoredKeyWarnings(name string, svc types.ServiceConfig) []string {
+	raw, err := json.Marshal(svc)
+	if err != nil {
+		return nil
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return nil
+	}
+	var ignored []string
+	for k, v := range fields {
+		if handledKeys[k] || quietKeys[k] || isEmptyJSON(v) {
+			continue
+		}
+		ignored = append(ignored, k)
+	}
+	if d := svc.Deploy; d != nil {
+		if d.Replicas != nil && *d.Replicas != 1 {
+			ignored = append(ignored, "deploy.replicas")
+		}
+		if r := d.Resources.Reservations; r != nil && (r.NanoCPUs > 0 || r.MemoryBytes > 0) {
+			ignored = append(ignored, "deploy.resources.reservations")
+		}
+		if len(d.Placement.Constraints) > 0 || len(d.Placement.Preferences) > 0 {
+			ignored = append(ignored, "deploy.placement")
+		}
+	}
+	if len(ignored) == 0 {
+		return nil
+	}
+	sort.Strings(ignored)
+	return []string{fmt.Sprintf("%s: not supported yet, so ignored: %s", name, strings.Join(ignored, ", "))}
+}
+
+func isEmptyJSON(v any) bool {
+	switch t := v.(type) {
+	case nil:
+		return true
+	case bool:
+		return !t
+	case string:
+		return t == ""
+	case float64:
+		return t == 0
+	case []any:
+		return len(t) == 0
+	case map[string]any:
+		return len(t) == 0
+	}
+	return false
 }
 
 // isRegularFile reports whether path is an existing, absolute path to a
@@ -828,8 +1091,19 @@ func ApplyPinOverride(plan *Plan, pins map[string][]string) {
 			}
 		}
 	}
+	host := agent.HostNodeID()
 	for i := range plan.Workloads {
 		wl := &plan.Workloads[i]
+		if hasDockerSocket(*wl) {
+			// Never moved or freed: it only works on the control-plane
+			// host (see convertService).
+			if node, ok := nodeByService[wl.Service]; ok && node != host {
+				plan.Warnings = append(plan.Warnings, fmt.Sprintf("%s: pinned to node %s, but it mounts the Docker socket and stays on the control-plane host", wl.Service, node))
+			}
+			wl.Constraints.PinnedNodeID = host
+			wl.Storage.PinnedNodeID = host
+			continue
+		}
 		if node, ok := nodeByService[wl.Service]; ok {
 			wl.Constraints.PinnedNodeID = node
 			if wl.Storage.Class == model.NodeLocalPersistent {
