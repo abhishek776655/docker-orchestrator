@@ -27,122 +27,39 @@ import (
 func main() {
 	if len(os.Args) < 2 {
 		usage()
+		return
+	}
+	name, args := os.Args[1], os.Args[2:]
+	switch name {
+	case "help", "--help", "-h":
+		if err := printHelp(os.Stdout, args); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// An older command name still works, with a note on stderr.
+	if a, ok := aliases[name]; ok {
+		fmt.Fprintf(os.Stderr, "haco: %s\n", renameNotice(name, a))
+		argv := a.to(args)
+		name, args = argv[0], argv[1:]
+	}
+	cmd := findCommand(name)
+	if cmd == nil {
+		fmt.Fprintf(os.Stderr, "haco: unknown command %q; run 'haco help' to list commands\n", name)
 		os.Exit(1)
+	}
+	if wantsHelp(args) {
+		_ = printHelp(os.Stdout, []string{cmd.name})
+		return
 	}
 
 	url := envOr("HACO_CONTROLPLANE_URL", "http://localhost:8099")
-
-	var err error
-	switch os.Args[1] {
-	case "deploy":
-		err = deploy(url, os.Args[2:])
-	case "plan":
-		err = plan(url, os.Args[2:])
-	case "build":
-		err = buildCmd(url, os.Args[2:])
-	case "nodes":
-		err = nodes(url)
-	case "node":
-		err = node(url, os.Args[2:])
-	case "workloads":
-		err = workloads(url, os.Args[2:])
-	case "projects":
-		err = projects(url, os.Args[2:])
-	case "tui":
-		err = runTUI(url, os.Args[2:])
-	case "containers":
-		err = containers(url, os.Args[2:])
-	case "services":
-		err = services(url, os.Args[2:])
-	case "status":
-		err = status(url, os.Args[2:])
-	case "logs":
-		err = logs(url, os.Args[2:])
-	case "stop":
-		err = stop(url, os.Args[2:])
-	case "resume":
-		err = resume(url, os.Args[2:])
-	case "restart":
-		err = restart(url, os.Args[2:])
-	case "remove-workload":
-		err = removeWorkload(url, os.Args[2:])
-	case "remove-all-workloads":
-		err = removeAllWorkloads(url, os.Args[2:])
-	case "events":
-		err = getOptionalProject(url, "/v1/events", os.Args[2:])
-	case "metrics":
-		err = getOptionalProject(url, "/v1/metrics", os.Args[2:])
-	case "join-token":
-		err = printJoinCommand(url)
-	case "revoke-node":
-		if len(os.Args) != 3 {
-			err = fmt.Errorf("usage: haco revoke-node <node-id>")
-		} else {
-			err = post(url, "/v1/admin/nodes/"+neturl.PathEscape(os.Args[2])+"/revoke", []byte(`{}`))
-		}
-	case "stop-containers":
-		err = stopContainers(url, os.Args[2:])
-	case "teardown":
-		err = teardown(url, os.Args[2:])
-	case "shutdown":
-		err = shutdown(url, os.Args[2:])
-	case "start":
-		err = start(url, os.Args[2:])
-	case "stop-all":
-		err = stopAll(os.Args[2:])
-	case "agent":
-		err = agentCmd(os.Args[2:])
-	case "remove-node":
-		err = removeNode(url, os.Args[2:])
-	default:
-		usage()
-		os.Exit(1)
-	}
-	if err != nil {
+	if err := cmd.run(url, args); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
-}
-
-func usage() {
-	fmt.Fprintln(os.Stderr, `haco: a thin CLI over the control-plane API (HACO_CONTROLPLANE_URL, default http://localhost:8099)
-
-Usage:
-  haco build  <project> <docker-compose.yml>   just build the build: service images, no scheduling or containers (--no-cache forces a full rebuild; --service <name> scopes to that service and its dependencies (repeatable, or a comma list); --pin-host/--pin-node below)
-  haco deploy <project> <docker-compose.yml>   build, schedule, and run a Compose project, then show a live status table until every workload is ready/failed/stopped (like 'docker compose up -d'); prompts if a pinned service needs a fresh volume (--yes skips it); --no-cache forces a full rebuild; --service <name> deploys only that service and its dependencies (repeat it, or give a comma list, for several); --pin-host/--pin-node below; --fresh lets every currently-unpinned service reschedule freely instead of reusing its existing node (prompts first, abandons its current data; --yes skips it)
-  haco plan   <project> <docker-compose.yml>   dry-run the same, no side effects (table; add --json for raw; --service <name> to scope the same way; --pin-host/--pin-node below; --fresh previews what 'deploy --fresh' would actually do instead of the existing-pin reuse a plain deploy uses)
-                                                   --pin-host <service,...>: override storage affinity for this call only, no Compose file changes needed — only the named services (e.g. a database, and whichever service you're actively live-editing) pin to this control-plane host; every other service schedules anywhere, even one that bind-mounts its own source (overrides compose.go's own auto-pin heuristic)
-                                                   --pin-node <node-id>=<service,...>: same override, but pins the named services to that specific node instead of the control-plane host — repeatable for multiple nodes; combines with --pin-host in the same call
-  haco status [project] [service] [revision]   table of every workload (optionally filtered to one project), or one workload's full detail once service is named (revision defaults to "latest")
-  haco logs   <project> <service> [revision]   live container logs from whichever node runs it (revision defaults to "latest"; --tail N lines, default 200; -f to follow); falls back to the tail captured when a container failed to start
-  haco stop   <project> <service> <revision>   stop the workload and remove its container
-  haco resume <project> [service]              start stopped services again on the nodes they last ran on (no rebuild, no rescheduling)
-  haco restart <project> [service]             recreate the containers of running services, in place
-  haco remove-workload <project> <service> [revision]   hard-delete that workload's record entirely (revision defaults to "latest"); distinct from stop, which keeps a stopped row
-  haco remove-all-workloads [project]          hard-delete every workload record, optionally scoped to one project (--yes skips confirmation)
-  haco nodes                                   list registered nodes
-  haco node <id>                               one node's full detail
-  haco node cordon <id>                        block new workloads from scheduling onto this node (existing ones keep running)
-  haco node uncordon <id>                      make this node eligible for new workloads again
-  haco node rename <id> <name>                 give a node a display name (its ID is the machine's permanent identity and never changes)
-  haco node limit <id> --cpus N --memory SIZE  cap what the scheduler may reserve on a node, e.g. --cpus 4 --memory 8GiB (--clear removes the cap)
-  haco workloads [project]                     table of every workload, optionally filtered to one project
-  haco projects                                list distinct projects with a quick workload-status breakdown
-  haco tui [project]                           read-only auto-refreshing terminal dashboard (nodes/workloads/containers/events/metrics/services/projects tabs)
-  haco containers [project]                    node/workload/container join view, optionally filtered to one project
-  haco services <project> [service]            resolve a logical service name to its current endpoints
-  haco events [project]                        recent audit events, optionally filtered to one project
-  haco metrics [project]                       node/workload counts, optionally filtered to one project's workloads
-  haco join-token                              print a fresh one-time agent join command
-  haco revoke-node <node-id>                   revoke that agent credential (node stays listed, permanently unavailable)
-  haco remove-node <node-id> [--force]         hard-delete that node record and its credential (refused if it still has a non-terminal workload assigned, unless --force)
-  haco stop-containers [project]               stop every workload's container, optionally filtered to one project (nodes stay joined; --yes skips confirmation)
-  haco teardown                                stop every workload and revoke every node credential (--yes skips confirmation)
-  haco shutdown                                stop the whole cluster in order: every node's containers (stopped, not removed) and agent, then the control plane; 'haco start' + 'haco agent run' bring the same services back (--yes skips confirmation)
-  haco start                                   start the control plane in the background; each node builds its own images (--registry to run the local build registry instead, --web to also serve the web console and print its URL, --foreground to run attached, --logs to tail its log right after starting, --tui to launch the dashboard once ready instead — not combinable with each other or --foreground)
-  haco stop-all                                stop the control plane process started by 'haco start'
-  haco agent join <token>                      join this machine as a worker node (one-time token from 'haco start')
-  haco agent run                                run this machine's already-joined node (reuses the saved credential, no token needed)`)
 }
 
 func printJoinCommand(baseURL string) error {
@@ -170,71 +87,28 @@ func printJoinCommand(baseURL string) error {
 // default (raw JSON is for the API/future UI, not the terminal); pass
 // --json to get the same raw response haco used to always print.
 func plan(baseURL string, args []string) error {
-	jsonOut, fresh := false, false
-	onlyService := ""
-	var pinHost *[]string
-	pinNodes := map[string][]string{}
-	var rest []string
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--json":
-			jsonOut = true
-		case "--fresh":
-			fresh = true
-		case "--service":
-			i++
-			if i >= len(args) {
-				return fmt.Errorf("--service requires a value")
-			}
-			onlyService = addService(onlyService, args[i])
-		case "--pin-host":
-			i++
-			if i >= len(args) {
-				return fmt.Errorf("--pin-host requires a value")
-			}
-			list := splitPinHost(args[i])
-			pinHost = &list
-		case "--pin-node":
-			i++
-			if i >= len(args) {
-				return fmt.Errorf("--pin-node requires a value")
-			}
-			node, services, err := parsePinNode(args[i])
-			if err != nil {
-				return err
-			}
-			pinNodes[node] = append(pinNodes[node], services...)
-		default:
-			rest = append(rest, args[i])
-		}
-	}
-	if len(rest) != 2 {
-		return fmt.Errorf("usage: haco plan <project> <docker-compose.yml> [--json] [--fresh] [--service <name>[,<name>...]] [--pin-host <service,...>] [--pin-node <node-id>=<service,...>]")
-	}
-	project, file := rest[0], rest[1]
-
-	yaml, err := os.ReadFile(file)
-	if err != nil {
-		return fmt.Errorf("read %s: %w", file, err)
-	}
-	workingDir, err := filepath.Abs(filepath.Dir(file))
+	o, err := parseComposeArgs("plan", args, "json", "fresh")
 	if err != nil {
 		return err
 	}
-	if jsonOut {
+	project, _, workingDir, yaml, err := o.resolve("plan")
+	if err != nil {
+		return err
+	}
+	if o.jsonOut {
 		body, _ := json.Marshal(map[string]any{
 			"project":      project,
 			"working_dir":  workingDir,
 			"yaml":         string(yaml),
-			"only_service": onlyService,
-			"pin_host":     pinHost,
-			"pin_nodes":    pinNodes,
-			"fresh":        fresh,
+			"only_service": o.services,
+			"pin_host":     o.pinHost,
+			"pin_nodes":    o.pinNodes,
+			"fresh":        o.fresh,
 		})
 		return post(baseURL, "/v1/compose/plan", body)
 	}
 
-	out, err := fetchPlan(baseURL, project, workingDir, yaml, onlyService, pinHost, pinNodes, fresh)
+	out, err := fetchPlan(baseURL, project, workingDir, yaml, o.services, o.pinHost, o.pinNodes, o.fresh)
 	if err != nil {
 		return err
 	}
@@ -386,64 +260,22 @@ func freshVolumeWarnings(v planView) map[string][]string {
 // dependency closure the same way deploy/plan do, though only the
 // build: services within that closure actually get built.
 func buildCmd(baseURL string, args []string) error {
-	noCache := false
-	onlyService := ""
-	var pinHost *[]string
-	pinNodes := map[string][]string{}
-	var rest []string
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--no-cache":
-			noCache = true
-		case "--service":
-			i++
-			if i >= len(args) {
-				return fmt.Errorf("--service requires a value")
-			}
-			onlyService = addService(onlyService, args[i])
-		case "--pin-host":
-			i++
-			if i >= len(args) {
-				return fmt.Errorf("--pin-host requires a value")
-			}
-			list := splitPinHost(args[i])
-			pinHost = &list
-		case "--pin-node":
-			i++
-			if i >= len(args) {
-				return fmt.Errorf("--pin-node requires a value")
-			}
-			node, services, err := parsePinNode(args[i])
-			if err != nil {
-				return err
-			}
-			pinNodes[node] = append(pinNodes[node], services...)
-		default:
-			rest = append(rest, args[i])
-		}
-	}
-	if len(rest) != 2 {
-		return fmt.Errorf("usage: haco build <project> <docker-compose.yml> [--no-cache] [--service <name>[,<name>...]] [--pin-host <service,...>] [--pin-node <node-id>=<service,...>]")
-	}
-	project, file := rest[0], rest[1]
-
-	yaml, err := os.ReadFile(file)
-	if err != nil {
-		return fmt.Errorf("read %s: %w", file, err)
-	}
-	workingDir, err := filepath.Abs(filepath.Dir(file))
+	o, err := parseComposeArgs("build", args, "no-cache")
 	if err != nil {
 		return err
 	}
-
+	project, _, workingDir, yaml, err := o.resolve("build")
+	if err != nil {
+		return err
+	}
 	body, _ := json.Marshal(map[string]any{
 		"project":      project,
 		"working_dir":  workingDir,
 		"yaml":         string(yaml),
-		"no_cache":     noCache,
-		"only_service": onlyService,
-		"pin_host":     pinHost,
-		"pin_nodes":    pinNodes,
+		"no_cache":     o.noCache,
+		"only_service": o.services,
+		"pin_host":     o.pinHost,
+		"pin_nodes":    o.pinNodes,
 	})
 	return post(baseURL, "/v1/compose/build", body)
 }
@@ -454,59 +286,16 @@ func buildCmd(baseURL string, args []string) error {
 // service into ahead of time, but it still deserves a live confirmation
 // at the moment it's actually about to happen, not just silent action.
 func deploy(baseURL string, args []string) error {
-	yes, noCache, fresh := false, false, false
-	onlyService := ""
-	var pinHost *[]string
-	pinNodes := map[string][]string{}
-	var rest []string
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--yes", "-y":
-			yes = true
-		case "--no-cache":
-			noCache = true
-		case "--fresh":
-			fresh = true
-		case "--service":
-			i++
-			if i >= len(args) {
-				return fmt.Errorf("--service requires a value")
-			}
-			onlyService = addService(onlyService, args[i])
-		case "--pin-host":
-			i++
-			if i >= len(args) {
-				return fmt.Errorf("--pin-host requires a value")
-			}
-			list := splitPinHost(args[i])
-			pinHost = &list
-		case "--pin-node":
-			i++
-			if i >= len(args) {
-				return fmt.Errorf("--pin-node requires a value")
-			}
-			node, services, err := parsePinNode(args[i])
-			if err != nil {
-				return err
-			}
-			pinNodes[node] = append(pinNodes[node], services...)
-		default:
-			rest = append(rest, args[i])
-		}
-	}
-	if len(rest) != 2 {
-		return fmt.Errorf("usage: haco deploy <project> <docker-compose.yml> [--yes] [--no-cache] [--fresh] [--service <name>[,<name>...]] [--pin-host <service,...>] [--pin-node <node-id>=<service,...>]")
-	}
-	project, file := rest[0], rest[1]
-
-	yaml, err := os.ReadFile(file)
-	if err != nil {
-		return fmt.Errorf("read %s: %w", file, err)
-	}
-	workingDir, err := filepath.Abs(filepath.Dir(file))
+	o, err := parseComposeArgs("deploy", args, "yes", "no-cache", "fresh")
 	if err != nil {
 		return err
 	}
+	project, _, workingDir, yaml, err := o.resolve("deploy")
+	if err != nil {
+		return err
+	}
+	yes, noCache, fresh := o.yes, o.noCache, o.fresh
+	onlyService, pinHost, pinNodes := o.services, o.pinHost, o.pinNodes
 
 	if planned, err := fetchPlan(baseURL, project, workingDir, yaml, onlyService, pinHost, pinNodes, fresh); err == nil {
 		if warnings := freshVolumeWarnings(planned); len(warnings) > 0 {
@@ -732,7 +521,7 @@ func watchDeploy(baseURL, project string, keys []string) error {
 			return nil
 		}
 		if time.Now().After(deadline) {
-			fmt.Println("(timed out waiting for all workloads to reach a terminal state; check `haco workloads` for current status)")
+			fmt.Println("(timed out waiting for all workloads to reach a terminal state; check `haco ps` for current status)")
 			return nil
 		}
 		time.Sleep(time.Second)
@@ -848,13 +637,24 @@ func fetchJSON(baseURL, path string, out any) error {
 	return json.Unmarshal(data, out)
 }
 
-// workloads lists every workload, optionally filtered to one project, as a
-// table (SERVICE/REVISION/NODE/STATUS/REASON) — raw per-workload detail is
-// still available via `haco status`.
-func workloads(baseURL string, args []string) error {
-	if len(args) > 1 {
-		return fmt.Errorf("usage: haco workloads [project]")
+// ps lists every service with its node and status, or one service's full
+// detail once a project and a service are named. Every deploy replaces the
+// same project/service/latest workload in place, so there is no revision to
+// show or type.
+func ps(baseURL string, args []string) error {
+	switch len(args) {
+	case 0, 1:
+		return psTable(baseURL, args)
+	case 2:
+		return get(baseURL, "/v1/workloads/"+neturl.PathEscape(args[0])+"/"+neturl.PathEscape(args[1])+"/latest")
+	case 3: // the older `status <project> <service> <revision>`
+		return get(baseURL, "/v1/workloads/"+neturl.PathEscape(args[0])+"/"+neturl.PathEscape(args[1])+"/"+neturl.PathEscape(args[2]))
+	default:
+		return fmt.Errorf("usage: haco ps [project] [service]")
 	}
+}
+
+func psTable(baseURL string, args []string) error {
 	path := "/v1/workloads"
 	if len(args) == 1 {
 		path += "?project=" + neturl.QueryEscape(args[0])
@@ -864,13 +664,24 @@ func workloads(baseURL string, args []string) error {
 		return err
 	}
 	if len(out) == 0 {
-		fmt.Println("no workloads")
+		fmt.Println("no services")
 		return nil
 	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Project != out[j].Project {
+			return out[i].Project < out[j].Project
+		}
+		return out[i].Service < out[j].Service
+	})
 	tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(tw, "PROJECT\tSERVICE\tREVISION\tNODE\tSTATUS\tREASON")
+	fmt.Fprintln(tw, "PROJECT\tSERVICE\tNODE\tSTATUS\tPORTS\tCONTAINER\tREASON")
 	for _, w := range out {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", w.Project, w.Service, w.Revision, orDash(w.NodeID), w.Status, orDash(w.StatusReason))
+		cid := w.ContainerID
+		if len(cid) > 12 {
+			cid = cid[:12]
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", w.Project, w.Service, orDash(w.NodeID), w.Status,
+			intListOrDash(w.Constraints.HostPorts), orDash(cid), orDash(w.StatusReason))
 	}
 	tw.Flush()
 	return nil
@@ -906,55 +717,6 @@ func projects(baseURL string, args []string) error {
 		fmt.Fprintf(tw2, "%s\t%d\t%d\t%d\t%d\t%d\n", p.Project, p.Total, ready, failed, stopped, other)
 	}
 	tw2.Flush()
-	return nil
-}
-
-// containers is a join view over workloads + nodes: which container is
-// actually running where, derived entirely from existing data (no new
-// storage). Stopped/failed workloads have no live container, so they're
-// filtered out here — haco workloads keeps the full history including
-// those.
-func containers(baseURL string, args []string) error {
-	if len(args) > 1 {
-		return fmt.Errorf("usage: haco containers [project]")
-	}
-	path := "/v1/workloads"
-	if len(args) == 1 {
-		path += "?project=" + neturl.QueryEscape(args[0])
-	}
-	var all []workloadRecordView
-	if err := fetchJSON(baseURL, path, &all); err != nil {
-		return err
-	}
-	w := make([]workloadRecordView, 0, len(all))
-	for _, rec := range all {
-		if rec.Status == "stopped" || rec.Status == "failed" {
-			continue
-		}
-		w = append(w, rec)
-	}
-	if len(w) == 0 {
-		fmt.Println("no containers")
-		return nil
-	}
-	sort.Slice(w, func(i, j int) bool {
-		if w[i].NodeID != w[j].NodeID {
-			return w[i].NodeID < w[j].NodeID
-		}
-		return w[i].Project+w[i].Service < w[j].Project+w[j].Service
-	})
-	tw := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
-	fmt.Fprintln(tw, "NODE\tPROJECT\tSERVICE\tCONTAINER ID\tSTATUS\tPORTS\tINTERNAL URL")
-	for _, rec := range w {
-		cid := rec.ContainerID
-		if len(cid) > 12 {
-			cid = cid[:12]
-		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			orDash(rec.NodeID), rec.Project, rec.Service, orDash(cid), rec.Status,
-			intListOrDash(rec.Constraints.HostPorts), internalURLs(rec.Service, rec.ContainerPorts))
-	}
-	tw.Flush()
 	return nil
 }
 
@@ -1024,21 +786,41 @@ func nodes(baseURL string) error {
 
 // nodeDetail prints one node's full detail; there's no dedicated
 // single-node endpoint yet, so this filters the existing node list.
-// node dispatches `haco node <id>` (detail) and the cordon/uncordon
-// subcommands — kept under one verb since they all operate on "a node",
-// the same way `haco node <id>` already reads as "this node".
+// node dispatches the `haco node <command>` family: everything that acts
+// on one node, plus join-token, which makes a new one. A bare
+// `haco node <id>` still shows the node, as before.
 func node(baseURL string, args []string) error {
-	switch {
-	case len(args) == 2 && args[0] == "cordon":
-		return post(baseURL, "/v1/admin/nodes/"+neturl.PathEscape(args[1])+"/cordon", []byte(`{}`))
-	case len(args) == 2 && args[0] == "uncordon":
-		return post(baseURL, "/v1/admin/nodes/"+neturl.PathEscape(args[1])+"/uncordon", []byte(`{}`))
-	case len(args) >= 1 && args[0] == "rename":
-		return setNodeName(baseURL, args[1:])
-	case len(args) >= 1 && args[0] == "limit":
-		return setNodeLimits(baseURL, args[1:])
+	if len(args) == 0 {
+		return fmt.Errorf("usage: haco node show|join-token|cordon|uncordon|rename|limit|revoke|rm ... (haco help node)")
+	}
+	rest := args[1:]
+	switch args[0] {
+	case "show":
+		return nodeDetail(baseURL, rest)
+	case "join-token":
+		return printJoinCommand(baseURL)
+	case "cordon", "uncordon":
+		if len(rest) != 1 {
+			return fmt.Errorf("usage: haco node %s <id>", args[0])
+		}
+		return post(baseURL, "/v1/admin/nodes/"+neturl.PathEscape(rest[0])+"/"+args[0], []byte(`{}`))
+	case "rename":
+		return setNodeName(baseURL, rest)
+	case "limit":
+		return setNodeLimits(baseURL, rest)
+	case "revoke":
+		if len(rest) != 1 {
+			return fmt.Errorf("usage: haco node revoke <id>")
+		}
+		return post(baseURL, "/v1/admin/nodes/"+neturl.PathEscape(rest[0])+"/revoke", []byte(`{}`))
+	case "rm":
+		return removeNode(baseURL, rest)
 	default:
-		return nodeDetail(baseURL, args)
+		if len(args) == 1 {
+			fmt.Fprintf(os.Stderr, "haco: \"haco node <id>\" is now \"haco node show <id>\" (the old form still works)\n")
+			return nodeDetail(baseURL, args)
+		}
+		return fmt.Errorf("unknown node command %q (haco help node)", args[0])
 	}
 }
 
@@ -1139,7 +921,7 @@ func parseByteSize(s string) (int64, error) {
 
 func nodeDetail(baseURL string, args []string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("usage: haco node <id> | haco node cordon|uncordon <id>")
+		return fmt.Errorf("usage: haco node show <id>")
 	}
 	var nodes []nodeView
 	if err := fetchJSON(baseURL, "/v1/nodes", &nodes); err != nil {
@@ -1212,54 +994,6 @@ func orDash(s string) string {
 	return s
 }
 
-// status is a table of everything with no/one argument (just like
-// `haco workloads`, which it shares its implementation with), or one
-// workload's full detail once you name a service. Revision defaults to
-// "latest" since that's the only one anything in this codebase ever
-// produces today — there's no content-addressed revisioning yet (every
-// deploy replaces the same project/service/latest workload in place), so
-// in practice it never needs to be spelled out.
-func status(baseURL string, args []string) error {
-	switch len(args) {
-	case 0, 1:
-		return workloads(baseURL, args)
-	case 2:
-		return get(baseURL, "/v1/workloads/"+args[0]+"/"+args[1]+"/latest")
-	case 3:
-		return get(baseURL, "/v1/workloads/"+args[0]+"/"+args[1]+"/"+args[2])
-	default:
-		return fmt.Errorf("usage: haco status [project] [service] [revision]")
-	}
-}
-
-// stopContainers stops every workload (so each agent removes its
-// container) without touching node credentials — the "clear the board but
-// keep nodes joined" command. teardown below reuses it as its first half.
-func stopContainers(baseURL string, args []string) error {
-	yes := false
-	var rest []string
-	for _, a := range args {
-		if a == "--yes" || a == "-y" {
-			yes = true
-			continue
-		}
-		rest = append(rest, a)
-	}
-	if len(rest) > 1 {
-		return fmt.Errorf("usage: haco stop-containers [project] [--yes]")
-	}
-	project := ""
-	target := "EVERY workload's container"
-	if len(rest) == 1 {
-		project = rest[0]
-		target = fmt.Sprintf("every workload's container in project %q", project)
-	}
-	if !yes && !confirm(fmt.Sprintf("This will stop %s. Continue?", target)) {
-		return fmt.Errorf("aborted")
-	}
-	return stopAllWorkloads(baseURL, project)
-}
-
 // stopAllWorkloads stops every non-stopped workload, or (project != "")
 // just those under that project — teardown calls it unscoped ("") since
 // node-credential revocation isn't a per-project concept either way.
@@ -1287,7 +1021,7 @@ func stopAllWorkloads(baseURL, project string) error {
 	return nil
 }
 
-// teardown stops every workload (so agents remove their containers) and
+// teardown (haco cluster reset) stops every workload (so agents remove their containers) and
 // revokes every node's agent credential — the "start completely clean
 // again" command, built from the existing per-workload stop and
 // per-node revoke endpoints rather than a new bulk server-side operation.
@@ -1299,7 +1033,7 @@ func teardown(baseURL string, args []string) error {
 		}
 	}
 	if !yes && !confirm("This will stop EVERY workload and revoke EVERY node's credential. Continue?") {
-		return fmt.Errorf("teardown aborted")
+		return fmt.Errorf("cluster reset aborted")
 	}
 
 	if err := stopAllWorkloads(baseURL, ""); err != nil {
@@ -1403,7 +1137,7 @@ func shutdown(baseURL string, args []string) error {
 		time.Sleep(500 * time.Millisecond)
 	}
 	if controlPlaneUp(baseURL) {
-		fmt.Println("control plane is still up; stop it with `haco stop-all`")
+		fmt.Println("control plane is still up; stop it with `haco stop-cluster`")
 		return nil
 	}
 	_ = os.Remove(filepath.Join(envOr("HACO_DATA_DIR", filepath.Join(homeDir(), ".haco")), "controlplane.pid"))
@@ -1463,7 +1197,7 @@ func start(baseURL string, args []string) error {
 			if webConsoleUp(baseURL) {
 				fmt.Printf("web console: %s/\n", strings.TrimRight(baseURL, "/"))
 			} else {
-				fmt.Println("the running control plane was started without --web; run 'haco stop-all' then 'haco start --web' to serve the console")
+				fmt.Println("the running control plane was started without --web; run 'haco stop-cluster' then 'haco start --web' to serve the console")
 			}
 		}
 		if showLogs {
@@ -1543,11 +1277,11 @@ func start(baseURL string, args []string) error {
 	return fmt.Errorf("control plane did not become ready within 10s; check %s", logPath)
 }
 
-// stopAll stops the background control-plane process `start` launched,
+// stopControlPlane stops the background control-plane process `start` launched,
 // using the pid file it wrote — the counterpart to `start`, distinct from
-// `stop` (which stops one workload) and `teardown` (which stops workloads
+// `stop` (which stops services) and `cluster reset` (which stops workloads
 // and revokes nodes but leaves the control plane itself running).
-func stopAll(args []string) error {
+func stopControlPlane(args []string) error {
 	dataDir := envOr("HACO_DATA_DIR", filepath.Join(homeDir(), ".haco"))
 	pidPath := filepath.Join(dataDir, "controlplane.pid")
 
@@ -1720,50 +1454,80 @@ func postQuiet(baseURL, path string, body []byte) error {
 	return nil
 }
 
-// workloadsFor lists a project's workloads, optionally one service's.
-func workloadsFor(baseURL, project, service string) ([]workloadRecordView, error) {
+// projectAndServices reads "<project> [service...]". A trailing "latest" is
+// dropped: the older commands took a revision there, and there has only
+// ever been "latest".
+func projectAndServices(usage string, args []string) (string, []string, error) {
+	pos := args
+	if len(pos) >= 3 && pos[len(pos)-1] == "latest" {
+		pos = pos[:len(pos)-1]
+	}
+	for _, a := range pos {
+		if strings.HasPrefix(a, "-") && len(a) > 1 {
+			return "", nil, fmt.Errorf("unknown flag %s\nusage: %s", a, usage)
+		}
+	}
+	if len(pos) < 1 {
+		return "", nil, fmt.Errorf("usage: %s", usage)
+	}
+	return pos[0], pos[1:], nil
+}
+
+// workloadsFor lists a project's workloads, narrowed to the named services
+// when there are any.
+func workloadsFor(baseURL, project string, services []string) ([]workloadRecordView, error) {
 	var all []workloadRecordView
 	if err := fetchJSON(baseURL, "/v1/workloads?project="+neturl.QueryEscape(project), &all); err != nil {
 		return nil, err
 	}
-	var out []workloadRecordView
+	var inProject []workloadRecordView
 	for _, w := range all {
-		if w.Project == project && (service == "" || w.Service == service) {
-			out = append(out, w)
+		if w.Project == project {
+			inProject = append(inProject, w)
 		}
 	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("no workloads for %s", strings.TrimSuffix(project+"/"+service, "/"))
+	if len(inProject) == 0 {
+		return nil, fmt.Errorf("no services in project %q", project)
+	}
+	if len(services) == 0 {
+		return inProject, nil
+	}
+	var out []workloadRecordView
+	for _, name := range services {
+		found := false
+		for _, w := range inProject {
+			if w.Service == name {
+				out = append(out, w)
+				found = true
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("project %q has no service %q", project, name)
+		}
 	}
 	return out, nil
 }
 
-// resume starts stopped (or failed) workloads again where they last ran.
+// resume starts stopped (or failed) services again where they last ran.
 func resume(baseURL string, args []string) error {
-	if len(args) < 1 || len(args) > 2 {
-		return fmt.Errorf("usage: haco resume <project> [service]")
+	project, services, err := projectAndServices("haco resume <project> [service...]", args)
+	if err != nil {
+		return err
 	}
-	service := ""
-	if len(args) == 2 {
-		service = args[1]
-	}
-	wl, err := workloadsFor(baseURL, args[0], service)
+	wl, err := workloadsFor(baseURL, project, services)
 	if err != nil {
 		return err
 	}
 	return eachWorkload(baseURL, wl, "start", func(w workloadRecordView) bool { return w.Status == "stopped" || w.Status == "failed" }, "nothing is stopped")
 }
 
-// restart recreates running workloads' containers on their current nodes.
+// restart recreates running services' containers on their current nodes.
 func restart(baseURL string, args []string) error {
-	if len(args) < 1 || len(args) > 2 {
-		return fmt.Errorf("usage: haco restart <project> [service]")
+	project, services, err := projectAndServices("haco restart <project> [service...]", args)
+	if err != nil {
+		return err
 	}
-	service := ""
-	if len(args) == 2 {
-		service = args[1]
-	}
-	wl, err := workloadsFor(baseURL, args[0], service)
+	wl, err := workloadsFor(baseURL, project, services)
 	if err != nil {
 		return err
 	}
@@ -1795,69 +1559,89 @@ func eachWorkload(baseURL string, wl []workloadRecordView, action string, want f
 	return nil
 }
 
+// stop stops the named services, a whole project, or (--all) everything.
+// The service keeps its record, node and data, so resume starts it again.
 func stop(baseURL string, args []string) error {
-	if len(args) != 3 {
-		return fmt.Errorf("usage: haco stop <project> <service> <revision>")
+	yes, rest := hasFlag(args, "--yes", "-y")
+	all, rest := hasFlag(rest, "--all")
+	if all {
+		if len(rest) > 0 {
+			return fmt.Errorf("--all stops every project, so it takes no project or services")
+		}
+		if !yes && !confirm("This will stop EVERY service of EVERY project. Continue?") {
+			return fmt.Errorf("aborted")
+		}
+		return stopAllWorkloads(baseURL, "")
 	}
-	path := fmt.Sprintf("/v1/workloads/%s/%s/%s/stop",
-		neturl.PathEscape(args[0]), neturl.PathEscape(args[1]), neturl.PathEscape(args[2]))
-	return post(baseURL, path, []byte(`{}`))
+	project, services, err := projectAndServices("haco stop <project> [service...] | haco stop --all", rest)
+	if err != nil {
+		return err
+	}
+	wl, err := workloadsFor(baseURL, project, services)
+	if err != nil {
+		return err
+	}
+	return eachWorkload(baseURL, wl, "stop", func(w workloadRecordView) bool { return w.Status != "stopped" }, "nothing is running")
 }
 
-// removeWorkload hard-deletes one workload record — distinct from stop,
-// which just marks it stopped and leaves the historical row behind.
-// Revision defaults to "latest" (the only one anything produces today),
-// same convenience haco status already offers.
-func removeWorkload(baseURL string, args []string) error {
-	if len(args) != 2 && len(args) != 3 {
-		return fmt.Errorf("usage: haco remove-workload <project> <service> [revision]")
+// rm hard-deletes workload records, unlike stop, which keeps a stopped row.
+// Naming services deletes just those; naming only a project, or --all,
+// deletes more, so those ask first.
+func rm(baseURL string, args []string) error {
+	yes, rest := hasFlag(args, "--yes", "-y")
+	all, rest := hasFlag(rest, "--all")
+	if all {
+		if len(rest) > 0 {
+			return fmt.Errorf("--all removes every project, so it takes no project or services")
+		}
+		if !yes && !confirm("This will permanently delete EVERY workload record (not just stop them). Continue?") {
+			return fmt.Errorf("aborted")
+		}
+		return del(baseURL, "/v1/workloads")
 	}
-	revision := "latest"
-	if len(args) == 3 {
-		revision = args[2]
+	project, services, err := projectAndServices("haco rm <project> [service...] | haco rm --all", rest)
+	if err != nil {
+		return err
 	}
-	path := fmt.Sprintf("/v1/workloads/%s/%s/%s",
-		neturl.PathEscape(args[0]), neturl.PathEscape(args[1]), neturl.PathEscape(revision))
-	return del(baseURL, path)
-}
-
-// removeAllWorkloads hard-deletes every workload record, or (project
-// given) just those under that project — the destructive counterpart to
-// haco stop-containers, which only marks them stopped.
-func removeAllWorkloads(baseURL string, args []string) error {
-	yes := false
-	var rest []string
-	for _, a := range args {
-		if a == "--yes" || a == "-y" {
-			yes = true
+	if len(services) == 0 {
+		if !yes && !confirm(fmt.Sprintf("This will permanently delete every workload record in project %q (not just stop them). Continue?", project)) {
+			return fmt.Errorf("aborted")
+		}
+		return del(baseURL, "/v1/workloads?project="+neturl.QueryEscape(project))
+	}
+	wl, err := workloadsFor(baseURL, project, services)
+	if err != nil {
+		return err
+	}
+	failed := 0
+	for _, w := range wl {
+		path := fmt.Sprintf("/v1/workloads/%s/%s/%s", neturl.PathEscape(w.Project), neturl.PathEscape(w.Service), neturl.PathEscape(w.Revision))
+		if err := delQuiet(baseURL, path); err != nil {
+			fmt.Printf("remove %s/%s: %v\n", w.Project, w.Service, err)
+			failed++
 			continue
 		}
-		rest = append(rest, a)
+		fmt.Printf("removed %s/%s\n", w.Project, w.Service)
 	}
-	if len(rest) > 1 {
-		return fmt.Errorf("usage: haco remove-all-workloads [project] [--yes]")
+	if failed > 0 {
+		return fmt.Errorf("%d of %d could not be removed", failed, len(wl))
 	}
-	project := ""
-	target := "EVERY workload record"
-	if len(rest) == 1 {
-		project = rest[0]
-		target = fmt.Sprintf("every workload record in project %q", project)
+	return nil
+}
+
+// cluster holds the cluster-wide operations.
+func cluster(baseURL string, args []string) error {
+	if len(args) == 0 || args[0] != "reset" {
+		return fmt.Errorf("usage: haco cluster reset [--yes]")
 	}
-	if !yes && !confirm(fmt.Sprintf("This will permanently delete %s (not just stop them). Continue?", target)) {
-		return fmt.Errorf("aborted")
-	}
-	path := "/v1/workloads"
-	if project != "" {
-		path += "?project=" + neturl.QueryEscape(project)
-	}
-	return del(baseURL, path)
+	return teardown(baseURL, args[1:])
 }
 
 func logs(baseURL string, args []string) error {
 	return fetchLogs(http.DefaultClient, baseURL, args, os.Stdout)
 }
 
-const logsUsage = "usage: haco logs <project> <service> [revision] [--tail N] [-f]"
+const logsUsage = "usage: haco logs <project> <service> [--tail N] [-f]"
 
 const followWindow = 1000
 
@@ -2004,13 +1788,31 @@ func removeNode(baseURL string, args []string) error {
 		rest = append(rest, a)
 	}
 	if len(rest) != 1 {
-		return fmt.Errorf("usage: haco remove-node <node-id> [--force]")
+		return fmt.Errorf("usage: haco node rm <id> [--force]")
 	}
 	path := "/v1/admin/nodes/" + neturl.PathEscape(rest[0])
 	if force {
 		path += "?force=true"
 	}
 	return del(baseURL, path)
+}
+
+// delQuiet is del without printing the response body.
+func delQuiet(baseURL, path string) error {
+	req, err := http.NewRequest(http.MethodDelete, baseURL+path, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(data)))
+	}
+	return nil
 }
 
 func del(baseURL, path string) error {

@@ -276,8 +276,7 @@ func (m tuiModel) View() string {
 // talks to the control plane for the TUI, reusing the same view structs
 // and fetchJSON helper the equivalent CLI table commands already use
 // (workloadRecordView/nodeView/serviceInstanceView/projectSummaryView),
-// plus intListOrDash/internalURLs for the containers tab exactly as
-// haco containers renders them.
+// plus intListOrDash/internalURLs for the containers tab.
 func fetchTabData(baseURL, project string, tab tuiTab) ([]table.Column, []table.Row, error) {
 	switch tab {
 	case tabNodes:

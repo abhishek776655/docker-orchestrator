@@ -180,7 +180,7 @@ async function postJson(path: string, body: unknown): Promise<Response> {
 }
 
 const OUTDATED =
-  'The control plane is an older version without this action. Run ./install.sh, then haco stop-all and haco start --web (and haco agent run on other machines).'
+  'The control plane is an older version without this action. Run ./install.sh, then haco stop-cluster and haco start --web (and haco agent run on other machines).'
 
 async function errorFrom(res: Response): Promise<ApiError> {
   // An older control plane routes unknown POST actions to a GET-only path.

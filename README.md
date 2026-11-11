@@ -41,9 +41,13 @@ haco agent join '<token>'
 **4. Deploy a Compose project** from the console's **Deploy** page, or:
 
 ```bash
-haco plan myapp ./docker-compose.yml     # dry run: where each service goes and why
-haco deploy myapp ./docker-compose.yml   # build, place, start, show live status
+cd ~/projects/myapp                      # the folder with your Compose file
+haco plan                                # dry run: where each service goes and why
+haco deploy                              # build, place, start, show live status
 ```
+
+The project is named after the folder (`myapp`); use `-p` to name it
+something else, or `-f` for a Compose file with another name.
 
 Details on each step are under [Install](#install) and
 [Setting up a cluster](#setting-up-a-cluster) below.
@@ -115,7 +119,7 @@ into `~/.haco/web`. Make sure that bin folder is on your `PATH`.
 ## Setting up a cluster
 
 - Join tokens expire after 10 minutes. Get a fresh one any time from
-  **Add node** in the console or with `haco join-token`.
+  **Add node** in the console or with `haco node join-token`.
 - After a machine has joined once, restart its agent without a token:
 
   ```bash
@@ -128,30 +132,42 @@ into `~/.haco/web`. Make sure that bin folder is on your `PATH`.
 
 ## Everyday commands
 
+Run these from the folder that holds your Compose file. `-f` defaults to the
+Compose file there and `-p` (the project name) to the folder's name, as in
+`docker compose`; pass either to use something else.
+
 | Task | Command |
 | --- | --- |
 | Start the control plane (with the web console) | `haco start --web` |
-| Stop the control plane | `haco stop-all` |
-| Dry-run a deploy | `haco plan <project> <compose.yml>` |
-| Deploy or redeploy | `haco deploy <project> <compose.yml>` |
-| Deploy one service and what it depends on | `haco deploy <project> <compose.yml> --service <name>` |
-| Let the scheduler place everything again | `haco deploy <project> <compose.yml> --fresh` |
+| Stop the control plane only | `haco stop-cluster` |
+| Dry-run a deploy | `haco plan` |
+| Deploy or redeploy | `haco deploy` |
+| Deploy one service and what it depends on | `haco deploy <service>` |
+| Let the scheduler place everything again | `haco deploy --fresh` |
 | Keep services on the control-plane machine | `--pin-host db,cache` on plan or deploy |
 | Pin services to a node | `--pin-node <node-id>=api,web` on plan or deploy |
-| Projects and workloads | `haco projects`, `haco status [project]` |
+| Another file or project name | `haco deploy -f other.yml -p myproject` |
+| Services and where they run | `haco ps [project]` |
+| Projects | `haco projects` |
 | Live logs | `haco logs <project> <service> -f` |
-| Stop / start again / restart | `haco stop <project> <service> latest`, `haco resume <project> [service]`, `haco restart <project> [service]` |
-| Remove a project | `haco remove-all-workloads <project>` |
-| Nodes | `haco nodes`, `haco node <id>` |
+| Stop / start again / restart | `haco stop <project> [service...]`, `haco resume <project> [service...]`, `haco restart <project> [service...]` |
+| Remove a project's services | `haco rm <project>` (or `haco rm <project> <service>`) |
+| Nodes | `haco nodes`, `haco node show <id>` |
 | Cordon / uncordon a node | `haco node cordon <id>`, `haco node uncordon <id>` |
 | Name a node | `haco node rename <id> "Studio Mac"` |
 | Cap a node's resources | `haco node limit <id> --cpus 4 --memory 8GiB` |
-| Remove a node | `haco remove-node <id>` |
+| Remove a node | `haco node rm <id>` |
 | Terminal dashboard | `haco tui` |
 | Audit events | `haco events [project]` |
 | Shut the whole cluster down | `haco shutdown` |
+| Stop everything and revoke every node | `haco cluster reset` |
 
-Run `haco help` for every command and flag.
+The older command names (`status`, `workloads`, `containers`, `stop-all`, `teardown`,
+`join-token`, `revoke-node`, `remove-node`, `remove-workload`, `remove-all-workloads`,
+`stop-containers`) and the `haco deploy <project> <file>` form still work for now and
+print what to use instead.
+
+Run `haco help` for every command, and `haco help <command>` for its flags.
 
 ## Compose extensions
 
