@@ -322,7 +322,12 @@ func (svc *Service) ComposeDeploy(ctx context.Context, project, workingDir strin
 		return plan, nil, err
 	}
 
+	// Keep placing the rest when one service can't be placed (a node went
+	// unavailable mid-deploy, a constraint nothing satisfies): stopping at
+	// the first failure left every later service unscheduled. All failures
+	// are reported together at the end.
 	var results []*SubmitResult
+	var failures []error
 	for _, wl := range plan.Workloads {
 		if ref, ok := images[wl.Service]; ok {
 			wl.Image = ref
@@ -332,10 +337,15 @@ func (svc *Service) ComposeDeploy(ctx context.Context, project, workingDir strin
 			}
 		}
 		result, err := svc.Submit(ctx, wl, opts.Fresh)
-		results = append(results, result)
-		if err != nil {
-			return plan, results, fmt.Errorf("schedule %s: %w", wl.Service, err)
+		if result != nil {
+			results = append(results, result)
 		}
+		if err != nil {
+			failures = append(failures, fmt.Errorf("schedule %s: %w", wl.Service, err))
+		}
+	}
+	if len(failures) > 0 {
+		return plan, results, fmt.Errorf("%d of %d services could not be scheduled: %w", len(failures), len(plan.Workloads), errors.Join(failures...))
 	}
 	return plan, results, nil
 }
@@ -364,7 +374,19 @@ func (svc *Service) resolveBuilds(ctx context.Context, project string, plan *com
 	if svc.builder != nil {
 		registry = svc.builder.Registry()
 	}
-	for _, b := range plan.Builds {
+	// Each build is independent, so they run through the bounded pool. The
+	// jobs only touch their own slot of results; the shared maps and the
+	// plan are updated afterwards, in plan order, on this goroutine.
+	type outcome struct {
+		service string
+		image   string
+		spec    *model.RemoteBuildSpec
+		arch    bool // registry build pinned to this machine's architecture
+		cap     bool // remote build needs a node with buildx
+	}
+	outcomes := make([]*outcome, len(plan.Builds))
+	var jobs []func() error
+	for i, b := range plan.Builds {
 		if registry != "" {
 			if len(b.SSH) > 0 {
 				return images, remote, fmt.Errorf("service %s uses build.ssh, which needs BuildKit on the building node; start the control plane without --registry so the assigned agent builds it", b.Service)
@@ -372,65 +394,92 @@ func (svc *Service) resolveBuilds(ctx context.Context, project string, plan *com
 			if svc.builder == nil {
 				return images, remote, fmt.Errorf("service %s requires a build but no builder is configured", b.Service)
 			}
-			if b.Platform == "" {
-				// One central image is pulled by every node, so it can't be
-				// "native" to each of them: build it for this machine and
-				// only place the service on nodes that can run that.
-				b.Platform = "linux/" + runtime.GOARCH
-				requireArchitecture(plan, b.Service, runtime.GOARCH)
-			}
-			ref, err := svc.builder.Build(ctx, project, "latest", b, noCache)
-			if err != nil {
-				return images, remote, fmt.Errorf("build %s: %w", b.Service, err)
-			}
-			images[b.Service] = ref
+			jobs = append(jobs, func() error {
+				o := &outcome{service: b.Service}
+				if b.Platform == "" {
+					// One central image is pulled by every node, so it can't be
+					// "native" to each of them: build it for this machine and
+					// only place the service on nodes that can run that.
+					b.Platform = "linux/" + runtime.GOARCH
+					o.arch = true
+				}
+				ref, err := svc.builder.Build(ctx, project, "latest", b, noCache)
+				if err != nil {
+					return fmt.Errorf("build %s: %w", b.Service, err)
+				}
+				o.image = ref
+				outcomes[i] = o
+				return nil
+			})
 			continue
 		}
 		wl, ok := workloadByService[b.Service]
 		if !ok {
 			continue
 		}
-		tarball, err := build.TarBuildContext(b.Context, b.Dockerfile)
-		if err != nil {
-			return images, remote, fmt.Errorf("package build context for %s: %w", b.Service, err)
-		}
-		data, err := io.ReadAll(tarball)
-		if err != nil {
-			return images, remote, fmt.Errorf("read build context for %s: %w", b.Service, err)
-		}
-		sshKeys, err := resolveBuildSSHKeys(b)
-		if err != nil {
-			return images, remote, err
-		}
-		spec := &model.RemoteBuildSpec{Dockerfile: b.Dockerfile, Args: b.Args, Platform: b.Platform, NoCache: noCache}
-		for id := range sshKeys {
-			spec.SSHIDs = append(spec.SSHIDs, id)
-		}
-		sort.Strings(spec.SSHIDs)
-		for id := range b.Secrets {
-			spec.SecretIDs = append(spec.SecretIDs, id)
-		}
-		sort.Strings(spec.SecretIDs)
-		spec.BuildID = buildID(spec, data)
-		if noCache {
-			// A no-cache deploy must rebuild even when nothing changed, so
-			// its ID can never match the image already on the node.
-			spec.BuildID += "-nocache-" + strconv.FormatInt(time.Now().UnixNano(), 36)
-		}
-		requireCapability(plan, b.Service, "buildx")
-		images[b.Service] = fmt.Sprintf("%s-%s:%s", project, b.Service, wl.Revision)
-		remote[b.Service] = spec
-		svc.stashBuildContext(wl.Key(), data)
-		stash := map[string][]byte{}
-		for id, k := range sshKeys {
-			stash[id] = k
-		}
-		for id, v := range b.Secrets {
-			stash["secret:"+id] = v
-		}
-		svc.stashBuildSSH(wl.Key(), stash)
+		jobs = append(jobs, func() error {
+			tarball, err := build.TarBuildContext(b.Context, b.Dockerfile)
+			if err != nil {
+				return fmt.Errorf("package build context for %s: %w", b.Service, err)
+			}
+			data, err := io.ReadAll(tarball)
+			if err != nil {
+				return fmt.Errorf("read build context for %s: %w", b.Service, err)
+			}
+			sshKeys, err := resolveBuildSSHKeys(b)
+			if err != nil {
+				return err
+			}
+			spec := &model.RemoteBuildSpec{Dockerfile: b.Dockerfile, Args: b.Args, Platform: b.Platform, NoCache: noCache}
+			for id := range sshKeys {
+				spec.SSHIDs = append(spec.SSHIDs, id)
+			}
+			sort.Strings(spec.SSHIDs)
+			for id := range b.Secrets {
+				spec.SecretIDs = append(spec.SecretIDs, id)
+			}
+			sort.Strings(spec.SecretIDs)
+			spec.BuildID = buildID(spec, data)
+			if noCache {
+				// A no-cache deploy must rebuild even when nothing changed, so
+				// its ID can never match the image already on the node.
+				spec.BuildID += "-nocache-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+			}
+			svc.stashBuildContext(wl.Key(), data)
+			stash := map[string][]byte{}
+			for id, k := range sshKeys {
+				stash[id] = k
+			}
+			for id, v := range b.Secrets {
+				stash["secret:"+id] = v
+			}
+			svc.stashBuildSSH(wl.Key(), stash)
+			outcomes[i] = &outcome{
+				service: b.Service,
+				image:   fmt.Sprintf("%s-%s:%s", project, b.Service, wl.Revision),
+				spec:    spec,
+				cap:     true,
+			}
+			return nil
+		})
 	}
-	return images, remote, nil
+	err := runBounded(deployParallelism(), jobs)
+	for _, o := range outcomes {
+		if o == nil {
+			continue
+		}
+		images[o.service] = o.image
+		if o.spec != nil {
+			remote[o.service] = o.spec
+		}
+		if o.arch {
+			requireArchitecture(plan, o.service, runtime.GOARCH)
+		}
+		if o.cap {
+			requireCapability(plan, o.service, "buildx")
+		}
+	}
+	return images, remote, err
 }
 
 // requireCapability restricts a service to nodes reporting capability, so a
@@ -579,6 +628,7 @@ func (svc *Service) FetchVolumeSnapshot(key string) ([]byte, bool) {
 // ComposeBuild.
 func (svc *Service) resolveVolumeSnapshots(plan *compose.Plan) error {
 	host := agent.HostNodeID()
+	var jobs []func() error
 	for i := range plan.Workloads {
 		wl := &plan.Workloads[i]
 		if wl.Storage.PinnedNodeID == host {
@@ -589,21 +639,24 @@ func (svc *Service) resolveVolumeSnapshots(plan *compose.Plan) error {
 			if v.HostPath == "" || v.DockerSocket {
 				continue
 			}
-			tarball, err := build.TarContext(v.HostPath)
-			if err != nil {
-				return fmt.Errorf("package volume %s for %s: %w", v.ContainerPath, wl.Service, err)
-			}
-			data, err := io.ReadAll(tarball)
-			if err != nil {
-				return fmt.Errorf("read volume tarball %s for %s: %w", v.ContainerPath, wl.Service, err)
-			}
 			key := fmt.Sprintf("%s:%d", wl.Key(), j)
-			svc.stashVolumeSnapshot(key, data)
-			v.HostPath = ""
-			v.RemoteDirKey = key
+			jobs = append(jobs, func() error {
+				tarball, err := build.TarContext(v.HostPath)
+				if err != nil {
+					return fmt.Errorf("package volume %s for %s: %w", v.ContainerPath, wl.Service, err)
+				}
+				data, err := io.ReadAll(tarball)
+				if err != nil {
+					return fmt.Errorf("read volume tarball %s for %s: %w", v.ContainerPath, wl.Service, err)
+				}
+				svc.stashVolumeSnapshot(key, data)
+				v.HostPath = ""
+				v.RemoteDirKey = key
+				return nil
+			})
 		}
 	}
-	return nil
+	return runBounded(deployParallelism(), jobs)
 }
 
 // resolveVolumeSeeds converts every volume's candidate seed path
@@ -614,6 +667,7 @@ func (svc *Service) resolveVolumeSnapshots(plan *compose.Plan) error {
 // single volume could in principle need both in different deploys and
 // they must never collide.
 func (svc *Service) resolveVolumeSeeds(plan *compose.Plan) error {
+	var jobs []func() error
 	for i := range plan.Workloads {
 		wl := &plan.Workloads[i]
 		for j := range wl.Volumes {
@@ -623,20 +677,23 @@ func (svc *Service) resolveVolumeSeeds(plan *compose.Plan) error {
 			}
 			sourcePath := v.SeedDirKey
 			v.SeedDirKey = ""
-			tarball, err := build.TarContext(sourcePath)
-			if err != nil {
-				return fmt.Errorf("package volume seed %s for %s: %w", v.ContainerPath, wl.Service, err)
-			}
-			data, err := io.ReadAll(tarball)
-			if err != nil {
-				return fmt.Errorf("read volume seed tarball %s for %s: %w", v.ContainerPath, wl.Service, err)
-			}
 			key := fmt.Sprintf("%s:seed:%d", wl.Key(), j)
-			svc.stashVolumeSnapshot(key, data)
-			v.SeedDirKey = key
+			jobs = append(jobs, func() error {
+				tarball, err := build.TarContext(sourcePath)
+				if err != nil {
+					return fmt.Errorf("package volume seed %s for %s: %w", v.ContainerPath, wl.Service, err)
+				}
+				data, err := io.ReadAll(tarball)
+				if err != nil {
+					return fmt.Errorf("read volume seed tarball %s for %s: %w", v.ContainerPath, wl.Service, err)
+				}
+				svc.stashVolumeSnapshot(key, data)
+				v.SeedDirKey = key
+				return nil
+			})
 		}
 	}
-	return nil
+	return runBounded(deployParallelism(), jobs)
 }
 
 // buildImages builds every build: service in plan centrally and
@@ -645,17 +702,28 @@ func (svc *Service) resolveVolumeSeeds(plan *compose.Plan) error {
 // to defer to, unlike resolveBuilds (used by ComposeDeploy).
 func (svc *Service) buildImages(ctx context.Context, project string, plan *compose.Plan, noCache bool) (map[string]string, error) {
 	built := map[string]string{}
-	for _, b := range plan.Builds {
-		if svc.builder == nil {
-			return built, fmt.Errorf("service %s requires a build but no builder is configured", b.Service)
-		}
-		ref, err := svc.builder.Build(ctx, project, "latest", b, noCache)
-		if err != nil {
-			return built, fmt.Errorf("build %s: %w", b.Service, err)
-		}
-		built[b.Service] = ref
+	if len(plan.Builds) > 0 && svc.builder == nil {
+		return built, fmt.Errorf("service %s requires a build but no builder is configured", plan.Builds[0].Service)
 	}
-	return built, nil
+	refs := make([]string, len(plan.Builds))
+	jobs := make([]func() error, len(plan.Builds))
+	for i, b := range plan.Builds {
+		jobs[i] = func() error {
+			ref, err := svc.builder.Build(ctx, project, "latest", b, noCache)
+			if err != nil {
+				return fmt.Errorf("build %s: %w", b.Service, err)
+			}
+			refs[i] = ref
+			return nil
+		}
+	}
+	err := runBounded(deployParallelism(), jobs)
+	for i, b := range plan.Builds {
+		if refs[i] != "" {
+			built[b.Service] = refs[i]
+		}
+	}
+	return built, err
 }
 
 // BuildResult is one service's outcome from ComposeBuild.
