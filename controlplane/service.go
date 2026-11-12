@@ -53,6 +53,7 @@ type Service struct {
 	shutdown shutdownState
 	renames  renameState
 	usage    usageState
+	busy     busyPortState
 	// nodeReqs queues restarts and image deletions for agents' control polls.
 	nodeReqs nodeRequests
 
@@ -209,7 +210,7 @@ func filterMessagesByService(messages []string, keep map[string]bool) []string {
 // persisting anything — each call's reservation feeds the next, the same
 // way sequential Submit calls would via the database.
 func (svc *Service) dryRunSchedule(ctx context.Context, workloads []model.Workload, fresh bool) ([]*model.Decision, error) {
-	nodes, err := svc.store.ListNodes(ctx)
+	nodes, err := svc.listNodesForScheduling(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list nodes: %w", err)
 	}
@@ -853,7 +854,7 @@ type SubmitResult struct {
 // file, or --pin-host/--pin-node at deploy time) — only the "no pin at
 // all, so reuse wherever it already landed" path is affected.
 func (svc *Service) Submit(ctx context.Context, w model.Workload, fresh bool) (*SubmitResult, error) {
-	nodes, err := svc.store.ListNodes(ctx)
+	nodes, err := svc.listNodesForScheduling(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list nodes: %w", err)
 	}

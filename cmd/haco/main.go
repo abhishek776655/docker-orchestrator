@@ -592,6 +592,25 @@ func renderPlanTable(project string, v planView) {
 	}
 	tw.Flush()
 
+	// For each placed service, say why every other node was not used, so a
+	// plan never leaves "why not the other machine?" to guesswork.
+	var notes []string
+	for _, wl := range v.Plan.Workloads {
+		idx, ok := decisionByKey[project+"/"+wl.Service+"/latest"]
+		if !ok {
+			continue
+		}
+		for _, line := range otherNodeReasons(v.Decisions[idx].Selected, v.Decisions[idx].Scores, v.Decisions[idx].Rejections) {
+			notes = append(notes, fmt.Sprintf("  %s: %s", wl.Service, line))
+		}
+	}
+	if len(notes) > 0 {
+		fmt.Println("\nwhy other nodes were not used:")
+		for _, n := range notes {
+			fmt.Println(n)
+		}
+	}
+
 	if len(v.Plan.Warnings) > 0 {
 		fmt.Println("\nwarnings:")
 		for _, w := range v.Plan.Warnings {
@@ -604,6 +623,40 @@ func renderPlanTable(project string, v planView) {
 			fmt.Println("  -", r)
 		}
 	}
+}
+
+// otherNodeReasons explains, for a placed service, why each other node was
+// not chosen: ruled out (with the reason) or eligible but scored lower.
+// Nothing for an unplaced service, whose table row already lists every
+// node's reason.
+func otherNodeReasons(selected string, scores []struct {
+	NodeID string  `json:"NodeID"`
+	Total  float64 `json:"Total"`
+}, rejections []struct {
+	NodeID string `json:"NodeID"`
+	Reason string `json:"Reason"`
+}) []string {
+	if selected == "" {
+		return nil
+	}
+	var chosen float64
+	for _, sc := range scores {
+		if sc.NodeID == selected {
+			chosen = sc.Total
+		}
+	}
+	var lines []string
+	for _, r := range rejections {
+		if r.NodeID != selected {
+			lines = append(lines, fmt.Sprintf("%s ruled out: %s", r.NodeID, r.Reason))
+		}
+	}
+	for _, sc := range scores {
+		if sc.NodeID != selected {
+			lines = append(lines, fmt.Sprintf("%s eligible but scored lower (%.2f vs %.2f)", sc.NodeID, sc.Total, chosen))
+		}
+	}
+	return lines
 }
 
 type workloadRecordView struct {

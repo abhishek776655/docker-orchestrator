@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -343,5 +344,28 @@ func TestClusterRefreshRevokesEveryNodeAndDropsHostCredential(t *testing.T) {
 	}
 	if !stopped {
 		t.Fatal("control plane should be stopped so `haco start` re-detects the address")
+	}
+}
+
+func TestOtherNodeReasonsExplainEveryUnusedNode(t *testing.T) {
+	var v planView
+	err := json.Unmarshal([]byte(`{"decisions":[{"WorkloadKey":"p/rabbitmq/latest","Selected":"mac-b",
+		"Scores":[{"NodeID":"mac-b","Total":0.8},{"NodeID":"mac-c","Total":0.6}],
+		"Rejections":[{"NodeID":"host","Reason":"host port 5672 is in use on this node by container x (not managed by haco)"},{"NodeID":"hp","Reason":"node hp is unavailable"}]}]}`), &v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := v.Decisions[0]
+	got := strings.Join(otherNodeReasons(d.Selected, d.Scores, d.Rejections), "\n")
+	for _, want := range []string{"host ruled out: host port 5672 is in use", "hp ruled out: node hp is unavailable", "mac-c eligible but scored lower (0.60 vs 0.80)"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "mac-b") {
+		t.Errorf("the chosen node must not be listed as unused:\n%s", got)
+	}
+	if otherNodeReasons("", d.Scores, d.Rejections) != nil {
+		t.Error("an unplaced service gets no extra notes")
 	}
 }

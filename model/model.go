@@ -78,6 +78,11 @@ type Node struct {
 	// Docker daemon, used only as a scoring signal (image cache locality,
 	// SRS §9.3) — never a hard filter, since any node can still pull.
 	CachedImages []string
+	// BusyPorts are host ports held by containers that are not haco's own
+	// (a leftover `docker compose` stack, say), each with a description of
+	// the holder. The agent reports them; they are never persisted, since
+	// they describe the node right now.
+	BusyPorts map[int]string
 }
 
 // GPU is one discovered accelerator device (SRS §9.2, §9.4).

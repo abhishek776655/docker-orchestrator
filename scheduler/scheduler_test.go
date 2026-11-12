@@ -536,3 +536,20 @@ func TestForcedPlacementOverridesRejection(t *testing.T) {
 		t.Fatal("forcing onto an unknown node must fail")
 	}
 }
+
+func TestSchedulerSkipsNodeWithPortHeldOutsideHaco(t *testing.T) {
+	nodes := []model.Node{
+		{ID: "busy", Availability: model.Available, Allocatable: model.Resources{CPUMillis: 4000, MemoryBytes: 8 << 30}, BusyPorts: map[int]string{5672: "container dockerize-rabbitmq-1"}},
+		{ID: "free", Availability: model.Available, Allocatable: model.Resources{CPUMillis: 4000, MemoryBytes: 8 << 30}},
+	}
+	w := model.Workload{Project: "p", Service: "rabbitmq", Revision: "latest", Constraints: model.Constraints{HostPorts: []int{5672}}}
+	d, err := scheduler.New(nodes).Schedule(w)
+	if err != nil || d.Selected != "free" {
+		t.Fatalf("selected %q, err %v; want the node without the port in use", d.Selected, err)
+	}
+
+	_, err = scheduler.New(nodes[:1]).Schedule(w)
+	if err == nil || !strings.Contains(err.Error(), "port 5672 is in use on this node by container dockerize-rabbitmq-1") {
+		t.Fatalf("err = %v, want the holder named", err)
+	}
+}

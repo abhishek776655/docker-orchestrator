@@ -403,8 +403,21 @@ func (a *Agent) register(ctx context.Context) error {
 		"gpus":          collectGPUs(ctx),
 		"thermal":       collectThermal(),
 		"cached_images": cachedImages,
+		"busy_ports":    a.busyPorts(ctx),
 	}
 	return a.post(ctx, "/v1/nodes", body, nil)
+}
+
+// busyPorts reports host ports held by containers haco doesn't manage. A
+// failure sends an empty list, which only means the scheduler can't see
+// them: the start-failure path still catches a clash.
+func (a *Agent) busyPorts(ctx context.Context) map[int]string {
+	busy, err := a.docker.BusyHostPorts(ctx)
+	if err != nil {
+		log.Printf("list busy ports failed: %v", err)
+		return map[int]string{}
+	}
+	return busy
 }
 
 func (a *Agent) heartbeat(ctx context.Context) error {
@@ -419,6 +432,7 @@ func (a *Agent) heartbeat(ctx context.Context) error {
 		"thermal":          collectThermal(),
 		"cached_images":    cachedImages,
 		"container_memory": memory,
+		"busy_ports":       a.busyPorts(ctx),
 	}
 	return a.post(ctx, "/v1/nodes/"+a.cfg.NodeID+"/heartbeat", body, nil)
 }

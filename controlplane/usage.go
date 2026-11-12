@@ -1,9 +1,11 @@
 package controlplane
 
 import (
+	"context"
 	"sync"
 	"time"
 
+	"github.com/abhishek/hardware-aware-container-orchestrator/model"
 	"github.com/abhishek/hardware-aware-container-orchestrator/store"
 )
 
@@ -53,4 +55,42 @@ func (svc *Service) withMemory(recs []store.WorkloadRecord) {
 			recs[i].MemoryUsedBytes = &v
 		}
 	}
+}
+
+// busyPortState holds, per node, the host ports held by containers haco
+// doesn't manage, as the agent last reported them. In memory only: it
+// describes the node right now, and the next heartbeat refreshes it.
+type busyPortState struct {
+	mu     sync.Mutex
+	byNode map[string]map[int]string
+}
+
+// recordBusyPorts stores a node's report. nil means the agent didn't send
+// one (an older agent), which leaves what is known untouched.
+func (svc *Service) recordBusyPorts(node string, ports map[int]string) {
+	if ports == nil {
+		return
+	}
+	svc.busy.mu.Lock()
+	defer svc.busy.mu.Unlock()
+	if svc.busy.byNode == nil {
+		svc.busy.byNode = map[string]map[int]string{}
+	}
+	svc.busy.byNode[node] = ports
+}
+
+// listNodesForScheduling is ListNodes plus each node's reported busy ports,
+// so the scheduler skips a node whose port is already taken by something
+// outside haco.
+func (svc *Service) listNodesForScheduling(ctx context.Context) ([]model.Node, error) {
+	nodes, err := svc.store.ListNodes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	svc.busy.mu.Lock()
+	defer svc.busy.mu.Unlock()
+	for i := range nodes {
+		nodes[i].BusyPorts = svc.busy.byNode[nodes[i].ID]
+	}
+	return nodes, nil
 }

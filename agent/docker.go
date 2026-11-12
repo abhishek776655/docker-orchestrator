@@ -302,6 +302,39 @@ func (d *Docker) CachedImages(ctx context.Context) ([]string, error) {
 	return tags, nil
 }
 
+// BusyHostPorts lists the host ports published by running containers that
+// haco did not start, mapped to the container holding each. haco's own
+// containers are left out: the scheduler already reserves their ports, and a
+// redeploy replaces them.
+func (d *Docker) BusyHostPorts(ctx context.Context) (map[int]string, error) {
+	list, err := d.cli.ContainerList(ctx, types.ContainerListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("list containers: %w", err)
+	}
+	return busyPortsFrom(list), nil
+}
+
+func busyPortsFrom(list []types.Container) map[int]string {
+	busy := map[int]string{}
+	for _, c := range list {
+		if _, ours := c.Labels[keyLabel]; ours {
+			continue
+		}
+		name := strings.TrimPrefix(c.ID, "")
+		if len(c.Names) > 0 {
+			name = "container " + strings.TrimPrefix(c.Names[0], "/")
+		} else if len(name) > 12 {
+			name = "container " + name[:12]
+		}
+		for _, p := range c.Ports {
+			if p.PublicPort != 0 {
+				busy[int(p.PublicPort)] = name
+			}
+		}
+	}
+	return busy
+}
+
 // RemoveImage deletes one image reference. Docker refuses an image that a
 // container still uses; that is left as an error rather than forced.
 func (d *Docker) RemoveImage(ctx context.Context, ref string) error {

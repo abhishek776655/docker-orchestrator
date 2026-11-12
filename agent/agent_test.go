@@ -24,6 +24,8 @@ func TestRegisterReportsDockerDaemonArchitecture(t *testing.T) {
 			body = `{"NCPU":2,"MemTotal":1024,"Architecture":"aarch64"}`
 		case strings.HasSuffix(req.URL.Path, "/images/json"):
 			body = `[]`
+		case strings.HasSuffix(req.URL.Path, "/containers/json"):
+			body = `[{"Id":"abc123","Names":["/other-rabbit"],"Ports":[{"PublicPort":5672,"Type":"tcp"}]}]`
 		case req.URL.Path == "/v1/nodes":
 			data, err := io.ReadAll(req.Body)
 			if err != nil {
@@ -52,6 +54,10 @@ func TestRegisterReportsDockerDaemonArchitecture(t *testing.T) {
 	}
 	if got := registered["architecture"]; got != "arm64" {
 		t.Fatalf("registered architecture = %v, want arm64", got)
+	}
+	busy, _ := registered["busy_ports"].(map[string]any)
+	if busy["5672"] != "container other-rabbit" {
+		t.Fatalf("registered busy_ports = %v, want 5672 held by container other-rabbit", registered["busy_ports"])
 	}
 }
 

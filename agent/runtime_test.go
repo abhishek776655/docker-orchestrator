@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 
 	"github.com/abhishek/hardware-aware-container-orchestrator/model"
@@ -66,5 +67,16 @@ func TestPrepareVolumesMountsDockerSocketWithoutCheckingIt(t *testing.T) {
 	}
 	if len(binds) != 1 || binds[0] != missing+":/var/run/docker.sock" {
 		t.Fatalf("binds = %v", binds)
+	}
+}
+
+func TestBusyPortsSkipsHacoContainersAndNamesTheHolder(t *testing.T) {
+	list := []types.Container{
+		{ID: "aaa", Names: []string{"/dockerize-localhost-rabbitmq-1"}, Ports: []types.Port{{PublicPort: 5672, Type: "tcp"}, {PublicPort: 5672, Type: "tcp"}, {PrivatePort: 9999}}},
+		{ID: "bbb", Names: []string{"/haco-demo-api"}, Labels: map[string]string{keyLabel: "demo/api/latest"}, Ports: []types.Port{{PublicPort: 8080}}},
+	}
+	got := busyPortsFrom(list)
+	if len(got) != 1 || got[5672] != "container dockerize-localhost-rabbitmq-1" {
+		t.Fatalf("busy = %v, want only 5672 held by the foreign container", got)
 	}
 }

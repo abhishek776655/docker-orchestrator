@@ -140,7 +140,16 @@ func (s *Scheduler) Schedule(w model.Workload) (*model.Decision, error) {
 	}
 
 	if len(eligible) == 0 {
-		return decision, fmt.Errorf("no eligible node for workload %s", w.Key())
+		// Name why each node was ruled out: "no eligible node" alone leaves
+		// the user guessing which constraint, capacity or node state it was.
+		reasons := make([]string, 0, len(decision.Rejections))
+		for _, r := range decision.Rejections {
+			reasons = append(reasons, r.NodeID+": "+r.Reason)
+		}
+		if len(reasons) == 0 {
+			return decision, fmt.Errorf("no eligible node for workload %s: the cluster has no nodes", w.Key())
+		}
+		return decision, fmt.Errorf("no eligible node for workload %s: %s", w.Key(), strings.Join(reasons, "; "))
 	}
 
 	for _, ns := range eligible {
@@ -210,6 +219,9 @@ func (s *Scheduler) reject(ns *nodeState, w model.Workload) (string, bool) {
 	for _, p := range w.Constraints.HostPorts {
 		if holder, taken := ns.usedPorts[p]; taken {
 			return portTakenReason(p, holder, w), true
+		}
+		if holder, busy := n.BusyPorts[p]; busy {
+			return fmt.Sprintf("host port %d is in use on this node by %s (not managed by haco)", p, holder), true
 		}
 	}
 

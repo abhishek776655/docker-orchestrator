@@ -199,6 +199,7 @@ type registerNodeRequest struct {
 	GPUs         []model.GPU       `json:"gpus"`
 	Thermal      model.Thermal     `json:"thermal"`
 	CachedImages []string          `json:"cached_images"`
+	BusyPorts    map[int]string    `json:"busy_ports"`
 }
 
 func (svc *Service) handleRegisterNode(w http.ResponseWriter, r *http.Request) {
@@ -222,6 +223,7 @@ func (svc *Service) handleRegisterNode(w http.ResponseWriter, r *http.Request) {
 		Thermal:      req.Thermal,
 		CachedImages: req.CachedImages,
 	}
+	svc.recordBusyPorts(n.ID, req.BusyPorts)
 	if err := svc.RegisterNode(r.Context(), n); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -233,6 +235,7 @@ type heartbeatRequest struct {
 	Thermal         model.Thermal    `json:"thermal"`
 	CachedImages    []string         `json:"cached_images"`
 	ContainerMemory map[string]int64 `json:"container_memory"`
+	BusyPorts       map[int]string   `json:"busy_ports"`
 }
 
 func (svc *Service) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
@@ -246,6 +249,7 @@ func (svc *Service) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	if authenticated := authenticatedNode(r); authenticated == "" || authenticated == id {
 		svc.recordMemory(id, req.ContainerMemory)
+		svc.recordBusyPorts(id, req.BusyPorts)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }

@@ -44,7 +44,7 @@ func (svc *Service) reconcileOnce(ctx context.Context, heartbeatTimeout time.Dur
 		return nil
 	}
 
-	nodes, err := svc.store.ListNodes(ctx)
+	nodes, err := svc.listNodesForScheduling(ctx)
 	if err != nil {
 		return err
 	}
