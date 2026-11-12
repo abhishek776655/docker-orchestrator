@@ -3,6 +3,7 @@ package dockerutil
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -79,7 +80,13 @@ func RunBuildx(ctx context.Context, o BuildxOptions) error {
 		if strings.Contains(tail, "unknown flag: --load") || strings.Contains(tail, "'buildx' is not a docker command") || strings.Contains(tail, "unknown command: docker buildx") {
 			return fmt.Errorf("build %s: this node's docker has no buildx plugin; install docker-buildx-plugin (Docker Desktop includes it)\n%s", o.Tag, tail)
 		}
+		if hint := ExplainBuildFailure(tail); hint != "" {
+			return fmt.Errorf("build %s: %w\n%s\n--- last build output ---\n%s", o.Tag, err, hint, tail)
+		}
 		return fmt.Errorf("build %s: %w\n--- last build output ---\n%s", o.Tag, err, tail)
+	}
+	if err := PruneBuildCache(ctx, BuildCacheLimit()); err != nil {
+		log.Printf("%v", err)
 	}
 	return nil
 }
@@ -163,4 +170,65 @@ func sortedKeys[V any](m map[string]V) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// ExplainBuildFailure turns BuildKit's terse context errors into a plain
+// sentence saying what to check; "" when the output is not one it knows.
+func ExplainBuildFailure(tail string) string {
+	switch {
+	case strings.Contains(tail, "forbidden path outside the build context"):
+		return "hint: the Dockerfile refers to a path outside the build context (the `context:` folder); BuildKit forbids `..` paths. Move the file into the context, or make the context a parent folder."
+	case strings.Contains(tail, "failed to compute cache key") && strings.Contains(tail, "not found"),
+		strings.Contains(tail, "failed to calculate checksum") && strings.Contains(tail, "not found"):
+		return "hint: a file the Dockerfile copies is not in the build context. Check the path, and check .dockerignore: an ignored file is not sent to the build (the Dockerfile itself is always sent)."
+	case strings.Contains(tail, "failed to read dockerfile"):
+		return "hint: BuildKit could not read the Dockerfile; check `build.dockerfile` and that .dockerignore does not exclude it."
+	}
+	return ""
+}
+
+// HasBuildx reports whether `docker buildx` works on this machine.
+func HasBuildx(ctx context.Context) bool {
+	bin, err := DockerCLI()
+	if err != nil {
+		return false
+	}
+	return exec.CommandContext(ctx, bin, "buildx", "version").Run() == nil
+}
+
+// DefaultBuildCacheLimit is how much BuildKit cache a node keeps.
+const DefaultBuildCacheLimit = "10GB"
+
+// BuildCacheLimit is the node's cache cap: HACO_BUILD_CACHE_LIMIT (for
+// example "20GB"), the default when unset, and "" (no pruning) for "0".
+func BuildCacheLimit() string {
+	v := strings.TrimSpace(os.Getenv("HACO_BUILD_CACHE_LIMIT"))
+	switch v {
+	case "":
+		return DefaultBuildCacheLimit
+	case "0", "off", "none":
+		return ""
+	}
+	return v
+}
+
+// PruneBuildCache trims BuildKit's cache to limit, oldest entries first, so
+// repeated builds don't fill the disk. Best effort: the caller logs errors.
+func PruneBuildCache(ctx context.Context, limit string) error {
+	if limit == "" {
+		return nil
+	}
+	bin, err := DockerCLI()
+	if err != nil {
+		return err
+	}
+	out, err := exec.CommandContext(ctx, bin, "buildx", "prune", "--force", "--max-used-space", limit).CombinedOutput()
+	if err != nil && strings.Contains(string(out), "unknown flag: --max-used-space") {
+		// buildx before 0.17 spells it --keep-storage.
+		out, err = exec.CommandContext(ctx, bin, "buildx", "prune", "--force", "--keep-storage", limit).CombinedOutput()
+	}
+	if err != nil {
+		return fmt.Errorf("prune build cache: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }

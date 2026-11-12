@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -416,6 +417,7 @@ func (svc *Service) resolveBuilds(ctx context.Context, project string, plan *com
 			// its ID can never match the image already on the node.
 			spec.BuildID += "-nocache-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 		}
+		requireCapability(plan, b.Service, "buildx")
 		images[b.Service] = fmt.Sprintf("%s-%s:%s", project, b.Service, wl.Revision)
 		remote[b.Service] = spec
 		svc.stashBuildContext(wl.Key(), data)
@@ -429,6 +431,16 @@ func (svc *Service) resolveBuilds(ctx context.Context, project string, plan *com
 		svc.stashBuildSSH(wl.Key(), stash)
 	}
 	return images, remote, nil
+}
+
+// requireCapability restricts a service to nodes reporting capability, so a
+// build that needs buildx is never placed on a node without it.
+func requireCapability(plan *compose.Plan, service, capability string) {
+	for i := range plan.Workloads {
+		if plan.Workloads[i].Service == service && !slices.Contains(plan.Workloads[i].Constraints.RequiredCapabilities, capability) {
+			plan.Workloads[i].Constraints.RequiredCapabilities = append(plan.Workloads[i].Constraints.RequiredCapabilities, capability)
+		}
+	}
 }
 
 // requireArchitecture restricts a service to nodes able to run arch.

@@ -26,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/abhishek/hardware-aware-container-orchestrator/dockerutil"
 	"github.com/abhishek/hardware-aware-container-orchestrator/model"
 	"github.com/abhishek/hardware-aware-container-orchestrator/store"
 )
@@ -396,7 +397,7 @@ func (a *Agent) register(ctx context.Context) error {
 		"address":       a.cfg.Address,
 		"architecture":  architecture,
 		"labels":        a.cfg.nodeLabels(),
-		"capabilities":  map[string]bool{},
+		"capabilities":  map[string]bool{"buildx": dockerutil.HasBuildx(ctx)},
 		"cpu_millis":    capacity.CPUMillis,
 		"memory_bytes":  capacity.MemoryBytes,
 		"gpus":          collectGPUs(ctx),

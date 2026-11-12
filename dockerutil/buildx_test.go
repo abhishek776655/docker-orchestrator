@@ -58,3 +58,33 @@ func TestTailBufferKeepsLastLines(t *testing.T) {
 		t.Fatalf("tail = %q", got)
 	}
 }
+
+func TestExplainBuildFailure(t *testing.T) {
+	cases := map[string]string{
+		`failed to compute cache key: "/app.py" not found: not found`:               ".dockerignore",
+		`ERROR: failed to solve: forbidden path outside the build context: ../x ()`: "outside the build context",
+		`failed to read dockerfile: open Dockerfile: no such file or directory`:     "Dockerfile",
+		`process "/bin/sh -c make" did not complete successfully: exit code: 2`:     "",
+	}
+	for tail, want := range cases {
+		got := ExplainBuildFailure(tail)
+		if want == "" && got != "" || want != "" && !strings.Contains(got, want) {
+			t.Errorf("ExplainBuildFailure(%q) = %q, want mention of %q", tail, got, want)
+		}
+	}
+}
+
+func TestBuildCacheLimit(t *testing.T) {
+	t.Setenv("HACO_BUILD_CACHE_LIMIT", "")
+	if got := BuildCacheLimit(); got != DefaultBuildCacheLimit {
+		t.Fatalf("default = %q", got)
+	}
+	t.Setenv("HACO_BUILD_CACHE_LIMIT", "20GB")
+	if got := BuildCacheLimit(); got != "20GB" {
+		t.Fatalf("got %q", got)
+	}
+	t.Setenv("HACO_BUILD_CACHE_LIMIT", "0")
+	if got := BuildCacheLimit(); got != "" {
+		t.Fatalf("0 should disable pruning, got %q", got)
+	}
+}
