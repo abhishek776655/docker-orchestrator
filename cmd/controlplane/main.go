@@ -144,7 +144,7 @@ func main() {
 	fmt.Printf("One-time agent join command (expires in 10 minutes): haco agent join '%s'\n", encoded)
 
 	if envOr("HACO_AUTO_JOIN_HOST", "true") != "false" {
-		go runHostAgent(ctx, joinManager, advertiseHost, dataDir)
+		go runHostAgent(ctx, joinManager, advertiseHost, fmt.Sprintf("https://%s", net.JoinHostPort(advertiseHost, fmt.Sprint(port))), dataDir)
 	}
 
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -158,7 +158,7 @@ func main() {
 // fatal — since running a control plane with no local Docker workload is
 // an explicitly supported mode (HACO_AUTO_JOIN_HOST=false opts out, or a
 // missing Docker daemon here just skips it).
-func runHostAgent(ctx context.Context, jm *controlplane.JoinManager, advertiseHost, dataDir string) {
+func runHostAgent(ctx context.Context, jm *controlplane.JoinManager, advertiseHost, endpoint, dataDir string) {
 	nodeID := agent.HostNodeID()
 	credentialPath := filepath.Join(dataDir, "agent-credentials", nodeID+".json")
 
@@ -183,6 +183,15 @@ func runHostAgent(ctx context.Context, jm *controlplane.JoinManager, advertiseHo
 	}
 	cfg.Role = "host"
 	cfg.CredentialPath = credentialPath
+	// The host agent talks to the control plane in this same process, so it
+	// always uses the address that process is serving on now. The endpoint
+	// saved in its credential file goes stale when this machine's IP changes
+	// (DHCP, a different network) and would otherwise leave it dialing an
+	// address nothing answers on.
+	if cfg.ControlPlaneURL != endpoint {
+		log.Printf("host agent: using %s (saved credential says %s)", endpoint, cfg.ControlPlaneURL)
+		cfg.ControlPlaneURL = endpoint
+	}
 
 	docker, err := agent.NewDocker(nodeID, filepath.Join(dataDir, "volumes", nodeID))
 	if err != nil {
@@ -196,7 +205,7 @@ func runHostAgent(ctx context.Context, jm *controlplane.JoinManager, advertiseHo
 		// After a rename the saved node-id file already holds the new ID,
 		// so starting over picks up the renamed credential and data folder.
 		log.Printf("host agent: %v", re)
-		runHostAgent(ctx, jm, advertiseHost, dataDir)
+		runHostAgent(ctx, jm, advertiseHost, endpoint, dataDir)
 		return
 	}
 	if err != nil && ctx.Err() == nil {

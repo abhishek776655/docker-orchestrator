@@ -1631,10 +1631,63 @@ func rm(baseURL string, args []string) error {
 
 // cluster holds the cluster-wide operations.
 func cluster(baseURL string, args []string) error {
-	if len(args) == 0 || args[0] != "reset" {
-		return fmt.Errorf("usage: haco cluster reset [--yes]")
+	if len(args) > 0 {
+		switch args[0] {
+		case "reset":
+			return teardown(baseURL, args[1:])
+		case "refresh":
+			return refreshCluster(baseURL, args[1:], defaultCredentialDir(), stopControlPlane)
+		}
 	}
-	return teardown(baseURL, args[1:])
+	return fmt.Errorf("usage: haco cluster reset|refresh [--yes]")
+}
+
+func defaultCredentialDir() string {
+	return filepath.Join(envOr("HACO_DATA_DIR", filepath.Join(homeDir(), ".haco")), "agent-credentials")
+}
+
+// refreshCluster (haco cluster refresh) recovers from this machine's IP
+// address changing. Every node's saved credential holds the control plane's
+// old address, so all of them are revoked (workers must join again with a
+// fresh token), this machine's own saved credential is removed so the next
+// `haco start` re-joins it at the new address, and the control plane is
+// stopped so that start re-detects the address. Services are not stopped.
+func refreshCluster(baseURL string, args []string, credentialDir string, stop func([]string) error) error {
+	yes := false
+	for _, a := range args {
+		if a == "--yes" || a == "-y" {
+			yes = true
+		}
+	}
+	if !yes && !confirm("This revokes EVERY node's credential, this machine's too, and stops the control plane. Other nodes must join again. Services keep running. Continue?") {
+		return fmt.Errorf("cluster refresh aborted")
+	}
+	var nodeList []nodeView
+	if err := fetchJSON(baseURL, "/v1/nodes", &nodeList); err != nil {
+		return fmt.Errorf("list nodes: %w", err)
+	}
+	own := agent.HostNodeID()
+	failed := 0
+	for _, n := range nodeList {
+		if err := postQuiet(baseURL, "/v1/admin/nodes/"+neturl.PathEscape(n.ID)+"/revoke", []byte(`{}`)); err != nil {
+			fmt.Printf("revoke %s: %v\n", n.ID, err)
+			failed++
+			continue
+		}
+		fmt.Printf("revoked %s\n", n.ID)
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d node(s) could not be revoked; nothing else was changed, fix that and run it again", failed)
+	}
+	if err := os.Remove(filepath.Join(credentialDir, own+".json")); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove this machine's saved credential: %w", err)
+	}
+	if err := stop(nil); err != nil {
+		fmt.Printf("could not stop the control plane (%v); stop it yourself\n", err)
+	}
+	fmt.Println("\nNext: run `haco start` on this machine. It prints a join command with a fresh token; run that")
+	fmt.Println("(`haco agent join '<token>'`) on every other node, then `haco agent run`.")
+	return nil
 }
 
 func logs(baseURL string, args []string) error {

@@ -8,9 +8,13 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/abhishek/hardware-aware-container-orchestrator/agent"
 )
 
 func TestParseComposeArgs(t *testing.T) {
@@ -297,5 +301,47 @@ func TestProjectCommandsRejectBadInput(t *testing.T) {
 	}
 	if got := f.calls(); len(got) != 0 {
 		t.Errorf("bad input must not change anything, but sent %v", got)
+	}
+}
+
+func TestClusterRefreshRevokesEveryNodeAndDropsHostCredential(t *testing.T) {
+	own := agent.HostNodeID()
+	var mu sync.Mutex
+	var revoked []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/nodes":
+			fmt.Fprintf(w, `[{"id":%q},{"id":"worker-1"}]`, own)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/revoke"):
+			mu.Lock()
+			revoked = append(revoked, strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/admin/nodes/"), "/revoke"))
+			mu.Unlock()
+			fmt.Fprint(w, `{}`)
+		default:
+			fmt.Fprint(w, `{}`)
+		}
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	hostCred := filepath.Join(dir, own+".json")
+	if err := os.WriteFile(hostCred, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stopped := false
+	if err := refreshCluster(server.URL, []string{"--yes"}, dir, func([]string) error { stopped = true; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(revoked)
+	want := []string{"worker-1", own}
+	sort.Strings(want)
+	if !slices.Equal(revoked, want) {
+		t.Fatalf("revoked %v, want %v (the host's own node too)", revoked, want)
+	}
+	if _, err := os.Stat(hostCred); !os.IsNotExist(err) {
+		t.Fatalf("host credential file should be removed, stat err = %v", err)
+	}
+	if !stopped {
+		t.Fatal("control plane should be stopped so `haco start` re-detects the address")
 	}
 }

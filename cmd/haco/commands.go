@@ -210,11 +210,15 @@ the control plane. 'haco start' and 'haco agent run' bring the same services bac
 		},
 		{
 			name: "cluster", group: groupCluster,
-			summary: "cluster-wide operations (cluster reset)",
-			detail: `Usage: haco cluster reset [--yes]
+			summary: "cluster-wide operations (cluster reset, cluster refresh)",
+			detail: `Usage: haco cluster reset|refresh [--yes]
 
   reset                   stop every service and revoke every node's credential (this machine's own
                           node is kept): the 'start completely clean again' command
+  refresh                 use after this machine's IP changed: revoke every node (this machine's
+                          too), drop its saved credential and stop the control plane. Services keep
+                          running. 'haco start' then re-joins this machine at its new address; every
+                          other node joins again with a fresh token
 
   -y, --yes               skip the question`,
 			run: cluster,
