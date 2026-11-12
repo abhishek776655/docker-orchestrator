@@ -406,6 +406,10 @@ func (svc *Service) resolveBuilds(ctx context.Context, project string, plan *com
 			spec.SSHIDs = append(spec.SSHIDs, id)
 		}
 		sort.Strings(spec.SSHIDs)
+		for id := range b.Secrets {
+			spec.SecretIDs = append(spec.SecretIDs, id)
+		}
+		sort.Strings(spec.SecretIDs)
 		spec.BuildID = buildID(spec, data)
 		if noCache {
 			// A no-cache deploy must rebuild even when nothing changed, so
@@ -415,7 +419,14 @@ func (svc *Service) resolveBuilds(ctx context.Context, project string, plan *com
 		images[b.Service] = fmt.Sprintf("%s-%s:%s", project, b.Service, wl.Revision)
 		remote[b.Service] = spec
 		svc.stashBuildContext(wl.Key(), data)
-		svc.stashBuildSSH(wl.Key(), sshKeys)
+		stash := map[string][]byte{}
+		for id, k := range sshKeys {
+			stash[id] = k
+		}
+		for id, v := range b.Secrets {
+			stash["secret:"+id] = v
+		}
+		svc.stashBuildSSH(wl.Key(), stash)
 	}
 	return images, remote, nil
 }
@@ -474,6 +485,9 @@ func buildID(spec *model.RemoteBuildSpec, context []byte) string {
 	}
 	for _, id := range spec.SSHIDs {
 		fmt.Fprintf(h, "ssh %s\n", id)
+	}
+	for _, id := range spec.SecretIDs {
+		fmt.Fprintf(h, "secret %s\n", id)
 	}
 	h.Write(context)
 	return hex.EncodeToString(h.Sum(nil))[:20]

@@ -674,8 +674,8 @@ func (a *Agent) buildRemote(ctx context.Context, rec store.WorkloadRecord) error
 	if resp.StatusCode >= 300 {
 		return fmt.Errorf("fetch build context: control plane returned %s: %s", resp.Status, string(tarball))
 	}
-	if len(rec.RemoteBuild.SSHIDs) == 0 {
-		return a.docker.BuildImage(ctx, bytes.NewReader(tarball), rec.Image, *rec.RemoteBuild)
+	if len(rec.RemoteBuild.SSHIDs) == 0 && len(rec.RemoteBuild.SecretIDs) == 0 {
+		return a.docker.BuildImage(ctx, bytes.NewReader(tarball), rec.Image, *rec.RemoteBuild, nil, nil)
 	}
 	sshPath := fmt.Sprintf("/v1/agent/%s/build-ssh/%s/%s/%s", a.cfg.NodeID, rec.Project, rec.Service, rec.Revision)
 	sshReq, err := http.NewRequestWithContext(ctx, http.MethodGet, a.cfg.ControlPlaneURL+sshPath, nil)
@@ -689,12 +689,25 @@ func (a *Agent) buildRemote(ctx context.Context, rec store.WorkloadRecord) error
 	if sshResp.StatusCode >= 300 {
 		return fmt.Errorf("fetch build ssh keys: control plane returned %s: %s", sshResp.Status, string(body))
 	}
-	var keys map[string]string
-	if err := json.Unmarshal(body, &keys); err != nil {
+	var files map[string]string
+	if err := json.Unmarshal(body, &files); err != nil {
 		return fmt.Errorf("decode build ssh keys: %w", err)
 	}
-	return a.docker.BuildImageWithSSH(ctx, bytes.NewReader(tarball), rec.Image, *rec.RemoteBuild, keys)
+	// One endpoint carries both: secret values are keyed "secret:<id>".
+	keys, secrets := map[string][]byte{}, map[string][]byte{}
+	for k, v := range files {
+		if id, ok := strings.CutPrefix(k, buildSecretPrefix); ok {
+			secrets[id] = []byte(v)
+		} else {
+			keys[k] = []byte(v)
+		}
+	}
+	return a.docker.BuildImage(ctx, bytes.NewReader(tarball), rec.Image, *rec.RemoteBuild, keys, secrets)
 }
+
+// buildSecretPrefix marks a build secret in the build-ssh endpoint's reply,
+// which started out carrying only ssh keys.
+const buildSecretPrefix = "secret:"
 
 // needsRemoteBuild reports whether this node must (re)build a RemoteBuild
 // image: when it's missing, or when the local copy was built from

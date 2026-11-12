@@ -47,6 +47,9 @@ type BuildSpec struct {
 	// SSH maps each build.ssh ID to its host key path; "" means the
 	// compose `default` entry.
 	SSH map[string]string
+	// Secrets holds each build.secrets entry's content by ID. Kept in memory
+	// only: never serialized, so it can't leak into a printed plan.
+	Secrets map[string][]byte `json:"-"`
 }
 
 // Plan is the importer's output: a dry-run deployment plan (SRS UC-02,
@@ -330,7 +333,24 @@ func convertService(project, workingDir, name string, svc types.ServiceConfig, b
 			}
 		}
 		if len(svc.Build.Secrets) > 0 {
-			warnings = append(warnings, fmt.Sprintf("%s: build.secrets are declared but BuildKit secret mounts are not implemented yet; the build will fail for anything requiring them (SRS §11, §18.1)", name))
+			build.Secrets = map[string][]byte{}
+			for _, s := range svc.Build.Secrets {
+				obj, ok := objs.secrets[s.Source]
+				if !ok {
+					rejections = append(rejections, fmt.Sprintf("%s: build secret %q is not defined at the top level", name, s.Source))
+					continue
+				}
+				data, err := fileObjectContent(types.FileObjectConfig(obj), objs.env)
+				if err != nil {
+					rejections = append(rejections, fmt.Sprintf("%s: build secret %q: %v", name, s.Source, err))
+					continue
+				}
+				id := s.Source
+				if s.Target != "" {
+					id = s.Target
+				}
+				build.Secrets[id] = data
+			}
 		}
 		// Caught here rather than left to surface mid-deploy: a missing
 		// build context (typo'd path, directory never committed, wrong

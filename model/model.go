@@ -123,6 +123,9 @@ type RemoteBuildSpec struct {
 	// needs. Only the IDs live here: the key material is held in control-
 	// plane memory and fetched over the build-ssh endpoint, never persisted.
 	SSHIDs []string `json:"ssh_ids,omitempty"`
+	// SecretIDs names the BuildKit secret mounts (RUN --mount=type=secret)
+	// this build needs; values are delivered like the SSH keys.
+	SecretIDs []string `json:"secret_ids,omitempty"`
 }
 
 // StoragePolicy pins a workload to a node when it owns node-local

@@ -20,13 +20,14 @@ import (
 	"github.com/moby/patternmatcher"
 	"github.com/moby/patternmatcher/ignorefile"
 
+	"github.com/abhishek/hardware-aware-container-orchestrator/agent"
 	"github.com/abhishek/hardware-aware-container-orchestrator/compose"
+	"github.com/abhishek/hardware-aware-container-orchestrator/dockerutil"
 )
 
-// Service builds images and pushes them to a registry. It uses a plain
-// Docker Engine API build, not full BuildKit, which is why
-// compose.BuildSpec's SSH/secret mounts are not honored yet (flagged as a
-// warning by the importer, not silently dropped).
+// Service builds images and pushes them to a registry. Builds run through
+// `docker buildx build` (BuildKit), so Dockerfiles can use cache and secret
+// mounts, COPY --link and heredocs.
 type Service struct {
 	cli      *client.Client
 	registry string // e.g. "localhost:5050"
@@ -63,27 +64,29 @@ func (s *Service) Build(ctx context.Context, project, revision string, spec comp
 		ref = fmt.Sprintf("%s/%s", s.registry, ref)
 	}
 
-	buildArgs := map[string]*string{}
-	for k, v := range spec.Args {
-		v := v
-		buildArgs[k] = &v
+	tmp, err := os.MkdirTemp("", "haco-build-")
+	if err != nil {
+		return "", err
 	}
-
-	resp, err := s.cli.ImageBuild(ctx, tarball, types.ImageBuildOptions{
+	defer os.RemoveAll(tmp)
+	contextDir := filepath.Join(tmp, "context")
+	if err := agent.ExtractTar(contextDir, tarball); err != nil {
+		return "", fmt.Errorf("unpack build context: %w", err)
+	}
+	_, secretPaths, err := dockerutil.WriteBuildFiles(filepath.Join(tmp, "secrets"), nil, spec.Secrets)
+	if err != nil {
+		return "", err
+	}
+	if err := dockerutil.RunBuildx(ctx, dockerutil.BuildxOptions{
+		ContextDir: contextDir,
 		Dockerfile: spec.Dockerfile,
-		BuildArgs:  buildArgs,
-		Tags:       []string{ref},
-		Remove:     true,
-		PullParent: true,
+		Tag:        ref,
 		Platform:   spec.Platform,
 		NoCache:    noCache,
-	})
-	if err != nil {
+		Args:       spec.Args,
+		Secrets:    secretPaths,
+	}); err != nil {
 		return "", fmt.Errorf("build %s: %w", spec.Service, err)
-	}
-	defer resp.Body.Close()
-	if err := consumeDockerStream(resp.Body, "build "+spec.Service); err != nil {
-		return "", err
 	}
 
 	built, _, err := s.cli.ImageInspectWithRaw(ctx, ref)
