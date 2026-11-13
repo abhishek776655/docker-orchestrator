@@ -106,6 +106,9 @@ export interface ComposeRequest {
   fresh: boolean
   // Services whose pin_nodes node must be used even if the scheduler rejects it.
   force?: string[]
+  // Services in this deploy only as dependencies of something new: any that
+  // is already running is left exactly as it is (not submitted again).
+  keep_running?: string[]
 }
 
 export interface PlanWorkload {
@@ -140,6 +143,8 @@ export interface ScoreFactors {
   MemoryFit: number
   ThermalFit: number
   CacheFit: number
+  /** Fewer services per core already on the node scores higher; absent from an older control plane. */
+  SpreadFit?: number
   Total: number
 }
 
@@ -287,6 +292,16 @@ export const api = {
     const path = [project, service, revision].map(encodeURIComponent).join('/')
     const res = await postJson(`/v1/workloads/${path}/${action}`, {})
     if (!res.ok) throw await errorFrom(res)
+  },
+  // Runs a service on another node and restarts what depends on it so those
+  // services get its new address. force places it even if the scheduler
+  // rejects the node; acceptEmptyVolume is needed for a service with a
+  // node-local volume (the data stays on the old node).
+  moveWorkload: async (project: string, service: string, revision: string, body: { node: string; force: boolean; acceptEmptyVolume: boolean }): Promise<{ from: string; to: string; restarted: string[] }> => {
+    const path = [project, service, revision].map(encodeURIComponent).join('/')
+    const res = await postJson(`/v1/workloads/${path}/move`, { node: body.node, force: body.force, accept_empty_volume: body.acceptEmptyVolume })
+    if (!res.ok) throw await errorFrom(res)
+    return (await res.json()) as { from: string; to: string; restarted: string[] }
   },
   // Folders on the control-plane machine, for the project-folder picker.
   listDirs: async (path: string): Promise<DirListing> => {

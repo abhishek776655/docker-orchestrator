@@ -2,11 +2,15 @@ import { useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ConfirmDialog } from '@/components/confirm-dialog'
-import { SplitButton } from '@/components/split-button'
 import { summarizeCompose } from '@/lib/compose-summary'
 import { defaultConfig } from '@/lib/deploy-config'
 import { buildRequest } from '@/lib/plan'
+import { loadComposeSource } from '@/lib/compose-source'
 import { VolumeRiskDialog } from '@/components/deploy/volume-risk-dialog'
+import { AddServiceDialog } from '@/components/project/add-service-dialog'
+import { RemoveServiceDialog } from '@/components/project/remove-service-dialog'
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
+import { ChevronDown } from 'lucide-react'
 import { keepVolumePlacements, volumeRisks, type VolumeRisk } from '@/lib/volume-risk'
 import { DependencyGraph } from '@/components/deploy/dependency-graph'
 import { Badge } from '@/components/ui/badge'
@@ -37,8 +41,10 @@ export function ProjectPage() {
 
   const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const [confirm, setConfirm] = useState<'stop' | 'remove' | 'redeploy' | 'fresh' | 'start' | 'restart' | null>(null)
+  const [confirm, setConfirm] = useState<'stop' | 'remove' | 'redeploy' | 'fresh' | 'start' | 'restart' | 'rebuild' | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  const [adding, setAdding] = useState(false)
+  const [removingServices, setRemovingServices] = useState(false)
   const done = (message: string) => {
     setConfirm(null)
     setNotice(message)
@@ -55,12 +61,13 @@ export function ProjectPage() {
   const redeploy = useMutation({
     mutationFn: async (input: RedeployInput): Promise<VolumeRisk[]> => {
       const saved = loadDeploy(name)
-      if (!saved) throw new Error('No saved Compose file for this project. Use Edit configuration to upload it.')
-      const parsed = summarizeCompose(saved.file.text)
+      const source = await loadComposeSource(name)
+      if (!saved || !source) throw new Error('No saved Compose file for this project. Use Edit configuration to upload it.')
+      const parsed = summarizeCompose(source.text)
       if (!parsed.ok) throw new Error(parsed.error)
       const base = { ...defaultConfig(parsed.summary), ...saved.config }
       const config = { ...base, fresh: input.fresh, placements: { ...(input.fresh ? {} : base.placements), ...input.pins } }
-      const req = buildRequest(saved.file.text, config, true)
+      const req = buildRequest(source.text, config, true)
       if (!input.force) {
         const [planned, current] = await Promise.all([api.composePlan(req), api.workloads()])
         const list = volumeRisks(planned, current)
@@ -78,6 +85,26 @@ export function ProjectPage() {
       setRisks(null)
       done(input.fresh ? 'Fresh redeploy submitted. Services are being placed again.' : 'Redeploy submitted. Services update on the nodes they run on.')
     },
+  })
+  // Rebuild every image in place: read the Compose file from disk, build
+  // without the cache and recreate those containers on the nodes they run on.
+  // Every deployed service is pinned to its current node, so nothing moves.
+  const rebuild = useMutation({
+    mutationFn: async () => {
+      const saved = loadDeploy(name)
+      const source = await loadComposeSource(name)
+      if (!saved || !source) throw new Error('No saved Compose file for this project. Use Edit configuration to upload it.')
+      const parsed = summarizeCompose(source.text)
+      if (!parsed.ok) throw new Error(parsed.error)
+      if (parsed.summary.builds === 0) throw new Error('No service in the Compose file has a build: section, so there is nothing to rebuild.')
+      const here = (workloadsQ.data ?? []).filter((w) => w.Project === name)
+      const config = { ...defaultConfig(parsed.summary), ...saved.config, project: name, scope: 'all' as const, noCache: true, fresh: false, forced: [], placements: Object.fromEntries(here.map((w) => [w.Service, w.NodeID])) }
+      // Services with a prebuilt image have nothing to rebuild: leave them running as they are.
+      const prebuilt = parsed.summary.details.filter((d) => !d.build).map((d) => d.name)
+      await api.composeDeploy({ ...buildRequest(source.text, config, true), keep_running: prebuilt })
+      return parsed.summary.builds
+    },
+    onSuccess: (n) => done(`Rebuilding ${n} ${n === 1 ? 'service' : 'services'} without the cache. They restart where they run as each build finishes.`),
   })
   // Start or restart every matching service; one failure does not stop the rest.
   const bulk = useMutation({
@@ -174,31 +201,68 @@ export function ProjectPage() {
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            {stoppedCount > 0 ? (
-              <Button variant="outline" onClick={() => { bulk.reset(); setConfirm('start') }}>
-                Start {stoppedCount === project.services.length ? 'all' : stoppedCount}
+          <Button
+            disabled={!saved || redeploy.isPending}
+            title={saved ? 'Deploy the saved Compose file again, keeping services where they run' : 'No saved Compose file in this browser'}
+            onClick={() => { redeploy.reset(); setConfirm('redeploy') }}
+          >
+            {redeploy.isPending ? 'Redeploying…' : 'Redeploy'}
+          </Button>
+          <Button variant="outline" className="text-bad-fg" onClick={() => { remove.reset(); setConfirm('remove') }}>
+            Remove project
+          </Button>
+          <DropdownMenu modal={false}>
+            <DropdownMenuTrigger asChild>
+              <Button variant="outline" className="gap-1.5">
+                Actions
+                <ChevronDown className="size-4" aria-hidden="true" />
               </Button>
-            ) : (
-              <Button variant="outline" onClick={() => { bulk.reset(); setConfirm('restart') }}>
-                Restart all
-              </Button>
-            )}
-            <Button variant="outline" disabled={project.allStopped} onClick={() => { stopAll.reset(); setConfirm('stop') }}>
-              Stop all
-            </Button>
-            <Button asChild variant="outline">
-              <Link to={deployLink(project.name, 'edit')}>Edit configuration</Link>
-            </Button>
-            <SplitButton
-              label={redeploy.isPending ? 'Redeploying…' : 'Redeploy'}
-              disabled={!saved || redeploy.isPending}
-              title={saved ? 'Deploy the saved Compose file again, keeping services where they run' : 'No saved Compose file in this browser'}
-              onClick={() => { redeploy.reset(); setConfirm('redeploy') }}
-              options={[{ label: 'Redeploy fresh', description: 'Let the scheduler place every service again. Moved volumes start empty.', onSelect: () => { redeploy.reset(); setConfirm('fresh') } }]}
-            />
-            <Button variant="outline" className="text-bad-fg" onClick={() => { remove.reset(); setConfirm('remove') }}>
-              Remove
-            </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-80">
+              <DropdownMenuLabel>Run</DropdownMenuLabel>
+              {stoppedCount > 0 ? (
+                <DropdownMenuItem onSelect={() => { bulk.reset(); setConfirm('start') }}>
+                  <span className="font-medium">Start {stoppedCount === project.services.length ? 'all' : stoppedCount} stopped</span>
+                  <span className="text-[13px] text-muted-foreground">Each starts again on the node it last ran on</span>
+                </DropdownMenuItem>
+              ) : (
+                <DropdownMenuItem onSelect={() => { bulk.reset(); setConfirm('restart') }}>
+                  <span className="font-medium">Restart all</span>
+                  <span className="text-[13px] text-muted-foreground">Recreates every container where it runs</span>
+                </DropdownMenuItem>
+              )}
+              <DropdownMenuItem disabled={project.allStopped} onSelect={() => { stopAll.reset(); setConfirm('stop') }}>
+                <span className="font-medium">Stop all</span>
+                <span className="text-[13px] text-muted-foreground">Containers stop; Start brings them back</span>
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuLabel>Services</DropdownMenuLabel>
+              <DropdownMenuItem disabled={!saved} onSelect={() => setAdding(true)}>
+                <span className="font-medium">Add service…</span>
+                <span className="text-[13px] text-muted-foreground">{saved ? 'From the saved Compose file; the others are not touched' : 'Needs the saved Compose file'}</span>
+              </DropdownMenuItem>
+              <DropdownMenuItem danger onSelect={() => setRemovingServices(true)}>
+                <span className="font-medium">Remove service…</span>
+                <span className="text-[13px] text-muted-foreground">Also removes the services that depend on it</span>
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuLabel>Deploy</DropdownMenuLabel>
+              <DropdownMenuItem asChild>
+                <Link to={deployLink(project.name, 'edit')}>
+                  <span className="font-medium">Edit configuration</span>
+                  <span className="text-[13px] text-muted-foreground">Change the Compose file or settings, then plan</span>
+                </Link>
+              </DropdownMenuItem>
+              <DropdownMenuItem disabled={!saved || rebuild.isPending} onSelect={() => { rebuild.reset(); setConfirm('rebuild') }}>
+                <span className="font-medium">{rebuild.isPending ? 'Rebuilding…' : 'Rebuild images…'}</span>
+                <span className="text-[13px] text-muted-foreground">{saved ? 'Rebuild every build: service without the cache, where it runs' : 'Needs the saved Compose file'}</span>
+              </DropdownMenuItem>
+              <DropdownMenuItem disabled={!saved || redeploy.isPending} onSelect={() => { redeploy.reset(); setConfirm('fresh') }}>
+                <span className="font-medium">Redeploy fresh</span>
+                <span className="text-[13px] text-muted-foreground">Place every service again. Moved volumes start empty.</span>
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
           </div>
         </div>
       </div>
@@ -218,6 +282,24 @@ export function ProjectPage() {
         {confirm === 'fresh'
           ? 'Every service is placed again from scratch and may move to another node. A service with a volume that moves starts with an empty volume.'
           : `Deploys ${saved?.file.name ?? 'the saved Compose file'} again with its saved settings. Services stay on the nodes they run on; images build again as in any deploy.`}
+      </ConfirmDialog>
+      <AddServiceDialog
+        project={project.name}
+        saved={saved}
+        workloads={(workloadsQ.data ?? []).filter((w) => w.Project === project.name)}
+        open={adding}
+        onOpenChange={setAdding}
+        onAdded={(message) => { setAdding(false); setNotice(message) }}
+      />
+      <RemoveServiceDialog
+        project={project.name}
+        workloads={(workloadsQ.data ?? []).filter((w) => w.Project === project.name)}
+        open={removingServices}
+        onOpenChange={setRemovingServices}
+        onRemoved={(message) => { setRemovingServices(false); setNotice(message) }}
+      />
+      <ConfirmDialog open={confirm === 'rebuild'} onOpenChange={(o) => !o && setConfirm(null)} danger={false} title={`Rebuild ${project.name}?`} confirmLabel="Rebuild" pending={rebuild.isPending} error={rebuild.error?.message ?? null} onConfirm={() => rebuild.mutate()}>
+        Reads {saved?.file.name ?? 'the Compose file'} from the project folder again, rebuilds every service that has a build: section without the build cache, and recreates those containers on the nodes they already run on. Services with a prebuilt image are not touched. Each service is briefly down while its container is recreated.
       </ConfirmDialog>
       <VolumeRiskDialog
         risks={risks?.list ?? []}

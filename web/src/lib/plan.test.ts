@@ -6,23 +6,21 @@ import { buildRequest, candidateTags, derivePlan, liveState, nodesUsed, pinsFor,
 
 describe('candidate tags when comparing nodes', () => {
   // The case from the service page: the scheduler picks the EliteBook on a
-  // tie, mysql runs on the Mac where its data is.
+  // tie, but mysql runs on the Mac where its data is.
   const elite: Candidate = { node: 'elitebook', outcome: 'rejected', rejectedBy: 'volume', inUse: false, score: 0.93, detail: 'volume data is on mac', isPick: true }
-  const mac: Candidate = { node: 'mac', outcome: 'eligible', inUse: false, score: 0.93, detail: '', isPick: false }
+  const mac: Candidate = { node: 'mac', outcome: 'selected', inUse: true, score: 0.93, detail: 'Highest score', isPick: false }
   const refused: Candidate = { node: 'm1', outcome: 'rejected', rejectedBy: 'scheduler', inUse: false, detail: 'host port 3306 already reserved', isPick: false }
   const labels = (c: Candidate) => candidateTags(c, 'mac').map((t) => t.label)
 
-  it("never calls the scheduler's own pick rejected", () => {
-    expect(labels(elite)).toEqual(["scheduler's pick", 'would start empty'])
+  it('says only selected or rejected, with the scheduler pick noted when it was overridden', () => {
+    expect(labels(elite)).toEqual(['rejected', "scheduler's pick"])
+    expect(labels(refused)).toEqual(['rejected'])
   })
   it('marks where the service runs now', () => {
-    expect(labels(mac)).toEqual(['runs here now'])
+    expect(labels(mac)).toEqual(['selected', 'runs here now'])
   })
-  it('keeps real scheduler rejections distinct', () => {
-    expect(labels(refused)).toEqual(['rejected by scheduler'])
-  })
-  it('falls back to eligible', () => {
-    expect(candidateTags({ ...mac, node: 'other' }, 'mac').map((t) => t.label)).toEqual(['eligible'])
+  it('never labels a node eligible', () => {
+    expect(candidateTags({ ...mac, node: 'other', outcome: 'rejected', inUse: false }, 'mac').map((t) => t.label)).toEqual(['rejected'])
   })
   it('reports nodes tied with the pick, ignoring refused ones', () => {
     expect(tiedWithPick([elite, mac, { ...refused, score: 0.93 }])).toEqual(['mac'])
@@ -107,9 +105,35 @@ describe('pruneToScope', () => {
     expect(buildRequest(file, picked, false).only_service).toBe('api,dbt')
   })
 
-  it('drops services outside the chosen one and its dependencies', () => {
+  it('reduces services outside the chosen one to stubs, so a failing env file or health check cannot break the plan', () => {
     const out = parse(pruneToScope(file, { ...config, scope: 'one', onlyServices: ['api'] }))
-    expect(Object.keys(out.services)).toEqual(['db', 'api'])
+    expect(Object.keys(out.services)).toEqual(['db', 'api', 'dbt'])
+    expect(out.services.dbt).toEqual({ build: './dbt' })
+    expect(out.services.api.depends_on).toEqual(['db'])
+  })
+
+  it('keeps the bind mounts of the other services, because shared folders must still look shared', () => {
+    const shared = `services:
+  validation:
+    build: ./validation
+    volumes: ['./validation:/app', './creds:/creds']
+    env_file: ./validation/.env
+  metaapi:
+    build: ./metaapi
+    volumes: ['./creds:/creds']
+    env_file: ./metaapi/.env
+    healthcheck: { test: exit 0 }
+`
+    const out = parse(pruneToScope(shared, { ...config, scope: 'one', onlyServices: ['validation'] }))
+    expect(out.services.metaapi).toEqual({ build: './metaapi', volumes: ['./creds:/creds'] })
+  })
+
+  it('drops a service that has no image, build or volumes to keep', () => {
+    const odd = `services:
+  api: { image: api }
+  helper: { command: sleep 1 }
+`
+    expect(Object.keys(parse(pruneToScope(odd, { ...config, scope: 'one', onlyServices: ['api'] })).services)).toEqual(['api'])
   })
 
   it('leaves text it cannot read alone', () => {
@@ -118,7 +142,9 @@ describe('pruneToScope', () => {
 
   it('is what the request carries', () => {
     const r = buildRequest(file, { ...config, scope: 'one', onlyServices: ['db'] }, false)
-    expect(Object.keys(parse(r.yaml).services)).toEqual(['db'])
+    const sent = parse(r.yaml).services
+    expect(sent.db).toEqual({ image: 'pg' })
+    expect(sent.api).toEqual({ image: 'api' }) // a stub: no depends_on, nothing the plan could trip on
     expect(r.only_service).toBe('db')
   })
 })
@@ -145,21 +171,31 @@ describe('derivePlan', () => {
     expect(api.deps).toEqual([{ name: 'db', healthy: true }])
     expect(api.candidates.map((c) => [c.node, c.outcome, c.isPick])).toEqual([
       ['mbp-m3', 'selected', true],
-      ['gpu-box', 'eligible', false],
+      ['gpu-box', 'rejected', false],
       ['nuc-old', 'rejected', false],
     ])
   })
 
-  it('marks nodes away from a volume\'s data as rejected, and a chosen one as in use', () => {
+  it('selects the chosen node with a warning when its volume data is elsewhere, and rejects the rest with reasons', () => {
     const stateful: PlanResponse = { ...base, plan: { ...base.plan, workloads: [wl('db', { Storage: { Class: 'node_local_persistent', PinnedNodeID: '' } })] }, decisions: [dec('db', 'gpu-box', ['mbp-m3'])] }
     const now = [{ Project: 'shop', Service: 'db', Revision: 'latest', Image: 'x', Resources: { CPUMillis: 0, MemoryBytes: 0 }, DesiredState: 'running' as const, Status: 'ready', StatusReason: '', NodeID: 'mbp-m3' }]
     const db = derivePlan(stateful, null, config, now)[0]
     expect(db.candidates.map((c) => [c.node, c.outcome, c.inUse])).toEqual([
-      ['gpu-box', 'rejected', true],
-      ['mbp-m3', 'eligible', false],
+      ['gpu-box', 'selected', true],
+      ['mbp-m3', 'rejected', false],
       ['nuc-old', 'rejected', false],
     ])
-    expect(db.candidates[0].detail).toContain('volume data is on mbp-m3')
+    expect(db.candidates[0].warning).toContain('volume data is on mbp-m3')
+    expect(db.candidates[1].detail).toMatch(/Lower score than gpu-box|Same score as gpu-box|Scored higher/)
+    expect(db.candidates[2].rejectedBy).toBe('scheduler')
+  })
+
+  it('does not call a higher-scoring node lower when the user chose another', () => {
+    const moved: PlanResponse = { ...base, decisions: [dec('db', 'mbp-m3'), dec('api', 'gpu-box'), dec('web', 'mbp-m3')] }
+    const api = derivePlan(base, moved, config).find((r) => r.name === 'api')!
+    const pick = api.candidates.find((c) => c.isPick)!
+    expect(pick.outcome).toBe('rejected')
+    expect(pick.detail).not.toMatch(/^Lower score/)
   })
 
   it('shows the changed node as selected and keeps the scheduler pick marked', () => {

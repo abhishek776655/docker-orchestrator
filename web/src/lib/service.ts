@@ -141,6 +141,7 @@ const NOTE: Record<string, string> = {
   starting: 'Container created, waiting for it to run.',
   running: 'Process is up. The healthcheck has not passed yet.',
   ready: 'Healthcheck passes. Services waiting for this one can start.',
+  unreachable: 'Its node stopped responding. The control plane keeps trying and resumes it, and restarts the services that depend on it, when the node answers.',
   failed: 'The workload failed.',
   stopped: 'Stopped by an operator.',
 }

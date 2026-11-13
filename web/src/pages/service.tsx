@@ -2,6 +2,10 @@ import { useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ConfirmDialog } from '@/components/confirm-dialog'
+import { MoveDialog } from '@/components/service/move-dialog'
+import { dependentsOf } from '@/lib/remove-service'
+import { loadComposeSource } from '@/lib/compose-source'
+import { dependencyClosure } from '@/lib/deploy-config'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
@@ -48,8 +52,8 @@ function CandidateCard({ c, runsOn }: { c: Candidate; runsOn: string }) {
         </span>
         {c.score !== undefined && <span className={`${mono} font-medium`}>total {c.score.toFixed(2)}</span>}
       </div>
-      {c.rejectedBy === 'scheduler' && <p className="m-0 text-[13px] text-bad-fg">{c.detail}</p>}
-      {c.rejectedBy === 'volume' && <p className="m-0 text-[13px] text-warn-fg">The scheduler accepts this node, but {c.detail}.</p>}
+      <p className={cn('m-0 text-[13px]', c.outcome === 'rejected' ? 'text-bad-fg' : 'text-muted-foreground')}>{c.detail}</p>
+      {c.warning && c.outcome === 'selected' && <p className="m-0 text-[13px] text-warn-fg">{c.warning}</p>}
       {(c.factors ?? []).map((f) => (
         <div key={f.label} className="flex items-center gap-3 text-[13px]">
           <span className="w-24 flex-none text-muted-foreground">{f.label}</span>
@@ -72,11 +76,13 @@ export function ServicePage() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [revision, setRevision] = useState<string>()
-  const [confirm, setConfirm] = useState<'stop' | 'remove' | 'start' | 'restart' | 'volume' | null>(null)
+  const [confirm, setConfirm] = useState<'stop' | 'remove' | 'start' | 'restart' | 'volume' | 'rebuild' | null>(null)
   const [follow, setFollow] = useState(false)
   const [volumeNode, setVolumeNode] = useState('')
   const [volumeAck, setVolumeAck] = useState(false)
   const [volumeSent, setVolumeSent] = useState<string | null>(null)
+  const [moving, setMoving] = useState(false)
+  const [notice, setNotice] = useState<string | null>(null)
 
   const workloadsQ = useQuery({ queryKey: ['workloads'], queryFn: api.workloads, refetchInterval: 3000 })
   const instancesQ = useQuery({ queryKey: ['instances', name], queryFn: () => api.instances(name), refetchInterval: 3000 })
@@ -107,6 +113,40 @@ export function ServicePage() {
     onSuccess: async () => {
       await queryClient.invalidateQueries({ queryKey: ['workloads'] })
       setConfirm(null)
+    },
+  })
+  // Rebuild this one service in place: read the Compose file from disk, build
+  // without the cache and recreate its container on the node it runs on. Its
+  // dependencies are left running untouched.
+  const rebuild = useMutation({
+    mutationFn: async () => {
+      const savedDeploy = loadDeploy(name)
+      const source = await loadComposeSource(name)
+      if (!savedDeploy || !source) throw new Error('No saved Compose file for this project. Use Edit configuration to upload it.')
+      const parsed = summarizeCompose(source.text)
+      if (!parsed.ok) throw new Error(parsed.error)
+      const info = parsed.summary.details.find((d) => d.name === service)
+      if (!info) throw new Error(`${service} is not in ${source.name}.`)
+      if (!info.build) throw new Error(`${service} uses a prebuilt image, so there is nothing to build.`)
+      const deps = dependencyClosure(parsed.summary.details, service).filter((n) => n !== service)
+      const here = Object.fromEntries((workloadsQ.data ?? []).filter((w) => w.Project === name).map((w) => [w.Service, w.NodeID]))
+      const config = {
+        ...defaultConfig(parsed.summary),
+        ...savedDeploy.config,
+        project: name,
+        scope: 'one' as const,
+        onlyServices: [service],
+        noCache: true,
+        fresh: false,
+        forced: [],
+        placements: Object.fromEntries([service, ...deps].filter((n) => here[n]).map((n) => [n, here[n]])),
+      }
+      await api.composeDeploy({ ...buildRequest(source.text, config, true), keep_running: deps })
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['workloads'] })
+      setConfirm(null)
+      setNotice(`Rebuilding ${service} without the cache. Its container restarts when the build finishes; other services were not touched.`)
     },
   })
   const removeVolume = useMutation({
@@ -168,6 +208,9 @@ export function ServicePage() {
   const address = detail.instances[0]?.Address ?? nodesAddress(nodesQ.data ?? [], detail.node)
   const homeUrl = address && detail.ports[0] ? `http://${address}:${detail.ports[0].host}/` : ''
   const row = compare.data
+  const projectWorkloads = (workloadsQ.data ?? []).filter((w) => w.Project === name)
+  const thisWorkload = projectWorkloads.find((w) => w.Service === service && w.Revision === detail.revision)
+  const canMove = !!detail.node && detail.desired === 'running' && detail.status !== 'stopped'
   return (
     <main className="mx-auto flex max-w-[1280px] flex-col gap-6 p-6">
       <div className="flex flex-col gap-3">
@@ -191,10 +234,14 @@ export function ServicePage() {
                 </select>
               </label>
             )}
+            <Button variant="outline" disabled={!saved} title={saved ? 'Rebuild its image from the Compose file on disk, without the cache' : 'No saved Compose file in this browser'} onClick={() => { rebuild.reset(); setConfirm('rebuild') }}>Rebuild</Button>
             {detail.status === 'stopped' || detail.status === 'failed' ? (
               <Button onClick={() => { runAction.reset(); setConfirm('start') }}>Start</Button>
             ) : (
-              <Button variant="outline" onClick={() => { runAction.reset(); setConfirm('restart') }}>Restart</Button>
+              <>
+                <Button variant="outline" onClick={() => { runAction.reset(); setConfirm('restart') }}>Restart</Button>
+                <Button variant="outline" disabled={!canMove} title={canMove ? 'Run it on another node' : 'It must be running to move'} onClick={() => setMoving(true)}>Move to node…</Button>
+              </>
             )}
             <Button variant="outline" disabled={stopped} onClick={() => { stop.reset(); setConfirm('stop') }}>Stop</Button>
             <Button variant="outline" className="text-bad-fg" title="Delete this revision's record and container. Other revisions are not touched." onClick={() => { remove.reset(); setConfirm('remove') }}>Remove revision</Button>
@@ -208,6 +255,27 @@ export function ServicePage() {
         )}
       </div>
 
+      <MoveDialog
+        project={name}
+        service={service}
+        revision={detail.revision}
+        currentNode={detail.node}
+        stateful={thisWorkload?.Storage?.Class === 'node_local_persistent'}
+        dependents={dependentsOf(projectWorkloads, service)}
+        nodes={nodesQ.data ?? []}
+        open={moving}
+        onOpenChange={setMoving}
+        onMoved={(message) => { setMoving(false); setNotice(message) }}
+      />
+      {notice && (
+        <p role="status" className="m-0 flex items-center justify-between gap-3 rounded-lg border border-ok/30 bg-ok-soft px-3.5 py-2.5 text-[13px] text-ok-fg">
+          {notice}
+          <button type="button" className="underline" onClick={() => setNotice(null)}>Dismiss</button>
+        </p>
+      )}
+      <ConfirmDialog open={confirm === 'rebuild'} onOpenChange={(o) => !o && setConfirm(null)} danger={false} title={`Rebuild ${service}?`} confirmLabel="Rebuild" pending={rebuild.isPending} error={rebuild.error?.message ?? null} onConfirm={() => rebuild.mutate()}>
+        Reads {saved?.file.name ?? 'the Compose file'} from the project folder again, rebuilds this service's image without the build cache, and recreates its container on {detail.node || 'its node'}. Its dependencies keep running untouched. It is briefly down while the container is recreated.
+      </ConfirmDialog>
       <ConfirmDialog open={confirm === 'stop'} onOpenChange={(o) => !o && setConfirm(null)} title={`Stop ${service}?`} confirmLabel="Stop" pending={stop.isPending} error={stop.error?.message ?? null} onConfirm={() => stop.mutate()}>
         The container is stopped and removed. The revision stays listed as stopped until you Start it again. Services waiting for it will keep waiting.
       </ConfirmDialog>

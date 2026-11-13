@@ -120,7 +120,7 @@ export function PlanTable({ services, states, locked, onUse, onReset }: Props) {
                       {s.score !== null && <span className="font-mono text-xs text-muted-foreground">{s.score.toFixed(2)}</span>}
                       {s.changed && <Chip tone="info">changed</Chip>}
                       {s.forced && <Chip tone="warn">forced</Chip>}
-                      {!s.forced && s.candidates.some((c) => c.inUse && c.outcome === 'rejected') && <Chip tone="warn">empty volume</Chip>}
+                      {!s.forced && s.candidates.some((c) => c.inUse && c.warning) && <Chip tone="warn">empty volume</Chip>}
                       {canChange && (
                         <button type="button" onClick={() => toggle(s.name)} className="min-h-11 px-1.5 text-[13px] font-medium text-ok underline">
                           Change
@@ -174,15 +174,15 @@ export function PlanTable({ services, states, locked, onUse, onReset }: Props) {
                           >
                             <span className="truncate font-mono">{c.node}</span>
                             <span>
-                              <Badge tone={c.outcome === 'rejected' ? (c.inUse ? 'warn' : 'bad') : c.outcome === 'selected' ? 'ok' : 'info'} className="text-[11px]">
-                                {c.outcome === 'rejected' && c.inUse ? 'rejected · in use' : c.outcome}
+                              <Badge tone={c.outcome === 'selected' ? 'ok' : 'bad'} className="text-[11px]">
+                                {c.outcome}
                               </Badge>
                             </span>
                             <span className="font-mono">{c.score !== undefined ? c.score.toFixed(2) : '-'}</span>
                             <span className="text-zinc-700">
-                              {c.isPick && <span className="mr-1.5 inline-block rounded bg-ok px-2 py-0.5 text-[11px] font-semibold text-white">★ Scheduler's pick</span>}
-                              {c.outcome === 'rejected' && c.inUse && <span className="mr-1.5 font-medium text-warn-fg">Chosen anyway.</span>}
+                              {c.isPick && c.outcome !== 'selected' && <span className="mr-1.5 inline-block rounded bg-muted px-2 py-0.5 text-[11px] font-semibold">Scheduler's pick</span>}
                               {c.detail}
+                              {c.warning && c.outcome === 'selected' && !c.detail.includes(c.warning) && <span className="ml-1.5 font-medium text-warn-fg">{c.warning}</span>}
                             </span>
                             <span className="text-right">
                               {canChange && c.inUse && (
@@ -194,11 +194,11 @@ export function PlanTable({ services, states, locked, onUse, onReset }: Props) {
                                 <Button
                                   type="button"
                                   variant="outline"
-                                  className={cn('min-h-11 px-3 text-[13px]', c.outcome === 'rejected' && 'text-warn-fg')}
-                                  title={c.outcome === 'rejected' ? `Rejected: ${c.detail}. Place it here anyway; it may fail or start without its data.` : undefined}
-                                  onClick={() => onUse(s.name, c.node, c.outcome === 'rejected')}
+                                  className={cn('min-h-11 px-3 text-[13px]', (c.rejectedBy === 'scheduler' || c.rejectedBy === 'volume') && 'text-warn-fg')}
+                                  title={c.rejectedBy === 'scheduler' || c.rejectedBy === 'volume' ? `Rejected: ${c.detail}. Place it here anyway; it may fail or start without its data.` : undefined}
+                                  onClick={() => onUse(s.name, c.node, c.rejectedBy === 'scheduler' || c.rejectedBy === 'volume')}
                                 >
-                                  {c.outcome === 'rejected' ? 'Use anyway' : 'Use here'}
+                                  {c.rejectedBy === 'scheduler' || c.rejectedBy === 'volume' ? 'Use anyway' : 'Use here'}
                                 </Button>
                               )}
                             </span>

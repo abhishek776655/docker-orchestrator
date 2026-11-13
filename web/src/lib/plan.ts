@@ -4,9 +4,15 @@ import { summarizeCompose } from './compose-summary'
 import { dependencyClosure, pickedServices, scopeRoots, type DeployConfig } from './deploy-config'
 
 /**
- * The file with only the chosen service and what it depends on. The control
- * plane reads every service (env files, build contexts) before it narrows the
- * deploy to one, so a service you did not pick could still fail the plan.
+ * The file narrowed to the chosen service and what it depends on. The control
+ * plane reads every service (env files, secrets, health checks) before it
+ * narrows the deploy, so one you did not pick could still fail the plan.
+ *
+ * The others are not deleted outright: they stay as stubs with only their
+ * image, build and volumes. The control plane decides what a bind mount is
+ * (source code to ship, or a data folder) partly by whether other services
+ * mount or build from the same folder, so without the stubs a folder shared
+ * with other services looks private and ends up as an empty volume.
  * Returns the text unchanged when everything is in scope or it cannot be read.
  */
 export function pruneToScope(yaml: string, config: DeployConfig): string {
@@ -20,7 +26,15 @@ export function pruneToScope(yaml: string, config: DeployConfig): string {
   const doc = parseDocument(yaml)
   const services = doc.get('services', true)
   if (!services || typeof (services as { items?: unknown }).items === 'undefined') return yaml
-  for (const name of parsed.summary.services) if (!keep.has(name)) doc.deleteIn(['services', name])
+  for (const name of parsed.summary.services) {
+    if (keep.has(name)) continue
+    const original = doc.getIn(['services', name]) as { toJSON?: () => Record<string, unknown> } | undefined
+    const full = original?.toJSON?.() ?? {}
+    const stub: Record<string, unknown> = {}
+    for (const field of ['image', 'build', 'volumes']) if (full[field] !== undefined) stub[field] = full[field]
+    if (Object.keys(stub).length === 0) doc.deleteIn(['services', name])
+    else doc.setIn(['services', name], doc.createNode(stub))
+  }
   return doc.toString()
 }
 
@@ -45,16 +59,16 @@ export function buildRequest(yaml: string, config: DeployConfig, withPlacements:
 
 export interface Candidate {
   node: string
-  // rejected: the scheduler refused it, or its volume data is elsewhere.
-  // A rejected node can still be the one in use when the user chose it anyway.
-  outcome: 'selected' | 'eligible' | 'rejected'
-  // Why it counts as rejected: the scheduler refused the node, or the
-  // scheduler accepted it but the service's volume data is on another node
-  // (it would start empty there). Only "scheduler" is a real rejection.
-  rejectedBy?: 'scheduler' | 'volume'
+  // Two outcomes only. selected: the node this service will run on, with the
+  // reason it was picked. rejected: every other node, with the reason it was not.
+  outcome: 'selected' | 'rejected'
+  // Why a node was rejected: the scheduler refused it, its volume data is on
+  // another node (it would start empty), or another node scored higher.
+  rejectedBy?: 'scheduler' | 'volume' | 'score'
   inUse: boolean // the node this service will run on
   score?: number
-  detail: string
+  detail: string // the reason for the outcome
+  warning?: string // on the selected node: something to know, such as an empty volume
   isPick: boolean // the scheduler's own choice
   factors?: { label: string; value: number }[] // each 0 (worst) to 1 (best)
 }
@@ -105,45 +119,75 @@ export function stagesOf(workloads: { Service: string; DependsOn?: string[] | nu
 function candidatesOf(base: Decision | undefined, selected: string, dataNode: string): Candidate[] {
   if (!base) return []
   const volumeElsewhere = (node: string) => (dataNode && node !== dataNode ? `volume data is on ${dataNode}; here it starts with an empty volume` : '')
-  const eligible = [...(base.Scores ?? [])]
-    .sort((a, b) => b.Total - a.Total)
-    .map((s): Candidate => {
-      const volume = volumeElsewhere(s.NodeID)
-      const inUse = s.NodeID === selected
-      return {
-        node: s.NodeID,
-        outcome: volume ? 'rejected' : inUse ? 'selected' : 'eligible',
-        rejectedBy: volume ? 'volume' : undefined,
-        inUse,
-        score: s.Total,
-        detail: volume || `CPU ${s.CPUFit.toFixed(2)} · memory ${s.MemoryFit.toFixed(2)} · thermal ${s.ThermalFit.toFixed(2)} · image cache ${s.CacheFit.toFixed(2)}`,
-        isPick: s.NodeID === base.Selected,
-        factors: [
-          { label: 'CPU fit', value: s.CPUFit },
-          { label: 'Memory fit', value: s.MemoryFit },
-          { label: 'Thermal fit', value: s.ThermalFit },
-          { label: 'Image cache', value: s.CacheFit },
-        ],
-      }
-    })
-  const rejected = (base.Rejections ?? []).map((r): Candidate => ({ node: r.NodeID, outcome: 'rejected', rejectedBy: 'scheduler', inUse: r.NodeID === selected, detail: r.Reason, isPick: false }))
-  return [...eligible, ...rejected]
+  const scored = [...(base.Scores ?? [])].sort((a, b) => b.Total - a.Total)
+  const selectedScore = scored.find((s) => s.NodeID === selected)?.Total
+  const eligible = scored.map((s): Candidate => {
+    const volume = volumeElsewhere(s.NodeID)
+    const inUse = s.NodeID === selected
+    const isPick = s.NodeID === base.Selected
+    const fit = `CPU ${s.CPUFit.toFixed(2)} · memory ${s.MemoryFit.toFixed(2)} · thermal ${s.ThermalFit.toFixed(2)} · image cache ${s.CacheFit.toFixed(2)}${s.SpreadFit === undefined ? '' : ` · spread ${s.SpreadFit.toFixed(2)}`}`
+    let detail: string
+    let rejectedBy: Candidate['rejectedBy']
+    if (inUse) {
+      detail = isPick ? `Highest score. ${fit}` : `Chosen by you. ${fit}`
+    } else if (volume) {
+      rejectedBy = 'volume'
+      detail = volume
+    } else {
+      rejectedBy = 'score'
+      detail =
+        selectedScore === undefined
+          ? fit
+          : s.Total.toFixed(2) === selectedScore.toFixed(2)
+            ? `Same score as ${selected}; the scheduler breaks ties by node name. ${fit}`
+            : s.Total > selectedScore
+              ? `Scored higher (${s.Total.toFixed(2)} vs ${selectedScore.toFixed(2)}), but ${selected} was chosen instead. ${fit}`
+              : `Lower score than ${selected} (${s.Total.toFixed(2)} vs ${selectedScore.toFixed(2)}). ${fit}`
+    }
+    return {
+      node: s.NodeID,
+      outcome: inUse ? 'selected' : 'rejected',
+      rejectedBy,
+      inUse,
+      score: s.Total,
+      detail,
+      warning: inUse && volume ? volume : undefined,
+      isPick,
+      factors: [
+        { label: 'CPU fit', value: s.CPUFit },
+        { label: 'Memory fit', value: s.MemoryFit },
+        { label: 'Thermal fit', value: s.ThermalFit },
+        { label: 'Image cache', value: s.CacheFit },
+        ...(s.SpreadFit === undefined ? [] : [{ label: 'Spread', value: s.SpreadFit }]),
+      ],
+    }
+  })
+  const refused = (base.Rejections ?? []).map((r): Candidate => {
+    const inUse = r.NodeID === selected
+    return {
+      node: r.NodeID,
+      outcome: inUse ? 'selected' : 'rejected',
+      rejectedBy: inUse ? undefined : 'scheduler',
+      inUse,
+      detail: inUse ? `Chosen by you although the scheduler rejected it: ${r.Reason}` : r.Reason,
+      warning: inUse ? r.Reason : undefined,
+      isPick: false,
+    }
+  })
+  return [...eligible, ...refused]
 }
 
 export type CandidateTag = { label: string; tone: 'ok' | 'info' | 'bad' | 'warn' }
 
 /**
- * The labels a node gets when comparing placements. They stack: the
- * scheduler's pick can also be where the service runs now, or a node it
- * would start empty on. "eligible" only when nothing else applies.
+ * The labels a node gets when comparing placements: selected or rejected, the
+ * scheduler's own pick when the user moved the service elsewhere, and where
+ * the service runs now.
  */
 export function candidateTags(c: Candidate, runsOn: string): CandidateTag[] {
-  const tags: CandidateTag[] = []
-  if (c.isPick) tags.push({ label: "scheduler's pick", tone: 'ok' })
+  const tags: CandidateTag[] = [c.outcome === 'selected' ? { label: 'selected', tone: 'ok' } : { label: 'rejected', tone: 'bad' }]
+  if (c.isPick && c.outcome !== 'selected') tags.push({ label: "scheduler's pick", tone: 'info' })
   if (runsOn && c.node === runsOn) tags.push({ label: 'runs here now', tone: 'info' })
-  if (c.rejectedBy === 'scheduler') tags.push({ label: 'rejected by scheduler', tone: 'bad' })
-  if (c.rejectedBy === 'volume') tags.push({ label: 'would start empty', tone: 'warn' })
-  if (tags.length === 0) tags.push({ label: 'eligible', tone: 'info' })
   return tags
 }
 
