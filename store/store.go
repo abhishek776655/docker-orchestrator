@@ -426,6 +426,56 @@ func (s *Store) WorkloadsOnUnavailableNodes(ctx context.Context) ([]WorkloadReco
 	return out, rows.Err()
 }
 
+// legacyUnreachableReason is the reason older control planes gave when they
+// marked a stateful workload failed because its node stopped heartbeating.
+// Such a workload is really unreachable, so recovery treats it that way.
+const legacyUnreachableReason = "node % unavailable; stateful workload is not relocated%"
+
+// RecoverUnreachable puts every workload that was marked unreachable (or the
+// old "failed because the node is unavailable" form) back to assigned once
+// its node is available again, so the node's agent adopts the container that
+// kept running, or starts it again. nodeID limits it to one node; "" covers
+// every available node. It returns the workloads it recovered.
+func (s *Store) RecoverUnreachable(ctx context.Context, nodeID string) ([]WorkloadRecord, error) {
+	query := `
+		SELECT w.project, w.service, w.revision, w.image, w.command, w.env, w.cpu_millis, w.memory_bytes, w.architecture, w.host_ports, w.container_ports, w.port_bindings, w.storage_class, w.storage_pinned_node, w.storage_allow_fresh_volume, w.constraint_pinned_node, w.skip_pull, w.remote_build, w.volumes, w.depends_on, w.depends_on_healthy, w.health_check, w.runtime, w.desired_state, w.status, w.status_reason, w.node_id, w.container_id
+		FROM workloads w
+		JOIN nodes n ON n.id = w.node_id
+		WHERE n.availability = 'available' AND w.desired_state = 'running'
+		  AND (w.status = 'unreachable' OR (w.status = 'failed' AND w.status_reason LIKE ?))`
+	args := []any{legacyUnreachableReason}
+	if nodeID != "" {
+		query += ` AND w.node_id = ?`
+		args = append(args, nodeID)
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	var recovered []WorkloadRecord
+	for rows.Next() {
+		rec, err := scanWorkloadRow(rows)
+		if err != nil {
+			rows.Close()
+			return nil, err
+		}
+		recovered = append(recovered, *rec)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	now := formatTime(time.Now())
+	for _, rec := range recovered {
+		if _, err := s.db.ExecContext(ctx, `UPDATE workloads SET status = 'assigned', status_reason = 'node is back; resuming', updated_at = ? WHERE key = ?`, now, rec.Key()); err != nil {
+			return recovered, err
+		}
+		_, _ = s.db.ExecContext(ctx, `INSERT INTO events (workload_key, node_id, type, message, created_at) VALUES (?, ?, 'status', 'assigned: node is back; resuming', ?)`, rec.Key(), rec.NodeID, now)
+	}
+	return recovered, nil
+}
+
 // Reassign moves a workload to a different node and resets it to
 // "assigned" so the new node's agent picks it up fresh (SRS §6.3
 // reconciliation: "issue safe corrective actions").
@@ -797,6 +847,36 @@ func (s *Store) ActiveReservationsExcluding(ctx context.Context, excludeKeys []s
 		}
 	}
 	return cpuMem, ports, rows.Err()
+}
+
+// ActiveWorkloadCounts counts the workloads holding a place on each node
+// (the same set ActiveReservationsExcluding sums), so the scheduler can
+// spread services across nodes even when they declare no CPU or memory.
+func (s *Store) ActiveWorkloadCounts(ctx context.Context, excludeKeys []string) (map[string]int, error) {
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(excludeKeys)), ",")
+	args := make([]any, len(excludeKeys))
+	for i, k := range excludeKeys {
+		args[i] = k
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT node_id, COUNT(*) FROM workloads
+		WHERE node_id != '' AND status NOT IN ('failed', 'stopped') AND key NOT IN (`+placeholders+`)
+		GROUP BY node_id
+	`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	counts := map[string]int{}
+	for rows.Next() {
+		var node string
+		var n int
+		if err := rows.Scan(&node, &n); err != nil {
+			return nil, err
+		}
+		counts[node] = n
+	}
+	return counts, rows.Err()
 }
 
 // WorkloadRecord is a workload plus its control-plane–assigned runtime

@@ -22,15 +22,18 @@ type Weights struct {
 	Memory  float64
 	Thermal float64
 	Cache   float64
+	// Spread weighs how many services a node already carries per CPU core.
+	Spread float64
 }
 
 // DefaultWeights favors CPU/memory headroom, with thermal and image-cache
 // locality as smaller tie-breaking signals (SRS §9.3, M7).
-var DefaultWeights = Weights{CPU: 0.4, Memory: 0.4, Thermal: 0.1, Cache: 0.1}
+var DefaultWeights = Weights{CPU: 0.35, Memory: 0.35, Thermal: 0.1, Cache: 0.1, Spread: 0.1}
 
 type nodeState struct {
 	node         model.Node
 	reservedCPU  int64
+	count        int // services already on this node, pinned ones included
 	reservedMem  int64
 	reservedVRAM int64
 	usedPorts    map[int]string // host port -> key of the workload holding it
@@ -80,6 +83,14 @@ func (s *Scheduler) SeedReservation(nodeID string, res model.Resources, hostPort
 	ns.reservedMem += res.MemoryBytes
 	for p, holder := range hostPorts {
 		ns.usedPorts[p] = holder
+	}
+}
+
+// SeedWorkloadCount records how many services already run on a node, so
+// the spread factor sees them even when they reserve no CPU or memory.
+func (s *Scheduler) SeedWorkloadCount(nodeID string, n int) {
+	if ns, ok := s.nodes[nodeID]; ok {
+		ns.count += n
 	}
 }
 
@@ -291,6 +302,7 @@ func (s *Scheduler) score(ns *nodeState, w model.Workload) model.ScoreFactors {
 	memFit := headroomFit(n.Allocatable.MemoryBytes, ns.reservedMem, w.Resources.MemoryBytes)
 	thermalFit := thermalFit(n.Thermal)
 	cacheFit := cacheFit(n.CachedImages, w.Image)
+	spreadFit := spreadFit(n.Allocatable.CPUMillis, ns.count)
 
 	return model.ScoreFactors{
 		NodeID:     n.ID,
@@ -298,8 +310,21 @@ func (s *Scheduler) score(ns *nodeState, w model.Workload) model.ScoreFactors {
 		MemoryFit:  memFit,
 		ThermalFit: thermalFit,
 		CacheFit:   cacheFit,
-		Total:      s.weights.CPU*cpuFit + s.weights.Memory*memFit + s.weights.Thermal*thermalFit + s.weights.Cache*cacheFit,
+		SpreadFit:  spreadFit,
+		Total:      s.weights.CPU*cpuFit + s.weights.Memory*memFit + s.weights.Thermal*thermalFit + s.weights.Cache*cacheFit + s.weights.Spread*spreadFit,
 	}
+}
+
+// spreadFit is 1/(1+services per core): an empty node scores 1, a node with
+// as many services as cores 0.5, and so on. Services that declare no CPU or
+// memory reserve nothing, so headroom alone would never notice them piling
+// up on one node.
+func spreadFit(cpuMillis int64, services int) float64 {
+	cores := float64(cpuMillis) / 1000
+	if cores < 1 {
+		cores = 1
+	}
+	return 1 / (1 + float64(services)/cores)
 }
 
 // thermalFit is neutral (1.0, "fine") whenever the node reports no thermal
@@ -345,6 +370,7 @@ func headroomFit(allocatable, reserved, request int64) float64 {
 // reserve records the winning workload's resources and ports against the
 // node so subsequent Schedule calls cannot overcommit it.
 func (s *Scheduler) reserve(ns *nodeState, w model.Workload) {
+	ns.count++
 	ns.reservedCPU += w.Resources.CPUMillis
 	ns.reservedMem += w.Resources.MemoryBytes
 	if w.Constraints.GPU.Required {

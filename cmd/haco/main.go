@@ -626,7 +626,7 @@ func renderPlanTable(project string, v planView) {
 }
 
 // otherNodeReasons explains, for a placed service, why each other node was
-// not chosen: ruled out (with the reason) or eligible but scored lower.
+// not chosen: rejected, with the reason (refused by the scheduler, or a lower score).
 // Nothing for an unplaced service, whose table row already lists every
 // node's reason.
 func otherNodeReasons(selected string, scores []struct {
@@ -648,12 +648,12 @@ func otherNodeReasons(selected string, scores []struct {
 	var lines []string
 	for _, r := range rejections {
 		if r.NodeID != selected {
-			lines = append(lines, fmt.Sprintf("%s ruled out: %s", r.NodeID, r.Reason))
+			lines = append(lines, fmt.Sprintf("%s rejected: %s", r.NodeID, r.Reason))
 		}
 	}
 	for _, sc := range scores {
 		if sc.NodeID != selected {
-			lines = append(lines, fmt.Sprintf("%s eligible but scored lower (%.2f vs %.2f)", sc.NodeID, sc.Total, chosen))
+			lines = append(lines, fmt.Sprintf("%s rejected: lower score (%.2f vs %.2f)", sc.NodeID, sc.Total, chosen))
 		}
 	}
 	return lines

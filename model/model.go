@@ -380,6 +380,12 @@ const (
 	// but at least one entry in DependsOn has no ready instance yet
 	// (SRS UC-05, FR-014). The agent re-checks on its next poll.
 	StatusWaitingDependencies Status = "waiting_dependencies"
+	// StatusUnreachable means the node holding the workload stopped sending
+	// heartbeats (asleep, screen off, network gone). Its container may well
+	// still be running, so this is not a failure: the control plane keeps
+	// the assignment, and when the node answers again the workload is
+	// adopted back, and the services that depend on it are restarted.
+	StatusUnreachable Status = "unreachable"
 )
 
 // ServiceInstance is one reachable, ready endpoint for a logical service,
@@ -430,7 +436,12 @@ type ScoreFactors struct {
 	// reports no thermal telemetry — unknown is never penalized (§9.5).
 	ThermalFit float64
 	CacheFit   float64
-	Total      float64
+	// SpreadFit rewards a node with fewer services per CPU core already on
+	// it, pinned ones included, so a node that is carrying a lot (the host
+	// with its pinned services) gets fewer of the rest. 1.0 when empty,
+	// falling toward 0 as it fills up.
+	SpreadFit float64
+	Total     float64
 }
 
 // Decision is the full, inspectable outcome of one scheduling attempt

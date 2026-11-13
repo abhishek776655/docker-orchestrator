@@ -346,3 +346,30 @@ func (svc *Service) handleImagesRemoved(w http.ResponseWriter, r *http.Request) 
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
+
+func (svc *Service) handleMoveWorkload(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Node              string `json:"node"`
+		Force             bool   `json:"force"`
+		AcceptEmptyVolume bool   `json:"accept_empty_volume"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	result, err := svc.MoveWorkload(r.Context(), workloadKeyFrom(r), req.Node, req.Force, req.AcceptEmptyVolume)
+	switch {
+	case err == nil:
+		writeJSON(w, http.StatusOK, result)
+	case errors.Is(err, store.ErrNotFound):
+		writeError(w, http.StatusNotFound, err)
+	case errors.Is(err, ErrMoveNeedsEmptyVolume), errors.Is(err, ErrNotMovable):
+		writeError(w, http.StatusConflict, err)
+	case result != nil && result.Decision != nil:
+		// The scheduler refused the node: 409 with the reasons, so the
+		// caller can offer to force it.
+		writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "decision": result.Decision})
+	default:
+		writeError(w, http.StatusInternalServerError, err)
+	}
+}

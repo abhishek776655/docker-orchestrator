@@ -34,6 +34,7 @@ func NewHandler(svc *Service) http.Handler {
 	mux.HandleFunc("DELETE /v1/workloads/{project}/{service}/{revision}", svc.handleDeleteWorkload)
 	mux.HandleFunc("POST /v1/workloads/{project}/{service}/{revision}/start", svc.refuseDuringShutdown(svc.handleStartWorkload))
 	mux.HandleFunc("POST /v1/workloads/{project}/{service}/{revision}/restart", svc.refuseDuringShutdown(svc.handleRestartWorkload))
+	mux.HandleFunc("POST /v1/workloads/{project}/{service}/{revision}/move", svc.refuseDuringShutdown(svc.handleMoveWorkload))
 	mux.HandleFunc("POST /v1/admin/nodes/{id}/name", svc.handleSetNodeName)
 	mux.HandleFunc("POST /v1/admin/nodes/{id}/limits", svc.handleSetNodeLimits)
 	mux.HandleFunc("POST /v1/admin/nodes/{id}/images/remove", svc.handleRemoveNodeImages)
@@ -246,6 +247,9 @@ func (svc *Service) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if err := svc.Heartbeat(r.Context(), id, req.Thermal, req.CachedImages); err != nil {
 		writeError(w, http.StatusNotFound, err)
 		return
+	}
+	if err := svc.recoverUnreachable(r.Context(), id); err != nil {
+		log.Printf("recover workloads on %s: %v", id, err)
 	}
 	if authenticated := authenticatedNode(r); authenticated == "" || authenticated == id {
 		svc.recordMemory(id, req.ContainerMemory)
@@ -543,6 +547,8 @@ type composeRequest struct {
 	// {"192-168-1-3": ["metaapi"]} to pin metaapi to that worker node
 	// specifically, rather than the control-plane host.
 	PinNodes map[string][]string `json:"pin_nodes"`
+	// KeepRunning: see DeployOptions.KeepRunning.
+	KeepRunning []string `json:"keep_running"`
 	// Fresh skips reusing any currently-unpinned service's existing stored
 	// pin — see DeployOptions.Fresh. For /v1/compose/plan, it previews
 	// exactly what /v1/compose/deploy --fresh would actually do, instead
@@ -595,7 +601,7 @@ func (svc *Service) handleComposeDeploy(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	plan, results, err := svc.ComposeDeploy(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), DeployOptions{NoCache: req.NoCache, OnlyService: req.OnlyService, PinHost: req.PinHost, PinNodes: req.PinNodes, Fresh: req.Fresh, Force: req.Force})
+	plan, results, err := svc.ComposeDeploy(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), DeployOptions{NoCache: req.NoCache, OnlyService: req.OnlyService, PinHost: req.PinHost, PinNodes: req.PinNodes, Fresh: req.Fresh, Force: req.Force, KeepRunning: req.KeepRunning})
 	if err != nil {
 		status := http.StatusInternalServerError
 		if plan != nil && !plan.CanDeploy() {

@@ -357,7 +357,7 @@ func TestOtherNodeReasonsExplainEveryUnusedNode(t *testing.T) {
 	}
 	d := v.Decisions[0]
 	got := strings.Join(otherNodeReasons(d.Selected, d.Scores, d.Rejections), "\n")
-	for _, want := range []string{"host ruled out: host port 5672 is in use", "hp ruled out: node hp is unavailable", "mac-c eligible but scored lower (0.60 vs 0.80)"} {
+	for _, want := range []string{"host rejected: host port 5672 is in use", "hp rejected: node hp is unavailable", "mac-c rejected: lower score (0.60 vs 0.80)"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q in:\n%s", want, got)
 		}

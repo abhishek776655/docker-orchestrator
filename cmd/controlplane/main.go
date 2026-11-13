@@ -92,6 +92,7 @@ func main() {
 	}
 	heartbeatTimeout := envDuration("HACO_HEARTBEAT_TIMEOUT", 15*time.Second)
 	reconcileInterval := envDuration("HACO_RECONCILE_INTERVAL", 5*time.Second)
+	svc.SetRescheduleAfter(envDuration("HACO_RESCHEDULE_AFTER", 2*time.Minute))
 	go svc.RunReconciler(ctx, reconcileInterval, heartbeatTimeout)
 	log.Printf("reconciler running every %s, heartbeat timeout %s", reconcileInterval, heartbeatTimeout)
 

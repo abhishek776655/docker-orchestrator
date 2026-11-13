@@ -553,3 +553,44 @@ func TestSchedulerSkipsNodeWithPortHeldOutsideHaco(t *testing.T) {
 		t.Fatalf("err = %v, want the holder named", err)
 	}
 }
+
+func TestSpreadFavorsTheNodeCarryingFewerServices(t *testing.T) {
+	nodes := []model.Node{node("busy", "arm64", 4000, 8<<30), node("quiet", "arm64", 4000, 8<<30)}
+	s := scheduler.New(nodes)
+	// Six services already sit on "busy". They reserve no CPU or memory, so
+	// headroom alone would see the two nodes as identical.
+	s.SeedWorkloadCount("busy", 6)
+	d, err := s.Schedule(model.Workload{Project: "p", Service: "api", Revision: "latest", Image: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Selected != "quiet" {
+		t.Fatalf("selected %s, want quiet: the busy node already carries six services", d.Selected)
+	}
+	var busy, quiet float64
+	for _, sc := range d.Scores {
+		if sc.NodeID == "busy" {
+			busy = sc.SpreadFit
+		} else {
+			quiet = sc.SpreadFit
+		}
+	}
+	if !(quiet == 1 && busy < 0.5) {
+		t.Fatalf("spread fit busy=%.2f quiet=%.2f, want quiet 1.00 and busy under 0.50", busy, quiet)
+	}
+}
+
+func TestSpreadCountsEachServiceScheduledInThisBatch(t *testing.T) {
+	s := scheduler.New([]model.Node{node("a", "arm64", 4000, 8<<30), node("b", "arm64", 4000, 8<<30)})
+	placed := map[string]int{}
+	for i := 0; i < 8; i++ {
+		d, err := s.Schedule(model.Workload{Project: "p", Service: string(rune('a' + i)), Revision: "latest", Image: "x"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		placed[d.Selected]++
+	}
+	if placed["a"] != 4 || placed["b"] != 4 {
+		t.Fatalf("placed %v, want an even split of identical services", placed)
+	}
+}

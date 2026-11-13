@@ -122,3 +122,11 @@ func workloadKeys(records []store.WorkloadRecord) []string {
 	}
 	return keys
 }
+
+func TestSplitAssignmentsDoesNotRunOrRemoveUnreachableWorkloads(t *testing.T) {
+	unreachable := store.WorkloadRecord{Workload: model.Workload{Project: "p", Service: "db", Revision: "latest"}, Status: model.StatusUnreachable, NodeID: "n"}
+	owned, executable := splitAssignments([]store.WorkloadRecord{unreachable})
+	if !owned[unreachable.Key()] || len(executable) != 0 {
+		t.Fatalf("owned=%v executable=%d; an unreachable workload must stay owned (its container is not removed) and not be executed until the control plane resumes it", owned, len(executable))
+	}
+}

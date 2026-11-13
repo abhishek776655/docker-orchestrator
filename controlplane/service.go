@@ -54,6 +54,8 @@ type Service struct {
 	renames  renameState
 	usage    usageState
 	busy     busyPortState
+	// rescheduleAfter: see SetRescheduleAfter.
+	rescheduleAfter time.Duration
 	// nodeReqs queues restarts and image deletions for agents' control polls.
 	nodeReqs nodeRequests
 
@@ -232,9 +234,16 @@ func (svc *Service) dryRunSchedule(ctx context.Context, workloads []model.Worklo
 	for nodeID, res := range cpuMem {
 		sched.SeedReservation(nodeID, res, ports[nodeID])
 	}
+	if err := svc.seedWorkloadCounts(ctx, sched, keys); err != nil {
+		return nil, err
+	}
 
-	var decisions []*model.Decision
-	for _, w := range workloads {
+	// Pinned services first, so they get their node's room before unpinned
+	// ones take it; the decisions come back in the original order.
+	byPosition := make([]*model.Decision, len(workloads))
+	var failure error
+	for _, i := range schedulingOrder(workloads) {
+		w := workloads[i]
 		if !fresh && w.Storage.Class == model.NodeLocalPersistent && w.Storage.PinnedNodeID == "" {
 			// Mirror Submit()'s existing-pin reuse so planning a redeploy of
 			// an unpinned service shows where it would actually land (its
@@ -246,12 +255,59 @@ func (svc *Service) dryRunSchedule(ctx context.Context, workloads []model.Worklo
 			}
 		}
 		decision, err := sched.Schedule(w)
-		decisions = append(decisions, decision)
+		byPosition[i] = decision
 		if err != nil {
-			return decisions, fmt.Errorf("schedule %s: %w", w.Service, err)
+			failure = fmt.Errorf("schedule %s: %w", w.Service, err)
+			break
 		}
 	}
-	return decisions, nil
+	var decisions []*model.Decision
+	for _, d := range byPosition {
+		if d != nil {
+			decisions = append(decisions, d)
+		}
+	}
+	return decisions, failure
+}
+
+// seedWorkloadCounts tells the scheduler how many services already sit on each
+// node (pinned ones included), so it spreads the rest instead of piling them
+// onto the node that happens to have the most headroom.
+func (svc *Service) seedWorkloadCounts(ctx context.Context, sched *scheduler.Scheduler, excludeKeys []string) error {
+	counts, err := svc.store.ActiveWorkloadCounts(ctx, excludeKeys)
+	if err != nil {
+		return fmt.Errorf("count workloads per node: %w", err)
+	}
+	for node, n := range counts {
+		sched.SeedWorkloadCount(node, n)
+	}
+	return nil
+}
+
+// isPinned: the service is tied to a node, by an operator or Compose pin or
+// because its volume data lives there.
+func isPinned(w model.Workload) bool {
+	return w.Constraints.PinnedNodeID != "" || (w.Storage.Class == model.NodeLocalPersistent && w.Storage.PinnedNodeID != "")
+}
+
+// schedulingOrder lists workload positions with pinned services first, each
+// group in its original order. A pinned service has only one node it can use,
+// so it has to claim that node's CPU, memory and ports before the unpinned
+// services, which can go elsewhere, are placed; otherwise one of them can take
+// the room a later pinned service needed.
+func schedulingOrder(workloads []model.Workload) []int {
+	order := make([]int, 0, len(workloads))
+	for i, w := range workloads {
+		if isPinned(w) {
+			order = append(order, i)
+		}
+	}
+	for i, w := range workloads {
+		if !isPinned(w) {
+			order = append(order, i)
+		}
+	}
+	return order
 }
 
 // DeployOptions carries haco deploy's optional flags through the API.
@@ -278,6 +334,12 @@ type DeployOptions struct {
 	// Force lists services whose PinNodes placement overrides the
 	// scheduler's hard filters (see model.Constraints.Forced).
 	Force []string
+	// KeepRunning lists services that are part of this deploy only because
+	// something new depends on them (adding a service). Any that is already
+	// running is left exactly as it is: not submitted again, so its status,
+	// container and build are untouched. One that is not running is deployed
+	// as usual.
+	KeepRunning []string
 	// Fresh, when true, skips reusing any currently-unpinned service's
 	// existing stored pin — the scheduler re-picks a node for it from
 	// scratch, abandoning whatever data lives on its current node. Has no
@@ -311,6 +373,9 @@ func (svc *Service) ComposeDeploy(ctx context.Context, project, workingDir strin
 	if !plan.Networking.Supported {
 		return plan, nil, fmt.Errorf("compose plan recommends %s networking, which is not provisioned yet: %s", plan.Networking.Mode, strings.Join(plan.Networking.Reasons, "; "))
 	}
+	if len(opts.KeepRunning) > 0 {
+		svc.leaveRunningAlone(ctx, plan, opts.KeepRunning)
+	}
 	if err := svc.resolveVolumeSnapshots(plan); err != nil {
 		return plan, nil, err
 	}
@@ -327,9 +392,10 @@ func (svc *Service) ComposeDeploy(ctx context.Context, project, workingDir strin
 	// unavailable mid-deploy, a constraint nothing satisfies): stopping at
 	// the first failure left every later service unscheduled. All failures
 	// are reported together at the end.
-	var results []*SubmitResult
+	byPosition := make([]*SubmitResult, len(plan.Workloads))
 	var failures []error
-	for _, wl := range plan.Workloads {
+	for _, i := range schedulingOrder(plan.Workloads) {
+		wl := plan.Workloads[i]
 		if ref, ok := images[wl.Service]; ok {
 			wl.Image = ref
 			if rb, ok := remoteBuilds[wl.Service]; ok {
@@ -338,17 +404,60 @@ func (svc *Service) ComposeDeploy(ctx context.Context, project, workingDir strin
 			}
 		}
 		result, err := svc.Submit(ctx, wl, opts.Fresh)
-		if result != nil {
-			results = append(results, result)
-		}
+		byPosition[i] = result
 		if err != nil {
 			failures = append(failures, fmt.Errorf("schedule %s: %w", wl.Service, err))
+		}
+	}
+	var results []*SubmitResult
+	for _, r := range byPosition {
+		if r != nil {
+			results = append(results, r)
 		}
 	}
 	if len(failures) > 0 {
 		return plan, results, fmt.Errorf("%d of %d services could not be scheduled: %w", len(failures), len(plan.Workloads), errors.Join(failures...))
 	}
 	return plan, results, nil
+}
+
+// leaveRunningAlone drops the named services from plan when they are already
+// running, so deploying something that depends on them does not submit them
+// again. Submitting an existing workload resets it to "assigned" and clears
+// its container, which makes the agent run it through its lifecycle again
+// and rebuild it if its sources changed. Nothing here is validated again:
+// the plan was checked in full before this.
+func (svc *Service) leaveRunningAlone(ctx context.Context, plan *compose.Plan, keep []string) {
+	skip := map[string]bool{}
+	for _, name := range keep {
+		key := fmt.Sprintf("%s/%s/%s", plan.Project, name, "latest")
+		rec, err := svc.store.GetWorkload(ctx, key)
+		if err != nil || rec.DesiredState != model.DesiredRunning {
+			continue
+		}
+		switch rec.Status {
+		case model.StatusFailed, model.StatusStopped, model.StatusUnreachable:
+			continue // needs the normal deploy
+		}
+		skip[name] = true
+	}
+	if len(skip) == 0 {
+		return
+	}
+	workloads := plan.Workloads[:0:0]
+	for _, w := range plan.Workloads {
+		if !skip[w.Service] {
+			workloads = append(workloads, w)
+		}
+	}
+	plan.Workloads = workloads
+	builds := plan.Builds[:0:0]
+	for _, b := range plan.Builds {
+		if !skip[b.Service] {
+			builds = append(builds, b)
+		}
+	}
+	plan.Builds = builds
 }
 
 // resolveBuilds determines each build: service's final image reference.
@@ -876,6 +985,9 @@ func (svc *Service) Submit(ctx context.Context, w model.Workload, fresh bool) (*
 	sched := scheduler.New(nodes)
 	for nodeID, res := range cpuMem {
 		sched.SeedReservation(nodeID, res, ports[nodeID])
+	}
+	if err := svc.seedWorkloadCounts(ctx, sched, []string{w.Key()}); err != nil {
+		return nil, err
 	}
 
 	decision, schedErr := sched.Schedule(w)

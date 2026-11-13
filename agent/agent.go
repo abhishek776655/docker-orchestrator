@@ -526,7 +526,10 @@ func splitAssignments(records []store.WorkloadRecord) (map[string]bool, []store.
 	executable := make([]store.WorkloadRecord, 0, len(records))
 	for _, rec := range records {
 		owned[rec.Key()] = true
-		if rec.Status == model.StatusFailed {
+		// Failed is terminal. Unreachable is the control plane's mark from
+		// before this node came back; it flips to assigned within a moment,
+		// and until then nothing is run or removed.
+		if rec.Status == model.StatusFailed || rec.Status == model.StatusUnreachable {
 			continue
 		}
 		executable = append(executable, rec)

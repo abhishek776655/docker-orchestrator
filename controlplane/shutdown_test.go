@@ -129,7 +129,7 @@ func TestDeploysRefusedDuringShutdown(t *testing.T) {
 	}
 }
 
-func TestReconcilerHoldsPausedNodeButFailsOverCrashedOne(t *testing.T) {
+func TestReconcilerHoldsPausedNodeButMarksCrashedOneUnreachable(t *testing.T) {
 	svc, s := shutdownTestService(t, map[string]model.Availability{"paused-node": model.Available, "crashed-node": model.Available})
 	ctx := context.Background()
 	for _, n := range []string{"paused-node", "crashed-node"} {
@@ -158,8 +158,8 @@ func TestReconcilerHoldsPausedNodeButFailsOverCrashedOne(t *testing.T) {
 		t.Fatalf("workload on paused node = %s (%s), want untouched ready", paused.Status, paused.StatusReason)
 	}
 	crashed, _ := svc.GetWorkload(ctx, "demo/crashed-node/latest")
-	if crashed.Status != model.StatusFailed {
-		t.Fatalf("workload on crashed node = %s, want today's failover (failed)", crashed.Status)
+	if crashed.Status != model.StatusUnreachable {
+		t.Fatalf("workload on crashed node = %s, want unreachable (not failed: its container may still be running)", crashed.Status)
 	}
 	if err := s.Heartbeat(ctx, "paused-node", model.Thermal{}, nil); err != nil {
 		t.Fatal(err)
