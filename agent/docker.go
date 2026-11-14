@@ -476,13 +476,23 @@ func (d *Docker) EnsureRunning(ctx context.Context, w model.Workload, extraHosts
 		return "", nil, fmt.Errorf("prepare volumes: %w", err)
 	}
 
+	// The project network: every container joins it under its service name.
+	netName := ""
+	if projectNetworksEnabled() && w.Project != "" {
+		netName = projectNetworkName(w.Project)
+		if err := d.EnsureNetwork(ctx, netName); err != nil {
+			return "", warnings, fmt.Errorf("ensure network %s: %w", netName, err)
+		}
+	}
+
 	existing, err := d.cli.ContainerInspect(ctx, name)
 	if err == nil {
 		image, _, err := d.cli.ImageInspectWithRaw(ctx, w.Image)
 		if err != nil {
 			return "", warnings, fmt.Errorf("inspect workload image %s: %w", w.Image, err)
 		}
-		if !containerImageMatches(existing.Image, image.ID) || !containerHostsMatch(existing.HostConfig, extraHosts) || !containerRuntimeMatches(existing.Config, w.Runtime) {
+		onNetwork := netName == "" || containerOnNetwork(existing, netName, w.Service)
+		if !containerImageMatches(existing.Image, image.ID) || !containerHostsMatch(existing.HostConfig, extraHosts) || !containerRuntimeMatches(existing.Config, w.Runtime) || !onNetwork {
 			// The workload key (and therefore its container name) stays the
 			// same across redeploys. A mutable tag such as :latest can now
 			// point at a different image, so remove the old container before
@@ -535,6 +545,25 @@ func (d *Docker) EnsureRunning(ctx context.Context, w model.Workload, extraHosts
 		}
 	}
 
+	hostConfig := &container.HostConfig{
+		PortBindings: bindings,
+		Binds:        binds,
+		ExtraHosts:   extraHosts,
+		RestartPolicy: container.RestartPolicy{
+			Name:              w.Runtime.Restart.Name,
+			MaximumRetryCount: w.Runtime.Restart.MaxRetries,
+		},
+		Resources: container.Resources{
+			NanoCPUs: w.Resources.CPUMillis * 1_000_000,
+			Memory:   w.Resources.MemoryBytes,
+		},
+	}
+	networking := &network.NetworkingConfig{}
+	if netName != "" {
+		hostConfig.NetworkMode = container.NetworkMode(netName)
+		networking.EndpointsConfig = map[string]*network.EndpointSettings{netName: {Aliases: []string{w.Service}}}
+	}
+
 	resp, err := d.cli.ContainerCreate(ctx,
 		&container.Config{
 			Image:        w.Image,
@@ -550,20 +579,8 @@ func (d *Docker) EnsureRunning(ctx context.Context, w model.Workload, extraHosts
 			},
 			Healthcheck: healthConfigFor(w.HealthCheck),
 		},
-		&container.HostConfig{
-			PortBindings: bindings,
-			Binds:        binds,
-			ExtraHosts:   extraHosts,
-			RestartPolicy: container.RestartPolicy{
-				Name:              w.Runtime.Restart.Name,
-				MaximumRetryCount: w.Runtime.Restart.MaxRetries,
-			},
-			Resources: container.Resources{
-				NanoCPUs: w.Resources.CPUMillis * 1_000_000,
-				Memory:   w.Resources.MemoryBytes,
-			},
-		},
-		&network.NetworkingConfig{},
+		hostConfig,
+		networking,
 		nil,
 		name,
 	)

@@ -20,14 +20,22 @@ func TestEnsureRunningReplacesContainerWhenMutableImageTagChanges(t *testing.T) 
 	removedOld := false
 	createdNew := false
 	var createdHostConfig struct {
-		ExtraHosts []string `json:"ExtraHosts"`
-		DNS        []string `json:"Dns"`
-		DNSSearch  []string `json:"DnsSearch"`
+		ExtraHosts  []string `json:"ExtraHosts"`
+		DNS         []string `json:"Dns"`
+		DNSSearch   []string `json:"DnsSearch"`
+		NetworkMode string   `json:"NetworkMode"`
+	}
+	var createdNetworking struct {
+		EndpointsConfig map[string]struct {
+			Aliases []string `json:"Aliases"`
+		} `json:"EndpointsConfig"`
 	}
 	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		status := http.StatusOK
 		body := "{}"
 		switch {
+		case req.Method == http.MethodGet && strings.HasSuffix(req.URL.Path, "/networks/haco-service-dns"):
+			// the project network already exists
 		case strings.HasSuffix(req.URL.Path, "/containers/haco-service-dns-client-latest/json"):
 			body = `{"Id":"old-container","Image":"sha256:old-image","State":{"Running":true}}`
 		case strings.HasSuffix(req.URL.Path, "/images/registry/service-dns-client:latest/json"):
@@ -41,12 +49,16 @@ func TestEnsureRunningReplacesContainerWhenMutableImageTagChanges(t *testing.T) 
 				t.Fatal("created replacement before removing stale container")
 			}
 			var request struct {
-				HostConfig json.RawMessage `json:"HostConfig"`
+				HostConfig       json.RawMessage `json:"HostConfig"`
+				NetworkingConfig json.RawMessage `json:"NetworkingConfig"`
 			}
 			if err := json.NewDecoder(req.Body).Decode(&request); err != nil {
 				t.Fatal(err)
 			}
 			if err := json.Unmarshal(request.HostConfig, &createdHostConfig); err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(request.NetworkingConfig, &createdNetworking); err != nil {
 				t.Fatal(err)
 			}
 			createdNew = true
@@ -92,6 +104,51 @@ func TestEnsureRunningReplacesContainerWhenMutableImageTagChanges(t *testing.T) 
 	}
 	if len(createdHostConfig.DNS) != 0 || len(createdHostConfig.DNSSearch) != 0 {
 		t.Fatalf("container DNS overrides = %v / %v, want default Docker DNS", createdHostConfig.DNS, createdHostConfig.DNSSearch)
+	}
+	// The container joins its project's network under its service name, so
+	// other services on this node reach it as client:<port>.
+	if createdHostConfig.NetworkMode != "haco-service-dns" {
+		t.Fatalf("network mode = %q, want haco-service-dns", createdHostConfig.NetworkMode)
+	}
+	if ep, ok := createdNetworking.EndpointsConfig["haco-service-dns"]; !ok || len(ep.Aliases) != 1 || ep.Aliases[0] != "client" {
+		t.Fatalf("endpoints = %+v, want haco-service-dns with alias client", createdNetworking.EndpointsConfig)
+	}
+}
+
+func TestExistingContainerOnTheDefaultBridgeIsRecreatedOntoTheProjectNetwork(t *testing.T) {
+	removed := false
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		status, body := http.StatusOK, "{}"
+		switch {
+		case req.Method == http.MethodGet && strings.HasSuffix(req.URL.Path, "/networks/haco-shop"):
+		case strings.HasSuffix(req.URL.Path, "/containers/haco-shop-api-latest/json"):
+			// same image, but attached only to Docker's default bridge
+			body = `{"Id":"old","Image":"sha256:img","State":{"Running":true},"HostConfig":{},"NetworkSettings":{"Networks":{"bridge":{"Aliases":null}}}}`
+		case strings.HasSuffix(req.URL.Path, "/images/api:latest/json"):
+			body = `{"Id":"sha256:img"}`
+		case req.Method == http.MethodDelete && strings.HasSuffix(req.URL.Path, "/containers/old"):
+			removed = true
+			status, body = http.StatusNoContent, ""
+		case req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/containers/create"):
+			body = `{"Id":"new","Warnings":[]}`
+		case req.Method == http.MethodPost && strings.HasSuffix(req.URL.Path, "/containers/new/start"):
+			status, body = http.StatusNoContent, ""
+		default:
+			t.Fatalf("unexpected Docker API request: %s %s", req.Method, req.URL)
+		}
+		return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+	})
+	cli, err := client.NewClientWithOpts(client.WithHost("http://docker.test"), client.WithVersion("1.41"), client.WithHTTPClient(&http.Client{Transport: transport}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &Docker{cli: cli, nodeID: "n"}
+	id, _, err := d.EnsureRunning(context.Background(), model.Workload{Project: "shop", Service: "api", Revision: "latest", Image: "api:latest"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != "new" || !removed {
+		t.Fatalf("id = %q, removed = %v; a container off the project network must be replaced", id, removed)
 	}
 }
 

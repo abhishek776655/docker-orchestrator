@@ -400,7 +400,11 @@ type ServiceInstance struct {
 	// name, for example metaapi:5000 — independent of any published host
 	// port, and discoverable even when the workload publishes none.
 	ContainerPort int
-	Status        Status
+	// Ports are every published container-port -> host-port pair of the
+	// service. A node reaching this service from elsewhere sends traffic to
+	// Address:HostPort, which Docker maps to the container port.
+	Ports  []PortBinding
+	Status Status
 }
 
 // Key returns the stable identity used to key reservations and decisions.

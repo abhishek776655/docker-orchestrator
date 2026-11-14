@@ -70,6 +70,9 @@ type Agent struct {
 	memMu  sync.Mutex
 	memory map[string]int64 // latest per-workload memory use, sent with each heartbeat
 
+	fwdMu     sync.Mutex        // one forwarder sync at a time
+	fwdWarned map[string]string // per project: the unpublished services already warned about
+
 	locks    keyLocks       // one in-flight handler per workload
 	heavy    chan struct{}  // build/pull slots
 	inflight sync.WaitGroup // workload handlers still running
@@ -94,7 +97,7 @@ func New(cfg Config, docker *Docker) *Agent {
 	apiClient := pinnedHTTPClient(cfg.TLSFingerprint, agentAPIHTTPTimeout)
 	transferClient := *apiClient // share the same transport and certificate pinning
 	transferClient.Timeout = agentTransferHTTPTimeout
-	return &Agent{cfg: cfg, docker: docker, http: apiClient, transferHTTP: &transferClient, heavy: heavySlotsFromEnv()}
+	return &Agent{cfg: cfg, docker: docker, http: apiClient, transferHTTP: &transferClient, heavy: heavySlotsFromEnv(), fwdWarned: map[string]string{}}
 }
 
 func pinnedHTTPClient(fingerprint string, timeout time.Duration) *http.Client {
@@ -454,6 +457,7 @@ func (a *Agent) pollAndExecute(ctx context.Context) error {
 	}
 
 	assignedHere, executable := splitAssignments(assignments)
+	a.syncForwardersFor(ctx, assignments)
 	for _, rec := range executable {
 		rec := rec
 		// Each workload in its own goroutine; one still being handled from an
@@ -577,6 +581,9 @@ func (a *Agent) execute(ctx context.Context, rec store.WorkloadRecord) {
 		return
 	}
 	extraHosts = append(extraHosts, rec.Runtime.ExtraHosts...)
+	// Make sure the services on other nodes are reachable by name before
+	// this one starts.
+	a.syncForwarders(ctx, []string{rec.Project})
 
 	if rec.RemoteBuild != nil {
 		if needsRemoteBuild(*rec.RemoteBuild, a.docker.HasImage(ctx, rec.Image), a.docker.ImageBuildID(ctx, rec.Image)) {
@@ -834,9 +841,15 @@ func (a *Agent) resolveDependencies(ctx context.Context, project string, deps, h
 	if err := a.get(ctx, "/v1/services/"+project, &instances); err != nil {
 		return nil, false, err
 	}
-	entries, err := projectServiceHostEntries(instances)
-	if err != nil {
-		return nil, false, err
+	// With project networks, names resolve through Docker DNS (same node) or
+	// a forwarder (other node), so no name -> node address entries are needed.
+	var entries []string
+	if !projectNetworksEnabled() {
+		var err error
+		entries, err = projectServiceHostEntries(instances)
+		if err != nil {
+			return nil, false, err
+		}
 	}
 	needsHealthy := make(map[string]bool, len(healthyDeps))
 	for _, d := range healthyDeps {
@@ -961,4 +974,55 @@ func (a *Agent) doRaw(req *http.Request) (*http.Response, []byte, error) {
 		return nil, nil, err
 	}
 	return resp, data, nil
+}
+
+// syncForwardersFor keeps the forwarders of every project that has a service
+// on this node in step with where the project's services run now, and removes
+// the forwarders of projects that no longer have one.
+func (a *Agent) syncForwardersFor(ctx context.Context, assignments []store.WorkloadRecord) {
+	if !projectNetworksEnabled() {
+		return
+	}
+	seen := map[string]bool{}
+	var projects []string
+	for _, rec := range assignments {
+		if rec.Project != "" && !seen[rec.Project] {
+			seen[rec.Project] = true
+			projects = append(projects, rec.Project)
+		}
+	}
+	a.syncForwarders(ctx, projects)
+	a.fwdMu.Lock()
+	defer a.fwdMu.Unlock()
+	if err := a.docker.RemoveForwardersExcept(ctx, seen); err != nil {
+		log.Printf("remove stale forwarders: %v", err)
+	}
+}
+
+// syncForwarders makes the forwarders for the given projects match the
+// control plane's list of where each service runs.
+func (a *Agent) syncForwarders(ctx context.Context, projects []string) {
+	if !projectNetworksEnabled() {
+		return
+	}
+	a.fwdMu.Lock()
+	defer a.fwdMu.Unlock()
+	for _, project := range projects {
+		if project == "" {
+			continue
+		}
+		var instances []model.ServiceInstance
+		if err := a.get(ctx, "/v1/services/"+project, &instances); err != nil {
+			log.Printf("forwarders for %s: list services: %v", project, err)
+			continue
+		}
+		forwards, skipped := forwardsFor(a.cfg.NodeID, instances)
+		if len(skipped) > 0 && strings.Join(skipped, ",") != a.fwdWarned[project] {
+			a.fwdWarned[project] = strings.Join(skipped, ",")
+			log.Printf("forwarders for %s: %s run on another node but publish no port, so nothing here can reach them by name; publish a port for them in the Compose file", project, strings.Join(skipped, ", "))
+		}
+		if err := a.docker.SyncForwarders(ctx, project, groupForwards(forwards)); err != nil {
+			log.Printf("forwarders for %s: %v", project, err)
+		}
+	}
 }
