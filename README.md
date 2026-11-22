@@ -211,6 +211,9 @@ Compose file there and `-p` (the project name) to the folder's name, as in
 | Services and where they run | `haco ps [project]` |
 | Projects | `haco projects` |
 | Live logs | `haco logs <project> <service> -f` |
+| Every service's logs, name-prefixed | `haco logs <project> [-f]` |
+| A shell or command in a container | `haco exec <project> <service> [-- cmd ...]` |
+| Reach a service's port from this machine | `haco port-forward <project> <service> [local:]remote` or `--all` |
 | Stop / start again / restart | `haco stop <project> [service...]`, `haco resume <project> [service...]`, `haco restart <project> [service...]` |
 | Remove a project's services | `haco rm <project>` (or `haco rm <project> <service>`) |
 | Nodes | `haco nodes`, `haco node show <id>` |

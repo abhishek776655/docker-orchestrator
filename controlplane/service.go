@@ -64,6 +64,8 @@ type Service struct {
 	nodeReqs nodeRequests
 	// imagePushes holds `haco image push` archives until nodes load them.
 	imagePushes imagePushState
+	// tunnels holds interactive sessions (exec, port-forward) being joined.
+	tunnels tunnelState
 
 	// volumeSnapshots holds a directory bind mount's content as a tarball,
 	// keyed by workload-key + volume index — the same in-memory, fetch-

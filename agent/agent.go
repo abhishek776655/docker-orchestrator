@@ -186,6 +186,9 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 	}()
 
+	// Interactive sessions (exec, port-forward) wait on a long poll.
+	go a.tunnelLoop(ctx)
+
 	// Control requests (live logs, cluster shutdown) get their own loop:
 	// pollAndExecute can be stuck in a long build and must not delay them.
 	go func() {

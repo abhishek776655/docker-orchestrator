@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -63,6 +64,10 @@ func main() {
 
 	url := envOr("HACO_CONTROLPLANE_URL", "http://localhost:8099")
 	if err := cmd.run(url, args); err != nil {
+		var ee exitCodeError
+		if errors.As(err, &ee) {
+			os.Exit(ee.code) // a command's own exit code, as `docker exec` does
+		}
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
@@ -1806,10 +1811,37 @@ func refreshCluster(baseURL string, args []string, credentialDir string, stop fu
 }
 
 func logs(baseURL string, args []string) error {
+	// `haco logs <project> [flags]` shows every service, with name prefixes.
+	var positional []string
+	for _, a := range args {
+		if !strings.HasPrefix(a, "-") {
+			positional = append(positional, a)
+		}
+	}
+	if len(positional) == 1 && !logFlagTakesValue(args, positional[0]) {
+		var flags []string
+		for _, a := range args {
+			if a != positional[0] {
+				flags = append(flags, a)
+			}
+		}
+		return projectLogs(baseURL, positional[0], flags)
+	}
 	return fetchLogs(http.DefaultClient, baseURL, args, os.Stdout)
 }
 
-const logsUsage = "usage: haco logs <project> <service> [--tail N] [-f]"
+// logFlagTakesValue reports whether word is the value of --tail/-n rather
+// than a project name.
+func logFlagTakesValue(args []string, word string) bool {
+	for i, a := range args {
+		if (a == "--tail" || a == "-n") && i+1 < len(args) && args[i+1] == word {
+			return true
+		}
+	}
+	return false
+}
+
+const logsUsage = "usage: haco logs <project> [service] [--tail N] [-f]"
 
 const followWindow = 1000
 

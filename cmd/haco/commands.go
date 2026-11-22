@@ -105,15 +105,44 @@ With a project and a service, prints that one service's full detail as JSON.`,
 		},
 		{
 			name: "logs", group: groupProject,
-			summary: "show a service's logs; -f follows them",
-			detail: `Usage: haco logs <project> <service> [--tail N] [-f]
+			summary: "show a service's logs, or all of a project's; -f follows them",
+			detail: `Usage: haco logs <project> [service] [--tail N] [-f]
 
 Shows the container's logs from whichever node runs it. If the container failed to start, shows the
-tail captured at that moment.
+tail captured at that moment. Without a service, shows every service of the project, each line led
+by the service name (like 'docker compose logs').
 
   --tail N, -n N          lines to show (default 200)
   -f, --follow            keep following new output`,
 			run: logs,
+		},
+		{
+			name: "exec", group: groupProject,
+			summary: "run a command or shell inside a service's container",
+			detail: `Usage: haco exec <project> <service> [-t | -T] [--] [command ...]
+
+Runs the command (default: sh) in the service's container on whichever node runs it, through the
+control plane, so nothing needs to be published. Gets a terminal when both input and output are
+one; -t forces it, -T turns it off. Exits with the command's own exit code.
+
+  haco exec shop db psql -U postgres
+  haco exec shop api -- ls -la /app`,
+			run: execCmd,
+		},
+		{
+			name: "port-forward", group: groupProject,
+			summary: "reach a service's port from this machine, wherever it runs",
+			detail: `Usage: haco port-forward <project> <service> [local:]remote [[local:]remote ...]
+       haco port-forward <project> --all
+
+Listens on 127.0.0.1 and relays each connection to the service's container port through the
+control plane, so an IDE or database client can use localhost:5432 even when the service
+publishes nothing and runs on another machine. Stays up until Ctrl-C.
+
+  haco port-forward shop db 5432          localhost:5432 -> db:5432
+  haco port-forward shop db 15432:5432    localhost:15432 -> db:5432
+  haco port-forward shop --all            every service's ports (a taken number gets a free one)`,
+			run: portForward,
 		},
 		{
 			name: "stop", group: groupProject,
