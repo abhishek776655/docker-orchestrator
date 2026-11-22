@@ -190,6 +190,18 @@ Starts the control plane in the background. Each node builds its own images.
 			run: start,
 		},
 		{
+			name: "image", group: groupNodes,
+			summary: "send a local image to nodes that cannot pull it",
+			detail: `Usage: haco image push <image> --node ID [--node ID ...]
+       haco image push <image> --all [--any-arch]
+
+Streams 'docker save <image>' from this machine to the nodes' agents, which run
+'docker load'. No registry needed; the image then shows in the node's cached
+images, so the scheduler prefers it. Nodes that already have it are skipped, and
+so are nodes with a different CPU architecture unless --any-arch is given.`,
+			run: imageCmd,
+		},
+		{
 			name: "service", group: groupCluster,
 			summary: "run the control plane or agent as a login service (survives reboots)",
 			detail: `Usage: haco service install controlplane [--web] [--registry] [--env-file FILE]

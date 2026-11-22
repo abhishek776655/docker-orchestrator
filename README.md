@@ -174,6 +174,19 @@ A binary built from source reports its version as `dev`.
   haco agent run
   ```
 
+- Send a local image to nodes that can't pull it (a private image, a local
+  build, no registry):
+
+  ```bash
+  haco image push myapp:dev --node laptop-2 --node mini
+  haco image push myapp:dev --all
+  ```
+
+  It streams `docker save` to each node's agent, which runs `docker load`;
+  the image then shows in the node's cached images and the scheduler
+  prefers that node. Nodes that already have it are skipped, and so are
+  nodes with a different CPU architecture unless you add `--any-arch`.
+
 - `haco plan` never changes anything; use it to check placements before
   a deploy. `haco deploy` shows live status until every service is ready
   or failed.

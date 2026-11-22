@@ -2,6 +2,7 @@ package agent
 
 import (
 	"archive/tar"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -340,6 +341,25 @@ func busyPortsFrom(list []types.Container) map[int]string {
 func (d *Docker) RemoveImage(ctx context.Context, ref string) error {
 	_, err := d.cli.ImageRemove(ctx, ref, types.ImageRemoveOptions{PruneChildren: true})
 	return err
+}
+
+// LoadImage runs `docker load` on a tar stream (the output of `docker save`).
+func (d *Docker) LoadImage(ctx context.Context, r io.Reader) error {
+	resp, err := d.cli.ImageLoad(ctx, r, true)
+	if err != nil {
+		return fmt.Errorf("docker load: %w", err)
+	}
+	defer resp.Body.Close()
+	out, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("docker load: %w", err)
+	}
+	// With quiet output the daemon reports a failure as an error object in
+	// the JSON stream rather than an HTTP status.
+	if i := bytes.Index(out, []byte(`"error"`)); i >= 0 {
+		return fmt.Errorf("docker load: %s", bytes.TrimSpace(out))
+	}
+	return nil
 }
 
 // PullImage pulls an image reference, draining the progress stream.

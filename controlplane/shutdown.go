@@ -209,7 +209,7 @@ func (svc *Service) handleAgentControl(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	restart, images, volumes := svc.requests().take(node)
-	writeJSON(w, http.StatusOK, map[string]any{"shutdown": svc.shutdownRequested(node), "rename_to": svc.pendingRenameFor(node), "restart": restart, "remove_images": images, "remove_volumes": volumes})
+	writeJSON(w, http.StatusOK, map[string]any{"shutdown": svc.shutdownRequested(node), "rename_to": svc.pendingRenameFor(node), "restart": restart, "remove_images": images, "remove_volumes": volumes, "load_images": svc.imagePushes.take(node)})
 }
 
 func (svc *Service) handleShutdownDone(w http.ResponseWriter, r *http.Request) {

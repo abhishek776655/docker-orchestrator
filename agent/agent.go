@@ -217,6 +217,9 @@ func (a *Agent) Run(ctx context.Context) error {
 				if len(ctl.RemoveVolumes) > 0 {
 					go a.removeVolumes(ctx, ctl.RemoveVolumes)
 				}
+				if len(ctl.LoadImages) > 0 {
+					go a.loadImages(ctx, ctl.LoadImages)
+				}
 			}
 		}
 	}()
@@ -274,6 +277,13 @@ type controlResponse struct {
 	RemoveImages []string `json:"remove_images"`
 	// RemoveVolumes lists workload keys whose volume data to delete here.
 	RemoveVolumes []string `json:"remove_volumes"`
+	// LoadImages lists `haco image push` archives to fetch and `docker load`.
+	LoadImages []loadImage `json:"load_images"`
+}
+
+type loadImage struct {
+	ID    string `json:"id"`
+	Image string `json:"image"`
 }
 
 // removeVolumes deletes workloads' volume data on this node and reports it.

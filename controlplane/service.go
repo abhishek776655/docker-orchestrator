@@ -60,6 +60,8 @@ type Service struct {
 	rescheduleAfter time.Duration
 	// nodeReqs queues restarts and image deletions for agents' control polls.
 	nodeReqs nodeRequests
+	// imagePushes holds `haco image push` archives until nodes load them.
+	imagePushes imagePushState
 
 	// volumeSnapshots holds a directory bind mount's content as a tarball,
 	// keyed by workload-key + volume index — the same in-memory, fetch-
