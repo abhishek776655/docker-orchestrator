@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"runtime"
 	"slices"
@@ -22,6 +23,7 @@ import (
 	"github.com/abhishek/hardware-aware-container-orchestrator/agent"
 	"github.com/abhishek/hardware-aware-container-orchestrator/build"
 	"github.com/abhishek/hardware-aware-container-orchestrator/compose"
+	"github.com/abhishek/hardware-aware-container-orchestrator/dockerutil"
 	"github.com/abhishek/hardware-aware-container-orchestrator/model"
 	"github.com/abhishek/hardware-aware-container-orchestrator/scheduler"
 	"github.com/abhishek/hardware-aware-container-orchestrator/store"
@@ -788,6 +790,24 @@ func (svc *Service) resolveVolumeSeeds(plan *compose.Plan) error {
 			sourcePath := v.SeedDirKey
 			v.SeedDirKey = ""
 			key := fmt.Sprintf("%s:seed:%d", wl.Key(), j)
+			if volName, ok := strings.CutPrefix(sourcePath, compose.DockerVolumeSeedPrefix); ok {
+				jobs = append(jobs, func() error {
+					data, found, err := dockerutil.TarNamedVolume(context.Background(), volName)
+					if err != nil {
+						// Not fatal: the volume just starts empty, as before.
+						log.Printf("controlplane: not adopting docker volume %s for %s: %v", volName, wl.Service, err)
+						return nil
+					}
+					if !found {
+						return nil
+					}
+					svc.stashVolumeSnapshot(key, data)
+					v.SeedDirKey = key
+					log.Printf("controlplane: seeding %s/%s %s from docker volume %s", wl.Project, wl.Service, v.ContainerPath, volName)
+					return nil
+				})
+				continue
+			}
 			jobs = append(jobs, func() error {
 				tarball, err := build.TarContext(sourcePath)
 				if err != nil {

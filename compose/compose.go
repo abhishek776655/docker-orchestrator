@@ -113,7 +113,7 @@ func Load(ctx context.Context, project, workingDir string, yaml []byte) (*Plan, 
 		},
 	}
 
-	objs := fileObjects{secrets: proj.Secrets, configs: proj.Configs, env: env}
+	objs := fileObjects{secrets: proj.Secrets, configs: proj.Configs, env: env, volumes: proj.Volumes, composeProject: composeProjectName(workingDir)}
 
 	names := make([]string, 0, len(proj.Services))
 	for name := range proj.Services {
@@ -631,6 +631,9 @@ func convertService(project, workingDir, name string, svc types.ServiceConfig, b
 			// clears it, if there's nothing worth seeding) before the
 			// workload is ever persisted or sent to an agent.
 			seed := candidateSeedPath(v)
+			if seed == "" && v.Type == "volume" {
+				seed = namedVolumeSeed(v, objs.volumes, objs.composeProject)
+			}
 			seeded = seeded || seed != ""
 			wl.Volumes = append(wl.Volumes, model.VolumeMount{ContainerPath: v.Target, ReadOnly: v.ReadOnly, SeedDirKey: seed})
 		default:
@@ -748,6 +751,10 @@ type fileObjects struct {
 	secrets types.Secrets
 	configs types.Configs
 	env     types.Mapping
+	volumes types.Volumes
+	// composeProject is the name `docker compose` would give this stack
+	// (its directory's name), which prefixes its named volumes.
+	composeProject string
 }
 
 // fileMounts turns a service's secrets and configs into single-file mounts
@@ -982,6 +989,43 @@ func candidateSeedPath(v types.ServiceVolumeConfig) string {
 	return v.Source
 }
 
+// DockerVolumeSeedPrefix marks a SeedDirKey candidate that names an existing
+// Docker named volume on the control-plane host instead of a directory.
+const DockerVolumeSeedPrefix = "docker-volume:"
+
+// namedVolumeSeed offers the Docker named volume a plain `docker compose up`
+// would have created (<compose project>_<volume>, or the volume's explicit
+// name) as the managed volume's one-time seed. Whether it exists and has
+// data is checked later, when the seed is packaged. Set
+// HACO_ADOPT_DOCKER_VOLUMES=0 to turn this off.
+func namedVolumeSeed(v types.ServiceVolumeConfig, volumes types.Volumes, composeProject string) string {
+	if os.Getenv("HACO_ADOPT_DOCKER_VOLUMES") == "0" || v.Source == "" {
+		return ""
+	}
+	name := composeProject + "_" + v.Source
+	if def, ok := volumes[v.Source]; ok && def.Name != "" && !strings.HasPrefix(def.Name, "_") {
+		name = def.Name // explicit `name:` (or external)
+	}
+	if composeProject == "" && strings.HasPrefix(name, "_") {
+		return ""
+	}
+	return DockerVolumeSeedPrefix + name
+}
+
+// composeProjectName mirrors how `docker compose` names a stack that has no
+// explicit name: the working directory's base name, lower-cased, with
+// anything outside [a-z0-9_-] removed and leading '-'/'_' trimmed.
+func composeProjectName(workingDir string) string {
+	base := strings.ToLower(filepath.Base(filepath.Clean(workingDir)))
+	var b strings.Builder
+	for _, r := range base {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '_' || r == '-' {
+			b.WriteRune(r)
+		}
+	}
+	return strings.TrimLeft(b.String(), "-_")
+}
+
 // matchesAnyBuildContext reports whether path is equal to, or a
 // subdirectory of, any entry in contexts — the cross-service build-context
 // bind-mount auto-detection. contexts is every service's build.context in
@@ -1096,12 +1140,15 @@ func ApplyHostPinOverride(plan *Plan, pinHost []string) {
 // annotations in the Compose file itself — it's an override supplied per
 // `haco deploy/plan/build --pin-host`/`--pin-node` call.
 //
-// A freed workload loses any literal bind-mount HostPath too (same as
-// x-haco-place-anywhere): that path was only ever valid on this one host,
-// so once the workload is free to land elsewhere it must fall back to a
-// normal agent-managed volume instead. A single-file bind mount is
-// unaffected either way — its content already travels with the workload
-// (VolumeMount.FileContent, set at plan time), not a literal HostPath.
+// A freed workload keeps its bind-mount source, but not as a live bind: the
+// control plane ships the folder's current content to wherever the workload
+// lands (resolveVolumeSnapshots turns the HostPath into a snapshot for any
+// workload not pinned to this host). It used to be wiped here, on the
+// reasoning that the path is only valid on this host; that predates
+// snapshots, and the wiped mount became an empty folder that hid the code
+// the image itself had installed (an auth or validation service that then
+// could not find its own files). A single-file bind mount is unaffected —
+// its content already travels with the workload (VolumeMount.FileContent).
 func ApplyPinOverride(plan *Plan, pins map[string][]string) {
 	nodeByService := map[string]string{}
 	for node, services := range pins {
@@ -1133,9 +1180,6 @@ func ApplyPinOverride(plan *Plan, pins map[string][]string) {
 		}
 		if wl.Storage.Class == model.NodeLocalPersistent {
 			wl.Storage.PinnedNodeID = ""
-		}
-		for j := range wl.Volumes {
-			wl.Volumes[j].HostPath = ""
 		}
 	}
 }

@@ -534,8 +534,10 @@ volumes:
 	if byService["auth"].Storage.PinnedNodeID != "" {
 		t.Fatalf("auth: expected unpinned (not named in --pin-host)")
 	}
-	if len(byService["frontendapi"].Volumes) != 1 || byService["frontendapi"].Volumes[0].HostPath != "" {
-		t.Fatalf("frontendapi: expected its literal bind-mount host path cleared once unpinned, got %+v", byService["frontendapi"].Volumes)
+	// Unpinned does not mean empty: the source folder stays, and the control
+	// plane ships its content to the node the service lands on.
+	if len(byService["frontendapi"].Volumes) != 1 || byService["frontendapi"].Volumes[0].HostPath == "" {
+		t.Fatalf("frontendapi: expected its bind-mount source kept (to be shipped as a snapshot) once unpinned, got %+v", byService["frontendapi"].Volumes)
 	}
 }
 
@@ -969,5 +971,52 @@ services:
 		if len(w.Volumes) != 1 || w.Volumes[0].SeedDirKey != "" {
 			t.Fatalf("%s: volumes = %+v, want no seed candidate", w.Service, w.Volumes)
 		}
+	}
+}
+
+// A named volume offers the Docker volume a plain `docker compose up` would
+// have created (<dir name>_<volume>) as its seed candidate; an explicit
+// `name:` wins; HACO_ADOPT_DOCKER_VOLUMES=0 turns it off.
+func TestNamedVolumeGetsDockerVolumeSeedCandidate(t *testing.T) {
+	workingDir := filepath.Join(t.TempDir(), "myproj")
+	if err := os.Mkdir(workingDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	yaml := []byte(`
+services:
+  db:
+    image: postgres:14
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+  cache:
+    image: redis:7
+    volumes:
+      - shared:/data
+volumes:
+  pgdata:
+  shared:
+    name: custom-shared
+`)
+	seeds := func() map[string]string {
+		plan, err := compose.Load(context.Background(), "demo", workingDir, yaml)
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		out := map[string]string{}
+		for _, w := range plan.Workloads {
+			out[w.Service] = w.Volumes[0].SeedDirKey
+		}
+		return out
+	}
+	got := seeds()
+	if got["db"] != compose.DockerVolumeSeedPrefix+"myproj_pgdata" {
+		t.Fatalf("db seed = %q, want docker-volume:myproj_pgdata", got["db"])
+	}
+	if got["cache"] != compose.DockerVolumeSeedPrefix+"custom-shared" {
+		t.Fatalf("cache seed = %q, want docker-volume:custom-shared", got["cache"])
+	}
+	t.Setenv("HACO_ADOPT_DOCKER_VOLUMES", "0")
+	if got := seeds(); got["db"] != "" || got["cache"] != "" {
+		t.Fatalf("seeds with adoption off = %+v, want none", got)
 	}
 }
