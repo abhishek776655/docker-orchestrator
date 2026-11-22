@@ -9,6 +9,8 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/client"
+
+	"github.com/abhishek/hardware-aware-container-orchestrator/model"
 )
 
 // Every project gets one Docker network per node, and every container joins
@@ -58,6 +60,21 @@ func (d *Docker) EnsureNetwork(ctx context.Context, name string) error {
 		}
 	}
 	return err
+}
+
+// OnProjectNetwork reports whether a workload's running container is attached
+// to its project network under its service name. It is true when project
+// networks are off, the workload has no project, or the container can't be
+// inspected: the agent only acts on a clear "no".
+func (d *Docker) OnProjectNetwork(ctx context.Context, w model.Workload) bool {
+	if !projectNetworksEnabled() || w.Project == "" {
+		return true
+	}
+	info, err := d.cli.ContainerInspect(ctx, ContainerName(w.Key()))
+	if err != nil {
+		return true
+	}
+	return containerOnNetwork(info, projectNetworkName(w.Project), w.Service)
 }
 
 // containerOnNetwork reports whether an existing container is attached to the

@@ -2,6 +2,8 @@ package controlplane
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -70,5 +72,49 @@ func TestUnpinnedServicesAvoidTheNodeAlreadyCarryingPinnedOnes(t *testing.T) {
 	}
 	if decisions[0].Selected != "n2" {
 		t.Fatalf("free service went to %s, want n2: n1 already carries six pinned services", decisions[0].Selected)
+	}
+}
+
+// A service that is not pinned while others are must still get its source:
+// the pin used to wipe its bind mount, leaving an empty folder over the code.
+func TestUnpinnedServiceStillGetsItsSourceWhenOthersArePinned(t *testing.T) {
+	svc, s := twoNodeService(t)
+	ctx := context.Background()
+	for _, id := range []string{"n1", "n2"} {
+		n := model.Node{ID: id, Address: "10.0.0.1", Architecture: "arm64", Labels: map[string]string{}, Capabilities: map[string]bool{"buildx": true},
+			Availability: model.Available, HeartbeatAt: time.Now(), Allocatable: model.Resources{CPUMillis: 4000, MemoryBytes: 8 << 30}}
+		if err := s.UpsertNode(ctx, n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dir := t.TempDir()
+	for _, d := range []string{"app", "lib"} {
+		if err := os.MkdirAll(filepath.Join(dir, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, d, "a.py"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "app", "Dockerfile"), []byte("FROM alpine\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	yaml := "services:\n  app:\n    build: ./app\n    volumes:\n      - ./app:/app\n      - ./lib:/lib\n  other:\n    build: ./app\n    volumes:\n      - ./lib:/lib\n  db:\n    image: alpine\n"
+	// db is pinned to a node (as `keep on host` does for the host); app and
+	// other are not.
+	if _, _, err := svc.ComposeDeploy(ctx, "p", dir, []byte(yaml), DeployOptions{PinNodes: map[string][]string{"n1": {"db"}}}); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := svc.GetWorkload(ctx, "p/app/latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range rec.Volumes {
+		if v.RemoteDirKey == "" && v.HostPath == "" && v.SeedDirKey == "" {
+			t.Errorf("volume %s of an unpinned service came out as an empty folder", v.ContainerPath)
+		}
+	}
+	if len(rec.Volumes) != 2 {
+		t.Fatalf("%d volumes, want 2", len(rec.Volumes))
 	}
 }

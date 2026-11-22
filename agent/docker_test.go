@@ -319,3 +319,31 @@ func TestExtractTarToleratesUnwritableExistingFiles(t *testing.T) {
 		}
 	}
 }
+
+func TestOnProjectNetworkOnlySaysNoForAContainerOffTheNetwork(t *testing.T) {
+	respond := func(inspect string) *Docker {
+		transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			status, body := http.StatusOK, inspect
+			if !strings.HasSuffix(req.URL.Path, "/containers/haco-shop-api-latest/json") {
+				t.Fatalf("unexpected Docker API request: %s %s", req.Method, req.URL)
+			}
+			return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+		})
+		cli, err := client.NewClientWithOpts(client.WithHost("http://docker.test"), client.WithVersion("1.41"), client.WithHTTPClient(&http.Client{Transport: transport}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &Docker{cli: cli, nodeID: "n"}
+	}
+	w := model.Workload{Project: "shop", Service: "api", Revision: "latest"}
+	if respond(`{"Id":"c","NetworkSettings":{"Networks":{"bridge":{"Aliases":null}}}}`).OnProjectNetwork(context.Background(), w) {
+		t.Error("a container on the default bridge is not on the project network")
+	}
+	if !respond(`{"Id":"c","NetworkSettings":{"Networks":{"haco-shop":{"Aliases":["api","c"]}}}}`).OnProjectNetwork(context.Background(), w) {
+		t.Error("a container on the project network under its service name is")
+	}
+	t.Setenv("HACO_PROJECT_NETWORK", "false")
+	if !respond(`{"Id":"c","NetworkSettings":{"Networks":{"bridge":{}}}}`).OnProjectNetwork(context.Background(), w) {
+		t.Error("with project networks off every container counts as fine")
+	}
+}

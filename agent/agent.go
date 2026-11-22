@@ -478,6 +478,15 @@ func (a *Agent) handle(ctx context.Context, rec store.WorkloadRecord) {
 			log.Printf("liveness check failed for %s: %v", rec.Key(), err)
 			return
 		}
+		if alive && !a.docker.OnProjectNetwork(ctx, rec.Workload) {
+			// Created before project networks existed (by an older agent):
+			// it sits on Docker's default bridge with address entries instead
+			// of its name on the project network. A container that is already
+			// running is otherwise never looked at again, so move it now.
+			log.Printf("%s is not on its project network yet; recreating it", rec.Key())
+			a.execute(ctx, rec)
+			return
+		}
 		if alive {
 			// Still waiting on its own healthcheck (StatusRunning, not
 			// yet Ready — covers both a Compose healthcheck and one
@@ -603,6 +612,12 @@ func (a *Agent) execute(ctx context.Context, rec store.WorkloadRecord) {
 			a.report(ctx, key, model.StatusPulling, "", "")
 			return a.docker.PullImage(ctx, rec.Image, rec.Constraints.Architecture)
 		})
+		if err != nil && ctx.Err() == nil && a.docker.HasImage(ctx, rec.Image) {
+			// Registry unreachable (offline, flaky): the image is already
+			// local, so run it instead of failing the workload.
+			log.Printf("agent: pull %s failed (%v); using local image", rec.Image, err)
+			err = nil
+		}
 		if err != nil {
 			if ctx.Err() == nil {
 				a.report(ctx, key, model.StatusFailed, "pull failed: "+err.Error(), "")
