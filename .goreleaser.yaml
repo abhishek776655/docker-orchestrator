@@ -1,0 +1,66 @@
+# Release binaries: `git tag v0.1.0 && git push origin v0.1.0` runs
+# .github/workflows/release.yml, which runs GoReleaser with this file.
+# Local dry run (no publishing):  goreleaser release --snapshot --clean --skip=publish
+version: 2
+
+project_name: haco
+
+builds:
+  - id: haco
+    main: ./cmd/haco
+    binary: haco
+    env: [CGO_ENABLED=0] # pure Go (modernc sqlite): cross-compiles anywhere
+    goos: [darwin, linux]
+    goarch: [arm64, amd64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w
+      - -X github.com/abhishek/hardware-aware-container-orchestrator/buildinfo.Version={{.Version}}
+      - -X github.com/abhishek/hardware-aware-container-orchestrator/buildinfo.Commit={{.ShortCommit}}
+      - -X github.com/abhishek/hardware-aware-container-orchestrator/buildinfo.Date={{.Date}}
+  - id: agent
+    main: ./cmd/agent
+    binary: agent
+    env: [CGO_ENABLED=0] # pure Go (modernc sqlite): cross-compiles anywhere
+    goos: [darwin, linux]
+    goarch: [arm64, amd64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w
+      - -X github.com/abhishek/hardware-aware-container-orchestrator/buildinfo.Version={{.Version}}
+      - -X github.com/abhishek/hardware-aware-container-orchestrator/buildinfo.Commit={{.ShortCommit}}
+      - -X github.com/abhishek/hardware-aware-container-orchestrator/buildinfo.Date={{.Date}}
+  - id: controlplane
+    main: ./cmd/controlplane
+    binary: controlplane
+    env: [CGO_ENABLED=0] # pure Go (modernc sqlite): cross-compiles anywhere
+    goos: [darwin, linux]
+    goarch: [arm64, amd64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w
+      - -X github.com/abhishek/hardware-aware-container-orchestrator/buildinfo.Version={{.Version}}
+      - -X github.com/abhishek/hardware-aware-container-orchestrator/buildinfo.Commit={{.ShortCommit}}
+      - -X github.com/abhishek/hardware-aware-container-orchestrator/buildinfo.Date={{.Date}}
+
+archives:
+  - id: haco
+    format: tar.gz
+    name_template: "haco_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude: ["^docs:", "^test:"]
+
+release:
+  # The web console (built by the workflow) is one file for every platform:
+  # unpack it into ~/.haco/web.
+  extra_files:
+    - glob: ./dist-web/haco-web.tar.gz

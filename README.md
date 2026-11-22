@@ -67,6 +67,22 @@ Details on each step are under [Install](#install) and
 `$(go env GOPATH)/bin` and, when npm is available, builds the web console
 into `~/.haco/web`. Make sure that bin folder is on your `PATH`.
 
+### Prebuilt binaries (no Go needed)
+
+Each tagged release has `haco_<version>_<os>_<arch>.tar.gz` for macOS and
+Linux on arm64 and amd64, with `haco`, `agent` and `controlplane` inside,
+plus `haco-web.tar.gz` for the web console and `checksums.txt`.
+
+```bash
+tar -xzf haco_<version>_darwin_arm64.tar.gz -C /usr/local/bin haco agent controlplane
+mkdir -p ~/.haco/web && tar -xzf haco-web.tar.gz -C ~/.haco/web   # control-plane machine only
+haco version
+```
+
+Releases are cut by pushing a tag: `git tag v0.1.0 && git push origin v0.1.0`
+(`.github/workflows/release.yml` runs GoReleaser with `.goreleaser.yaml`).
+A binary built from source reports its version as `dev`.
+
 ## Features
 
 **Scheduling**

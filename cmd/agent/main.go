@@ -14,9 +14,14 @@ import (
 
 	"github.com/abhishek/hardware-aware-container-orchestrator/agent"
 	"github.com/abhishek/hardware-aware-container-orchestrator/agentjoin"
+	"github.com/abhishek/hardware-aware-container-orchestrator/buildinfo"
 )
 
 func main() {
+	if len(os.Args) == 2 && (os.Args[1] == "version" || buildinfo.IsVersionArg(os.Args[1])) {
+		fmt.Println(buildinfo.String("agent"))
+		return
+	}
 	nodeID := envOr("HACO_NODE_ID", agent.SavedNodeID())
 	credentialPath := envOr("HACO_AGENT_CREDENTIAL_FILE", filepath.Join(defaultDataDir(), "agent-credentials", nodeID+".json"))
 	if len(os.Args) == 3 && os.Args[1] == "join" {

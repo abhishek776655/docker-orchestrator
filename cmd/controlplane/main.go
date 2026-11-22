@@ -17,6 +17,7 @@ import (
 	"github.com/abhishek/hardware-aware-container-orchestrator/agent"
 	"github.com/abhishek/hardware-aware-container-orchestrator/agentjoin"
 	"github.com/abhishek/hardware-aware-container-orchestrator/build"
+	"github.com/abhishek/hardware-aware-container-orchestrator/buildinfo"
 	"github.com/abhishek/hardware-aware-container-orchestrator/controlplane"
 	"github.com/abhishek/hardware-aware-container-orchestrator/dockerutil"
 	"github.com/abhishek/hardware-aware-container-orchestrator/netutil"
@@ -24,6 +25,10 @@ import (
 )
 
 func main() {
+	if len(os.Args) == 2 && (os.Args[1] == "version" || buildinfo.IsVersionArg(os.Args[1])) {
+		fmt.Println(buildinfo.String("controlplane"))
+		return
+	}
 	addr := envOr("HACO_LISTEN_ADDR", "127.0.0.1:8099")
 	agentAddr := envOr("HACO_AGENT_LISTEN_ADDR", ":8443")
 

@@ -22,11 +22,16 @@ import (
 
 	"github.com/abhishek/hardware-aware-container-orchestrator/agent"
 	"github.com/abhishek/hardware-aware-container-orchestrator/agentjoin"
+	"github.com/abhishek/hardware-aware-container-orchestrator/buildinfo"
 )
 
 func main() {
 	if len(os.Args) < 2 {
 		usage()
+		return
+	}
+	if os.Args[1] == "version" || buildinfo.IsVersionArg(os.Args[1]) {
+		fmt.Println(buildinfo.String("haco"))
 		return
 	}
 	name, args := os.Args[1], os.Args[2:]
