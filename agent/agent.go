@@ -531,6 +531,11 @@ func (a *Agent) handle(ctx context.Context, rec store.WorkloadRecord) {
 					log.Printf("collect logs for %s failed: %v", rec.Key(), logErr)
 				}
 				reason := fmt.Sprintf("exited with code %d (restart: %s)", exited.ExitCode, rec.Runtime.Restart.Name)
+				if exited.ExitCode == 0 {
+					// A one-shot job that finished: a success, not a failure.
+					a.reportWithLogs(ctx, rec.Key(), model.StatusCompleted, reason, exited.ContainerID, logs)
+					return
+				}
 				a.reportWithLogs(ctx, rec.Key(), model.StatusFailed, reason, exited.ContainerID, logs)
 				return
 			}
@@ -552,7 +557,7 @@ func splitAssignments(records []store.WorkloadRecord) (map[string]bool, []store.
 		// Failed is terminal. Unreachable is the control plane's mark from
 		// before this node came back; it flips to assigned within a moment,
 		// and until then nothing is run or removed.
-		if rec.Status == model.StatusFailed || rec.Status == model.StatusUnreachable {
+		if rec.Status == model.StatusFailed || rec.Status == model.StatusUnreachable || rec.Status == model.StatusCompleted {
 			continue
 		}
 		executable = append(executable, rec)
@@ -590,9 +595,13 @@ func (a *Agent) cleanupOrphans(ctx context.Context, assignedHere map[string]bool
 func (a *Agent) execute(ctx context.Context, rec store.WorkloadRecord) {
 	key := rec.Key()
 
-	extraHosts, ready, err := a.resolveDependencies(ctx, rec.Project, rec.DependsOn, rec.DependsOnHealthy)
+	extraHosts, ready, failedDep, err := a.resolveDependencies(ctx, rec.Project, rec.DependsOn, rec.DependsOnHealthy, rec.DependsOnCompleted)
 	if err != nil {
 		a.report(ctx, key, model.StatusFailed, "dependency resolution failed: "+err.Error(), "")
+		return
+	}
+	if failedDep != "" {
+		a.report(ctx, key, model.StatusFailed, "dependency "+failedDep+" did not complete successfully", "")
 		return
 	}
 	if !ready {
@@ -659,6 +668,15 @@ func (a *Agent) execute(ctx context.Context, rec store.WorkloadRecord) {
 		logs, logErr := a.docker.ContainerLogs(ctx, containerID)
 		if logErr != nil {
 			log.Printf("collect logs for %s failed: %v", key, logErr)
+		}
+		// A short one-shot job can finish before the first look: that is
+		// success when it exited with code 0 and is meant to run once.
+		if rec.Runtime.Restart.Name != "" {
+			if exited, exErr := a.docker.Exited(ctx, key); exErr == nil && exited != nil && exited.ExitCode == 0 {
+				reason := fmt.Sprintf("exited with code 0 (restart: %s)", rec.Runtime.Restart.Name)
+				a.reportWithLogs(ctx, key, model.StatusCompleted, reason, containerID, logs)
+				return
+			}
 		}
 		a.reportWithLogs(ctx, key, model.StatusFailed, "did not reach running: "+err.Error(), containerID, logs)
 		return
@@ -874,44 +892,72 @@ func (a *Agent) fetchVolumeSeeds(ctx context.Context, rec store.WorkloadRecord) 
 // — those need an instance that's actually StatusReady (passed its own
 // healthcheck, see waitHealthy), not merely StatusRunning; every other dep
 // is satisfied by either.
-func (a *Agent) resolveDependencies(ctx context.Context, project string, deps, healthyDeps []string) ([]string, bool, error) {
+func (a *Agent) resolveDependencies(ctx context.Context, project string, deps, healthyDeps, completedDeps []string) (entries []string, ready bool, failedDep string, err error) {
 	var instances []model.ServiceInstance
-	if err := a.get(ctx, "/v1/services/"+project, &instances); err != nil {
-		return nil, false, err
+	path := "/v1/services/" + project
+	if len(completedDeps) > 0 {
+		path += "?failed=1" // a failed job must be told apart from one not placed yet
+	}
+	if err := a.get(ctx, path, &instances); err != nil {
+		return nil, false, "", err
 	}
 	// With project networks, names resolve through Docker DNS (same node) or
 	// a forwarder (other node), so no name -> node address entries are needed.
-	var entries []string
 	if !projectNetworksEnabled() {
-		var err error
-		entries, err = projectServiceHostEntries(instances)
+		var live []model.ServiceInstance
+		for _, in := range instances {
+			if in.Status != model.StatusFailed && in.Status != model.StatusCompleted {
+				live = append(live, in)
+			}
+		}
+		entries, err = projectServiceHostEntries(live)
 		if err != nil {
-			return nil, false, err
+			return nil, false, "", err
 		}
 	}
 	needsHealthy := make(map[string]bool, len(healthyDeps))
 	for _, d := range healthyDeps {
 		needsHealthy[d] = true
 	}
+	needsCompleted := make(map[string]bool, len(completedDeps))
+	for _, d := range completedDeps {
+		needsCompleted[d] = true
+	}
 	running, readyOnly := make(map[string]bool, len(instances)), make(map[string]bool, len(instances))
+	completed, failed := make(map[string]bool), make(map[string]bool)
 	for _, instance := range instances {
-		if instance.Status == model.StatusReady {
+		switch instance.Status {
+		case model.StatusReady:
 			readyOnly[instance.Service] = true
 			running[instance.Service] = true
-		} else if instance.Status == model.StatusRunning {
+		case model.StatusRunning:
 			running[instance.Service] = true
+		case model.StatusCompleted:
+			completed[instance.Service] = true
+		case model.StatusFailed:
+			failed[instance.Service] = true
 		}
 	}
 	for _, dep := range deps {
-		if needsHealthy[dep] {
-			if !readyOnly[dep] {
-				return nil, false, nil
+		switch {
+		case needsCompleted[dep]:
+			if failed[dep] && !completed[dep] {
+				return nil, false, dep, nil
 			}
-		} else if !running[dep] {
-			return nil, false, nil
+			if !completed[dep] {
+				return nil, false, "", nil
+			}
+		case needsHealthy[dep]:
+			if !readyOnly[dep] {
+				return nil, false, "", nil
+			}
+		default:
+			if !running[dep] {
+				return nil, false, "", nil
+			}
 		}
 	}
-	return entries, true, nil
+	return entries, true, "", nil
 }
 
 func projectServiceHostEntries(instances []model.ServiceInstance) ([]string, error) {

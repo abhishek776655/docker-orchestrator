@@ -421,3 +421,95 @@ func TestWorkloadRuntimeRoundTrips(t *testing.T) {
 		t.Fatalf("runtime = %+v, want %+v", got.Runtime, want)
 	}
 }
+
+// A finished one-shot job keeps its DependsOnCompleted across a round trip,
+// stays assigned (so its container and logs are kept), and holds no
+// capacity or placement slot.
+func TestCompletedWorkloadKeepsDependenciesAndHoldsNoCapacity(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	node := testNode("node-completed")
+	if err := s.UpsertNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	mk := func(service string, status model.Status, completedDeps []string) store.WorkloadRecord {
+		return store.WorkloadRecord{
+			Workload: model.Workload{
+				Project: "demo", Service: service, Revision: "latest", Image: service + ":latest",
+				Resources:          model.Resources{CPUMillis: 500, MemoryBytes: 1 << 20},
+				Storage:            model.StoragePolicy{Class: model.Ephemeral},
+				DesiredState:       model.DesiredRunning,
+				DependsOn:          completedDeps,
+				DependsOnCompleted: completedDeps,
+			},
+			Status: status,
+			NodeID: node.ID,
+		}
+	}
+	if err := s.CreateWorkload(ctx, mk("migrate", model.StatusCompleted, nil)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateWorkload(ctx, mk("api", model.StatusWaitingDependencies, []string{"migrate"})); err != nil {
+		t.Fatal(err)
+	}
+
+	api, err := s.GetWorkload(ctx, "demo/api/latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(api.DependsOnCompleted) != 1 || api.DependsOnCompleted[0] != "migrate" {
+		t.Fatalf("DependsOnCompleted = %v", api.DependsOnCompleted)
+	}
+
+	assigned, err := s.AssignedWorkloads(ctx, node.ID)
+	if err != nil || len(assigned) != 2 {
+		t.Fatalf("assigned = %d, %v; a completed job must stay assigned", len(assigned), err)
+	}
+	res, _, err := s.ActiveReservationsExcluding(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := res[node.ID].CPUMillis; got != 500 {
+		t.Fatalf("reserved CPU = %d, want only the waiting api's 500 (the finished job holds none)", got)
+	}
+	counts, err := s.ActiveWorkloadCounts(ctx, nil)
+	if err != nil || counts[node.ID] != 1 {
+		t.Fatalf("counts = %v, %v; want 1", counts, err)
+	}
+}
+
+func TestProjectServiceTargetsListFailedOnlyWhenAsked(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	node := testNode("node-targets")
+	if err := s.UpsertNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	for _, st := range []struct {
+		name   string
+		status model.Status
+	}{{"ok", model.StatusReady}, {"job-done", model.StatusCompleted}, {"job-bad", model.StatusFailed}} {
+		err := s.CreateWorkload(ctx, store.WorkloadRecord{
+			Workload: model.Workload{Project: "demo", Service: st.name, Revision: "latest", Image: "x:1", Storage: model.StoragePolicy{Class: model.Ephemeral}, DesiredState: model.DesiredRunning},
+			Status:   st.status, NodeID: node.ID,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	names := func(list []model.ServiceInstance) map[string]model.Status {
+		out := map[string]model.Status{}
+		for _, in := range list {
+			out[in.Service] = in.Status
+		}
+		return out
+	}
+	plain, _ := s.ListProjectServiceTargets(ctx, "demo")
+	if got := names(plain); got["job-done"] != model.StatusCompleted || got["ok"] != model.StatusReady || len(got) != 2 {
+		t.Fatalf("plain = %v, want ok and the completed job, no failed one", got)
+	}
+	withFailed, _ := s.ListProjectServiceTargetsWithFailed(ctx, "demo")
+	if got := names(withFailed); got["job-bad"] != model.StatusFailed || len(got) != 3 {
+		t.Fatalf("withFailed = %v", got)
+	}
+}

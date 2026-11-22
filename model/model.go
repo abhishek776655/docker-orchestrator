@@ -238,6 +238,11 @@ type Workload struct {
 	// its own Docker healthcheck (status ready), not merely be running;
 	// every other entry in DependsOn is satisfied by running or ready.
 	DependsOnHealthy []string
+	// DependsOnCompleted is the subset of DependsOn declared with
+	// `condition: service_completed_successfully`: a one-shot job (a
+	// migration, a seed) that must have exited with code 0 before this
+	// workload starts; a non-zero exit fails this workload too.
+	DependsOnCompleted []string
 	// HealthCheck is this workload's own Docker healthcheck, when its
 	// Compose service declares one and it isn't disabled — nil otherwise.
 	// When set, the agent waits for Docker to report it healthy before
@@ -376,6 +381,10 @@ const (
 	StatusReady    Status = "ready"
 	StatusFailed   Status = "failed"
 	StatusStopped  Status = "stopped"
+	// StatusCompleted means a one-shot workload (restart: "no") ran and
+	// exited with code 0. It is a success: dependents that wait on its
+	// completion can start, and the agent does not run it again.
+	StatusCompleted Status = "completed"
 	// StatusWaitingDependencies means the agent picked up the assignment
 	// but at least one entry in DependsOn has no ready instance yet
 	// (SRS UC-05, FR-014). The agent re-checks on its next poll.

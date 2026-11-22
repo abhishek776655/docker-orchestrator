@@ -142,6 +142,7 @@ const NOTE: Record<string, string> = {
   running: 'Process is up. The healthcheck has not passed yet.',
   ready: 'Healthcheck passes. Services waiting for this one can start.',
   unreachable: 'Its node stopped responding. The control plane keeps trying and resumes it, and restarts the services that depend on it, when the node answers.',
+  completed: 'A one-shot job that ran and exited with code 0. Services waiting for it to finish can start.',
   failed: 'The workload failed.',
   stopped: 'Stopped by an operator.',
 }
@@ -162,7 +163,7 @@ export function lifecycle(key: string, status: string, reason: string, events: A
     return detail || NOTE[state] || ''
   }
   const at = PATH.indexOf(status)
-  const terminal = status === 'failed' || status === 'stopped'
+  const terminal = status === 'failed' || status === 'stopped' || status === 'completed'
   const steps: LifecycleStep[] = []
   for (const [i, state] of PATH.entries()) {
     if (!ALWAYS.has(state) && !seen.has(state) && state !== status) continue
@@ -175,7 +176,7 @@ export function lifecycle(key: string, status: string, reason: string, events: A
     })
   }
   if (terminal) {
-    steps.push({ label: status, state: status === 'failed' ? 'bad' : 'now', time: seen.get(status)?.CreatedAt ?? '', note: reason || note(status) })
+    steps.push({ label: status, state: status === 'failed' ? 'bad' : status === 'completed' ? 'done' : 'now', time: seen.get(status)?.CreatedAt ?? '', note: reason || note(status) })
   }
   return steps
 }

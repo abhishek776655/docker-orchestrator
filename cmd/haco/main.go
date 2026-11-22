@@ -428,7 +428,7 @@ func deployAndWatch(baseURL, project string, body []byte) error {
 // every submitted workload reaches one of these, the deploy is done
 // (successfully or not); anything else (assigned, pulling, building,
 // starting, running, waiting_dependencies) is still in progress.
-var terminalStatuses = map[string]bool{"ready": true, "failed": true, "stopped": true}
+var terminalStatuses = map[string]bool{"ready": true, "completed": true, "failed": true, "stopped": true}
 
 const (
 	ansiReset  = "\033[0m"
@@ -443,7 +443,7 @@ const (
 // deliberate stop, yellow for everything still in progress in between.
 func colorStatus(status string) string {
 	switch status {
-	case "ready", "running":
+	case "ready", "running", "completed":
 		return ansiGreen + status + ansiReset
 	case "failed":
 		return ansiRed + status + ansiReset
@@ -776,7 +776,7 @@ func projects(baseURL string, args []string) error {
 	tw2 := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
 	fmt.Fprintln(tw2, "PROJECT\tWORKLOADS\tREADY\tFAILED\tSTOPPED\tOTHER")
 	for _, p := range out {
-		ready, failed, stopped := p.ByStatus["ready"], p.ByStatus["failed"], p.ByStatus["stopped"]
+		ready, failed, stopped := p.ByStatus["ready"]+p.ByStatus["completed"], p.ByStatus["failed"], p.ByStatus["stopped"]
 		other := p.Total - ready - failed - stopped
 		fmt.Fprintf(tw2, "%s\t%d\t%d\t%d\t%d\t%d\n", p.Project, p.Total, ready, failed, stopped, other)
 	}

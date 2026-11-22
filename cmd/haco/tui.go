@@ -462,7 +462,7 @@ func fetchProjectsTab(baseURL string) ([]table.Column, []table.Row, error) {
 	}
 	rows := make([]table.Row, 0, len(out))
 	for _, p := range out {
-		ready, failed, stopped := p.ByStatus["ready"], p.ByStatus["failed"], p.ByStatus["stopped"]
+		ready, failed, stopped := p.ByStatus["ready"]+p.ByStatus["completed"], p.ByStatus["failed"], p.ByStatus["stopped"]
 		other := p.Total - ready - failed - stopped
 		rows = append(rows, table.Row{
 			p.Project, strconv.Itoa(p.Total), strconv.Itoa(ready),

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -1018,5 +1019,54 @@ volumes:
 	t.Setenv("HACO_ADOPT_DOCKER_VOLUMES", "0")
 	if got := seeds(); got["db"] != "" || got["cache"] != "" {
 		t.Fatalf("seeds with adoption off = %+v, want none", got)
+	}
+}
+
+// depends_on service_completed_successfully is carried separately from
+// service_healthy, and the job it waits on runs once (restart "no") unless
+// the file says otherwise.
+func TestCompletedSuccessfullyDependencyIsCarriedAndTheJobRunsOnce(t *testing.T) {
+	yaml := []byte(`
+services:
+  migrate:
+    image: migrator:1
+  seed:
+    image: seeder:1
+    restart: on-failure:2
+  db:
+    image: postgres:16
+  api:
+    image: api:1
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      seed:
+        condition: service_completed_successfully
+`)
+	plan, err := compose.Load(context.Background(), "demo", t.TempDir(), yaml)
+	if err != nil {
+		t.Fatal(err)
+	}
+	by := map[string]model.Workload{}
+	for _, w := range plan.Workloads {
+		by[w.Service] = w
+	}
+	api := by["api"]
+	if !slices.Equal(api.DependsOnCompleted, []string{"migrate", "seed"}) || !slices.Equal(api.DependsOnHealthy, []string{"db"}) {
+		t.Fatalf("completed=%v healthy=%v", api.DependsOnCompleted, api.DependsOnHealthy)
+	}
+	if !slices.Equal(api.DependsOn, []string{"db", "migrate", "seed"}) {
+		t.Fatalf("DependsOn = %v", api.DependsOn)
+	}
+	if got := by["migrate"].Runtime.Restart.Name; got != "no" {
+		t.Fatalf("migrate restart = %q, want no (a job another service waits on runs once)", got)
+	}
+	if got := by["seed"].Runtime.Restart; got.Name != "on-failure" || got.MaxRetries != 2 {
+		t.Fatalf("seed restart = %+v, an explicit policy must stay", got)
+	}
+	if got := by["db"].Runtime.Restart.Name; got != "" {
+		t.Fatalf("db restart = %q, services nobody waits on to finish keep Docker's default", got)
 	}
 }

@@ -122,7 +122,7 @@ export function deriveProjects(workloads: ApiWorkload[]): ProjectView[] {
 }
 
 export function statusTone(status: string): Tone {
-  if (status === 'ready') return 'ok'
+  if (status === 'ready' || status === 'completed') return 'ok'
   if (status === 'failed') return 'bad'
   if (status === 'stopped') return 'off'
   return 'warn'

@@ -16,10 +16,10 @@ export function tileCounts(nodes: NodeView[], workloads: ApiWorkload[]): Tiles {
   return {
     schedulable: nodes.filter((n) => n.state === 'available' || n.state === 'throttling').length,
     nodes: nodes.length,
-    ready: desired.filter((w) => w.Status === 'ready').length,
+    ready: desired.filter((w) => w.Status === 'ready' || w.Status === 'completed').length,
     running: desired.length,
     failed: desired.filter((w) => w.Status === 'failed').length,
-    inProgress: desired.filter((w) => !['ready', 'failed', 'stopped'].includes(w.Status)).length,
+    inProgress: desired.filter((w) => !['ready', 'completed', 'failed', 'stopped'].includes(w.Status)).length,
   }
 }
 

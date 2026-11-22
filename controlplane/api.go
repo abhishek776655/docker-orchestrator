@@ -522,7 +522,15 @@ func (svc *Service) handleListServiceInstances(w http.ResponseWriter, r *http.Re
 }
 
 func (svc *Service) handleListProjectServices(w http.ResponseWriter, r *http.Request) {
-	instances, err := svc.ListProjectServices(r.Context(), r.PathValue("project"))
+	var instances []model.ServiceInstance
+	var err error
+	if r.URL.Query().Get("failed") == "1" {
+		// For an agent gating on service_completed_successfully, which has
+		// to tell a failed job from one that is not placed yet.
+		instances, err = svc.store.ListProjectServiceTargetsWithFailed(r.Context(), r.PathValue("project"))
+	} else {
+		instances, err = svc.ListProjectServices(r.Context(), r.PathValue("project"))
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -646,8 +654,8 @@ func (svc *Service) handleReportStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusRequestEntityTooLarge, fmt.Errorf("container logs exceed the 72 KiB limit"))
 		return
 	}
-	if req.Logs != "" && req.Status != model.StatusFailed {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("container logs may only accompany failed status reports"))
+	if req.Logs != "" && req.Status != model.StatusFailed && req.Status != model.StatusCompleted {
+		writeError(w, http.StatusBadRequest, fmt.Errorf("container logs may only accompany failed or completed status reports"))
 		return
 	}
 	if nodeID := authenticatedNode(r); nodeID != "" {

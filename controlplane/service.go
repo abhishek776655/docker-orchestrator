@@ -916,7 +916,7 @@ func (svc *Service) DeleteNode(ctx context.Context, nodeID string, force bool) e
 		}
 		var active []string
 		for _, w := range assigned {
-			if w.Status != model.StatusFailed {
+			if w.Status != model.StatusFailed && w.Status != model.StatusCompleted {
 				active = append(active, w.Key())
 			}
 		}

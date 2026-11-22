@@ -64,6 +64,9 @@ type forwarderGroup struct {
 func forwardsFor(localNode string, instances []model.ServiceInstance) (forwards []forward, skipped []string) {
 	seen := map[string]bool{}
 	for _, in := range instances {
+		if in.Status == model.StatusCompleted || in.Status == model.StatusFailed {
+			continue // nothing listens there
+		}
 		if seen[in.Service] {
 			continue // one instance per name
 		}

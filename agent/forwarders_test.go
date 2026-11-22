@@ -123,3 +123,14 @@ func TestProjectNetworkName(t *testing.T) {
 		}
 	}
 }
+
+func TestFinishedAndFailedServicesGetNoForwarder(t *testing.T) {
+	job := inst("migrate", "b", "192.168.1.18", pb(8080, 8080))
+	job.Status = model.StatusCompleted
+	bad := inst("broken", "b", "192.168.1.18", pb(9090, 9090))
+	bad.Status = model.StatusFailed
+	forwards, _ := forwardsFor("a", []model.ServiceInstance{job, bad, inst("api", "b", "192.168.1.18", pb(3000, 3000))})
+	if len(forwards) != 1 || forwards[0].Service != "api" {
+		t.Fatalf("forwards = %+v, want only api (nothing listens on a finished or failed service)", forwards)
+	}
+}

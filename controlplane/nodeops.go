@@ -80,7 +80,7 @@ func (svc *Service) StartWorkload(ctx context.Context, key string) error {
 	if err != nil {
 		return err
 	}
-	if rec.Status != model.StatusStopped && rec.Status != model.StatusFailed {
+	if rec.Status != model.StatusStopped && rec.Status != model.StatusFailed && rec.Status != model.StatusCompleted {
 		return nil // already running or on its way
 	}
 	if rec.NodeID == "" {
@@ -177,7 +177,7 @@ func (svc *Service) RemoveVolumes(ctx context.Context, nodeID string, keys []str
 		if err != nil {
 			return err
 		}
-		if rec.NodeID == nodeID && rec.Status != model.StatusStopped && rec.Status != model.StatusFailed {
+		if rec.NodeID == nodeID && rec.Status != model.StatusStopped && rec.Status != model.StatusFailed && rec.Status != model.StatusCompleted {
 			return fmt.Errorf("%w: %s is %s on %s; stop it first", ErrVolumeInUse, k, rec.Status, nodeID)
 		}
 	}

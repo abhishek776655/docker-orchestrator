@@ -193,6 +193,21 @@ func Load(ctx context.Context, project, workingDir string, yaml []byte) (*Plan, 
 		}
 	}
 
+	// A job another service waits on to finish runs once, as Compose does
+	// when `restart` is left unset; without a policy the agent would start
+	// it again every poll.
+	awaited := map[string]bool{}
+	for _, wl := range plan.Workloads {
+		for _, dep := range wl.DependsOnCompleted {
+			awaited[dep] = true
+		}
+	}
+	for i := range plan.Workloads {
+		if awaited[plan.Workloads[i].Service] && plan.Workloads[i].Runtime.Restart.Name == "" {
+			plan.Workloads[i].Runtime.Restart = model.RestartPolicy{Name: "no"}
+		}
+	}
+
 	neededByDependent := map[string]bool{}
 	for _, wl := range plan.Workloads {
 		for _, dep := range wl.DependsOn {
@@ -448,12 +463,16 @@ func convertService(project, workingDir, name string, svc types.ServiceConfig, b
 
 	for dep, cfg := range svc.DependsOn {
 		wl.DependsOn = append(wl.DependsOn, dep)
-		if cfg.Condition == types.ServiceConditionHealthy {
+		switch cfg.Condition {
+		case types.ServiceConditionHealthy:
 			wl.DependsOnHealthy = append(wl.DependsOnHealthy, dep)
+		case types.ServiceConditionCompletedSuccessfully:
+			wl.DependsOnCompleted = append(wl.DependsOnCompleted, dep)
 		}
 	}
 	sort.Strings(wl.DependsOn)
 	sort.Strings(wl.DependsOnHealthy)
+	sort.Strings(wl.DependsOnCompleted)
 
 	if svc.HealthCheck != nil && !svc.HealthCheck.Disable {
 		if isPlaceholderHealthCheck(svc.HealthCheck.Test) {

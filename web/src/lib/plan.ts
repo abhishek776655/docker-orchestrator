@@ -284,6 +284,7 @@ export function liveState(status: string | undefined): LiveState {
     case undefined:
       return 'planned'
     case 'ready':
+    case 'completed': // a one-shot job that finished: done, like ready
       return 'ready'
     case 'failed':
       return 'failed'

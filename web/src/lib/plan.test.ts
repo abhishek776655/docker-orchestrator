@@ -238,6 +238,7 @@ describe('liveState', () => {
     expect(liveState('building')).toBe('progress')
     expect(liveState('running')).toBe('progress')
     expect(liveState('waiting_dependencies')).toBe('waiting')
+    expect(liveState('completed')).toBe('ready')
     expect(liveState('failed')).toBe('failed')
   })
 })
