@@ -175,18 +175,38 @@ Resolves a logical service name to its current endpoints: node, address, port an
 		{
 			name: "start", group: groupCluster,
 			summary: "start the control plane in the background",
-			detail: `Usage: haco start [--web] [--registry] [--foreground] [--logs | --tui]
+			detail: `Usage: haco start [--web] [--registry] [--service] [--foreground] [--logs | --tui]
 
 Starts the control plane in the background. Each node builds its own images.
 
   --web                   also serve the web console and print its URL
   --registry              run the local build registry instead of building on each node
+  --service               install it as a login service that restarts if it dies (haco help service)
   -f, --foreground        run attached to this terminal
   --logs                  tail the control plane's log right after starting
   --tui                   open the terminal dashboard once ready
 
 --logs, --tui and --foreground cannot be combined.`,
 			run: start,
+		},
+		{
+			name: "service", group: groupCluster,
+			summary: "run the control plane or agent as a login service (survives reboots)",
+			detail: `Usage: haco service install controlplane [--web] [--registry] [--env-file FILE]
+       haco service install agent [--env-file FILE]
+       haco service uninstall controlplane|agent
+       haco service status controlplane|agent
+
+A LaunchAgent on macOS, a systemd user unit on Linux: starts at login and restarts
+if the process dies. 'haco start --service' is the same as installing the control plane.
+
+  --env-file FILE         KEY=VALUE lines (e.g. the keys that ${VARS} in your Compose file read)
+  HACO_*                  every HACO_* variable in your shell is copied in too
+
+The settings are copied into the service when you install it; install again to change them.
+They are stored in the service file (mode 0600). While the service is installed,
+'haco stop-cluster' stops it and 'haco start' starts it again.`,
+			run: serviceCmd,
 		},
 		{
 			name: "stop-cluster", group: groupCluster,

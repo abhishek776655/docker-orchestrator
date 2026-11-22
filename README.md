@@ -150,6 +150,24 @@ A binary built from source reports its version as `dev`.
   `journalctl --user -u haco-agent` on Linux.
 - Join tokens expire after 10 minutes. Get a fresh one any time from
   **Add node** in the console or with `haco node join-token`.
+- Keep the control plane running across reboots and logouts, instead of
+  starting it by hand:
+
+  ```bash
+  haco start --service [--web] [--registry]
+  haco service install agent --env-file keys.env   # a joined worker, same idea
+  haco service status controlplane
+  haco service uninstall controlplane
+  ```
+
+  A LaunchAgent on macOS, a systemd user unit on Linux; it restarts if the
+  process dies. Every `HACO_*` variable in your shell, plus the lines of
+  `--env-file` (e.g. the keys your Compose `${VARS}` read), are copied into
+  the service file (mode 0600), so run the install again to change them.
+  While it is installed, `haco stop-cluster` stops it and `haco start`
+  starts it again. On Linux, `sudo loginctl enable-linger $USER` keeps it
+  running after logout.
+
 - After a machine has joined once, restart its agent without a token:
 
   ```bash

@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1220,9 +1221,11 @@ func shutdown(baseURL string, args []string) error {
 // --registry turns on the local build/push registry (HACO_REGISTRY_ADDR=auto)
 // unless the caller already set HACO_REGISTRY_ADDR.
 func start(baseURL string, args []string) error {
-	foreground, registry, showLogs, showTUI, web := false, false, false, false, false
+	foreground, registry, showLogs, showTUI, web, asService := false, false, false, false, false, false
 	for _, a := range args {
 		switch a {
+		case "--service":
+			asService = true
 		case "--web":
 			web = true
 		case "--foreground", "-f":
@@ -1246,6 +1249,27 @@ func start(baseURL string, args []string) error {
 
 	dataDir := envOr("HACO_DATA_DIR", filepath.Join(homeDir(), ".haco"))
 	logPath := filepath.Join(dataDir, "controlplane.log")
+
+	// --service installs (or refreshes) the login service and lets it run
+	// the control plane; a later plain `haco start` reuses that service.
+	m := localServiceManager()
+	if asService && !foreground {
+		if controlPlaneUp(baseURL) && !m.Installed("controlplane") {
+			return fmt.Errorf("a control plane is already running at %s outside a service; run 'haco stop-cluster' first, then 'haco start --service'", baseURL)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := installService(ctx, m, baseURL, "controlplane", web, registry, ""); err != nil {
+			return err
+		}
+		if showLogs {
+			return tailLogFile(logPath)
+		}
+		if showTUI {
+			return runTUI(baseURL, nil)
+		}
+		return nil
+	}
 
 	webDir := ""
 	if web {
@@ -1272,6 +1296,23 @@ func start(baseURL string, args []string) error {
 			return runTUI(baseURL, nil)
 		}
 		return nil
+	}
+
+	if m.Installed("controlplane") && !foreground {
+		fmt.Println("starting the control plane service")
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := m.Start(ctx, "controlplane"); err != nil {
+			return err
+		}
+		for i := 0; i < 40; i++ {
+			if controlPlaneUp(baseURL) {
+				fmt.Printf("control plane ready at %s\n", baseURL)
+				return nil
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		return fmt.Errorf("control plane service did not become ready within 20s; check %s", logPath)
 	}
 
 	bin, err := controlPlaneBinary()
@@ -1347,6 +1388,15 @@ func start(baseURL string, args []string) error {
 // `stop` (which stops services) and `cluster reset` (which stops workloads
 // and revokes nodes but leaves the control plane itself running).
 func stopControlPlane(args []string) error {
+	if m := localServiceManager(); m.Installed("controlplane") {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := m.Stop(ctx, "controlplane"); err != nil {
+			return err
+		}
+		fmt.Println("control plane service stopped (start it again with 'haco start'; remove it with 'haco service uninstall controlplane')")
+		return nil
+	}
 	dataDir := envOr("HACO_DATA_DIR", filepath.Join(homeDir(), ".haco"))
 	pidPath := filepath.Join(dataDir, "controlplane.pid")
 
