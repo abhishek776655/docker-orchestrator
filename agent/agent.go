@@ -712,47 +712,51 @@ func (a *Agent) checkHealth(ctx context.Context, key, containerID string) {
 // is no registry to pull rec.Image from, so this agent's own Docker daemon
 // is the only one that will ever produce it.
 func (a *Agent) buildRemote(ctx context.Context, rec store.WorkloadRecord) error {
+	var keys, secrets map[string][]byte
+	if len(rec.RemoteBuild.SSHIDs) > 0 || len(rec.RemoteBuild.SecretIDs) > 0 {
+		sshPath := fmt.Sprintf("/v1/agent/%s/build-ssh/%s/%s/%s", a.cfg.NodeID, rec.Project, rec.Service, rec.Revision)
+		sshReq, err := http.NewRequestWithContext(ctx, http.MethodGet, a.cfg.ControlPlaneURL+sshPath, nil)
+		if err != nil {
+			return err
+		}
+		sshResp, body, err := a.doRaw(sshReq)
+		if err != nil {
+			return err
+		}
+		if sshResp.StatusCode >= 300 {
+			return fmt.Errorf("fetch build ssh keys: control plane returned %s: %s", sshResp.Status, string(body))
+		}
+		var files map[string]string
+		if err := json.Unmarshal(body, &files); err != nil {
+			return fmt.Errorf("decode build ssh keys: %w", err)
+		}
+		// One endpoint carries both: secret values are keyed "secret:<id>".
+		keys, secrets = map[string][]byte{}, map[string][]byte{}
+		for k, v := range files {
+			if id, ok := strings.CutPrefix(k, buildSecretPrefix); ok {
+				secrets[id] = []byte(v)
+			} else {
+				keys[k] = []byte(v)
+			}
+		}
+	}
+
+	// The context tarball goes from the network straight into the build,
+	// never held in memory.
 	path := fmt.Sprintf("/v1/agent/%s/build-context/%s/%s/%s", a.cfg.NodeID, rec.Project, rec.Service, rec.Revision)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.cfg.ControlPlaneURL+path, nil)
 	if err != nil {
 		return err
 	}
-	resp, tarball, err := a.doRaw(req)
+	resp, err := a.doStream(req)
 	if err != nil {
 		return err
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("fetch build context: control plane returned %s: %s", resp.Status, string(tarball))
+		return fmt.Errorf("fetch build context: control plane returned %s: %s", resp.Status, errorBody(resp))
 	}
-	if len(rec.RemoteBuild.SSHIDs) == 0 && len(rec.RemoteBuild.SecretIDs) == 0 {
-		return a.docker.BuildImage(ctx, bytes.NewReader(tarball), rec.Image, *rec.RemoteBuild, nil, nil)
-	}
-	sshPath := fmt.Sprintf("/v1/agent/%s/build-ssh/%s/%s/%s", a.cfg.NodeID, rec.Project, rec.Service, rec.Revision)
-	sshReq, err := http.NewRequestWithContext(ctx, http.MethodGet, a.cfg.ControlPlaneURL+sshPath, nil)
-	if err != nil {
-		return err
-	}
-	sshResp, body, err := a.doRaw(sshReq)
-	if err != nil {
-		return err
-	}
-	if sshResp.StatusCode >= 300 {
-		return fmt.Errorf("fetch build ssh keys: control plane returned %s: %s", sshResp.Status, string(body))
-	}
-	var files map[string]string
-	if err := json.Unmarshal(body, &files); err != nil {
-		return fmt.Errorf("decode build ssh keys: %w", err)
-	}
-	// One endpoint carries both: secret values are keyed "secret:<id>".
-	keys, secrets := map[string][]byte{}, map[string][]byte{}
-	for k, v := range files {
-		if id, ok := strings.CutPrefix(k, buildSecretPrefix); ok {
-			secrets[id] = []byte(v)
-		} else {
-			keys[k] = []byte(v)
-		}
-	}
-	return a.docker.BuildImage(ctx, bytes.NewReader(tarball), rec.Image, *rec.RemoteBuild, keys, secrets)
+	return a.docker.BuildImage(ctx, resp.Body, rec.Image, *rec.RemoteBuild, keys, secrets)
 }
 
 // buildSecretPrefix marks a build secret in the build-ssh endpoint's reply,
@@ -789,12 +793,13 @@ func (a *Agent) fetchVolumeSnapshots(ctx context.Context, rec store.WorkloadReco
 		if err != nil {
 			return err
 		}
-		resp, tarball, err := a.doRaw(req)
+		resp, err := a.doStream(req)
 		if err != nil {
 			return err
 		}
 		hostPath := a.docker.VolumeHostPath(rec.Key(), v.ContainerPath)
 		if resp.StatusCode == http.StatusNotFound {
+			resp.Body.Close()
 			// Snapshots live only in control-plane memory, so a control
 			// plane restarted since the deploy (e.g. after haco
 			// shutdown) no longer has one. The copy already extracted here
@@ -806,9 +811,13 @@ func (a *Agent) fetchVolumeSnapshots(ctx context.Context, rec store.WorkloadReco
 			return fmt.Errorf("volume snapshot %s: the control plane restarted since this was deployed and no longer has it, and this node has no copy; redeploy to send it again", v.ContainerPath)
 		}
 		if resp.StatusCode >= 300 {
-			return fmt.Errorf("fetch volume snapshot %s: control plane returned %s: %s", v.ContainerPath, resp.Status, string(tarball))
+			msg := errorBody(resp)
+			resp.Body.Close()
+			return fmt.Errorf("fetch volume snapshot %s: control plane returned %s: %s", v.ContainerPath, resp.Status, msg)
 		}
-		if err := ExtractTar(hostPath, bytes.NewReader(tarball)); err != nil {
+		err = ExtractTar(hostPath, resp.Body)
+		resp.Body.Close()
+		if err != nil {
 			return fmt.Errorf("extract volume snapshot %s: %w", v.ContainerPath, err)
 		}
 	}
@@ -841,14 +850,18 @@ func (a *Agent) fetchVolumeSeeds(ctx context.Context, rec store.WorkloadRecord) 
 		if err != nil {
 			return err
 		}
-		resp, tarball, err := a.doRaw(req)
+		resp, err := a.doStream(req)
 		if err != nil {
 			return err
 		}
 		if resp.StatusCode >= 300 {
-			return fmt.Errorf("fetch volume seed %s: control plane returned %s: %s", v.ContainerPath, resp.Status, string(tarball))
+			msg := errorBody(resp)
+			resp.Body.Close()
+			return fmt.Errorf("fetch volume seed %s: control plane returned %s: %s", v.ContainerPath, resp.Status, msg)
 		}
-		if err := ExtractTar(hostPath, bytes.NewReader(tarball)); err != nil {
+		err = ExtractTar(hostPath, resp.Body)
+		resp.Body.Close()
+		if err != nil {
 			return fmt.Errorf("extract volume seed %s: %w", v.ContainerPath, err)
 		}
 	}
@@ -999,6 +1012,31 @@ func (a *Agent) doRaw(req *http.Request) (*http.Response, []byte, error) {
 		return nil, nil, err
 	}
 	return resp, data, nil
+}
+
+// doStream sends req and returns the response without reading its body, for
+// transfers too large to hold in memory (tarballs of seeds, snapshots, build
+// contexts). The client's whole-request timeout is lifted, since a multi-GB
+// copy over a slow link can outlast it; ctx still bounds the request. The
+// caller closes the body.
+func (a *Agent) doStream(req *http.Request) (*http.Response, error) {
+	if a.cfg.Credential != "" {
+		req.Header.Set("Authorization", "Bearer "+a.cfg.Credential)
+		req.Header.Set("X-HACO-Node-ID", a.cfg.NodeID)
+	}
+	client := a.transferHTTP
+	if client == nil { // permits focused tests to inject only the standard client
+		client = a.http
+	}
+	long := *client
+	long.Timeout = 0
+	return long.Do(req)
+}
+
+// errorBody reads the start of a non-2xx response, for an error message.
+func errorBody(resp *http.Response) string {
+	msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<10))
+	return strings.TrimSpace(string(msg))
 }
 
 // syncForwardersFor keeps the forwarders of every project that has a service

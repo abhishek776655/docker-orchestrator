@@ -59,13 +59,13 @@ func (svc *Service) MoveWorkload(ctx context.Context, key, node string, force, a
 	// copies in memory only, so after a restart there is nothing to send.
 	for _, v := range w.Volumes {
 		if v.RemoteDirKey != "" {
-			if _, ok := svc.FetchVolumeSnapshot(v.RemoteDirKey); !ok {
+			if !svc.HasVolumeSnapshot(v.RemoteDirKey) {
 				return nil, fmt.Errorf("%w: the control plane no longer holds the source snapshot for %s (it restarted since the deploy), so another node can't get it; redeploy the service instead", ErrNotMovable, v.ContainerPath)
 			}
 		}
 	}
 	if w.RemoteBuild != nil {
-		if _, ok := svc.FetchBuildContext(key); !ok {
+		if !svc.HasBuildContext(key) {
 			return nil, fmt.Errorf("%w: the control plane no longer holds its build context (it restarted since the deploy), so another node can't build it; redeploy the service instead", ErrNotMovable)
 		}
 	}

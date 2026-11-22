@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 
@@ -403,14 +404,12 @@ func (svc *Service) handleBuildContext(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, fmt.Errorf("workload %q is not assigned to node %q", key, nodeID))
 		return
 	}
-	data, ok := svc.FetchBuildContext(key)
+	f, ok := svc.OpenBuildContext(key)
 	if !ok {
 		writeError(w, http.StatusNotFound, fmt.Errorf("no stashed build context for %q", key))
 		return
 	}
-	w.Header().Set("Content-Type", "application/x-tar")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(data)
+	serveTarball(w, r, f)
 }
 
 // handleBuildSSH serves a build's BuildKit SSH keys (ID -> key) to the
@@ -467,14 +466,12 @@ func (svc *Service) handleVolumeContext(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	snapshotKey := key + ":" + r.PathValue("index")
-	data, ok := svc.FetchVolumeSnapshot(snapshotKey)
+	f, ok := svc.OpenVolumeSnapshot(snapshotKey)
 	if !ok {
 		writeError(w, http.StatusNotFound, fmt.Errorf("no stashed volume snapshot for %q", snapshotKey))
 		return
 	}
-	w.Header().Set("Content-Type", "application/x-tar")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(data)
+	serveTarball(w, r, f)
 }
 
 // handleVolumeSeed serves a stashed one-time managed-volume seed to the
@@ -499,14 +496,12 @@ func (svc *Service) handleVolumeSeed(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	seedKey := key + ":seed:" + r.PathValue("index")
-	data, ok := svc.FetchVolumeSnapshot(seedKey)
+	f, ok := svc.OpenVolumeSnapshot(seedKey)
 	if !ok {
 		writeError(w, http.StatusNotFound, fmt.Errorf("no stashed volume seed for %q", seedKey))
 		return
 	}
-	w.Header().Set("Content-Type", "application/x-tar")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(data)
+	serveTarball(w, r, f)
 }
 
 type reportStatusRequest struct {
@@ -752,4 +747,16 @@ func (svc *Service) handleDeleteWorkloads(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "deleted", "count": n})
+}
+
+// serveTarball streams a stashed tarball file to an agent, then closes it.
+func serveTarball(w http.ResponseWriter, r *http.Request, f *os.File) {
+	defer f.Close()
+	w.Header().Set("Content-Type", "application/x-tar")
+	if st, err := f.Stat(); err == nil {
+		http.ServeContent(w, r, "", st.ModTime(), f)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = io.Copy(w, f)
 }

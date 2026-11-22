@@ -1,6 +1,7 @@
 package controlplane
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -48,7 +49,7 @@ func TestResolveVolumeSnapshotsTarsUpUnpinnedDirectoryMounts(t *testing.T) {
 	if unpinned.Volumes[0].RemoteDirKey == "" {
 		t.Fatalf("unpinned: expected a RemoteDirKey")
 	}
-	data, ok := svc.FetchVolumeSnapshot(unpinned.Volumes[0].RemoteDirKey)
+	data, ok := stashedBytes(svc, unpinned.Volumes[0].RemoteDirKey)
 	if !ok || len(data) == 0 {
 		t.Fatalf("expected a stashed, non-empty tarball for %q", unpinned.Volumes[0].RemoteDirKey)
 	}
@@ -88,8 +89,19 @@ func TestResolveVolumeSeedsStashesCandidateAndReplacesKey(t *testing.T) {
 	if v.SeedDirKey == "" || v.SeedDirKey == dir {
 		t.Fatalf("SeedDirKey = %q, want it replaced with a stash key (not the raw path, not empty)", v.SeedDirKey)
 	}
-	data, ok := svc.FetchVolumeSnapshot(v.SeedDirKey)
+	data, ok := stashedBytes(svc, v.SeedDirKey)
 	if !ok || len(data) == 0 {
 		t.Fatalf("expected a stashed, non-empty seed tarball for %q", v.SeedDirKey)
 	}
+}
+
+// stashedBytes reads a stashed volume tarball back, for assertions.
+func stashedBytes(svc *Service, key string) ([]byte, bool) {
+	f, ok := svc.OpenVolumeSnapshot(key)
+	if !ok {
+		return nil, false
+	}
+	defer f.Close()
+	b, err := io.ReadAll(f)
+	return b, err == nil
 }

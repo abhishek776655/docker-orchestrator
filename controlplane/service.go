@@ -45,7 +45,9 @@ type Service struct {
 	// control-plane-process design — a restart between deploy and the
 	// agent's fetch would mean redeploying, an accepted limitation.
 	buildContextsMu sync.Mutex
-	buildContexts   map[string][]byte
+	// stash holds the tarballs agents fetch (build contexts, volume
+	// snapshots and seeds) in files, not memory: see blobStash.
+	stash blobStash
 	// buildSSH holds BuildKit SSH-mount keys (ssh ID -> private key) per
 	// workload key, guarded by buildContextsMu. Memory only, on purpose:
 	// key material must never reach the SQLite store.
@@ -69,8 +71,6 @@ type Service struct {
 	// (VolumeMount.RemoteDirKey) a service isn't explicitly pinned to this
 	// control-plane host for (resolveVolumeSnapshots), rather than a
 	// Docker build context.
-	volumeSnapshotsMu sync.Mutex
-	volumeSnapshots   map[string][]byte
 }
 
 func New(s *store.Store) *Service { return &Service{store: s} }
@@ -536,9 +536,8 @@ func (svc *Service) resolveBuilds(ctx context.Context, project string, plan *com
 			if err != nil {
 				return fmt.Errorf("package build context for %s: %w", b.Service, err)
 			}
-			data, err := io.ReadAll(tarball)
-			if err != nil {
-				return fmt.Errorf("read build context for %s: %w", b.Service, err)
+			if err := svc.stashBuildContext(wl.Key(), tarball); err != nil {
+				return fmt.Errorf("stash build context for %s: %w", b.Service, err)
 			}
 			sshKeys, err := resolveBuildSSHKeys(b)
 			if err != nil {
@@ -553,13 +552,17 @@ func (svc *Service) resolveBuilds(ctx context.Context, project string, plan *com
 				spec.SecretIDs = append(spec.SecretIDs, id)
 			}
 			sort.Strings(spec.SecretIDs)
-			spec.BuildID = buildID(spec, data)
+			stashed, ok := svc.OpenBuildContext(wl.Key())
+			if !ok {
+				return fmt.Errorf("stashed build context for %s is missing", b.Service)
+			}
+			spec.BuildID = buildID(spec, stashed)
+			stashed.Close()
 			if noCache {
 				// A no-cache deploy must rebuild even when nothing changed, so
 				// its ID can never match the image already on the node.
 				spec.BuildID += "-nocache-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 			}
-			svc.stashBuildContext(wl.Key(), data)
 			stash := map[string][]byte{}
 			for id, k := range sshKeys {
 				stash[id] = k
@@ -647,7 +650,7 @@ func resolveBuildSSHKeys(b compose.BuildSpec) (map[string][]byte, error) {
 }
 
 // buildID fingerprints everything that affects the built image.
-func buildID(spec *model.RemoteBuildSpec, context []byte) string {
+func buildID(spec *model.RemoteBuildSpec, context io.Reader) string {
 	h := sha256.New()
 	fmt.Fprintf(h, "dockerfile=%s\nplatform=%s\n", spec.Dockerfile, spec.Platform)
 	argKeys := make([]string, 0, len(spec.Args))
@@ -664,7 +667,7 @@ func buildID(spec *model.RemoteBuildSpec, context []byte) string {
 	for _, id := range spec.SecretIDs {
 		fmt.Fprintf(h, "secret %s\n", id)
 	}
-	h.Write(context)
+	_, _ = io.Copy(h, context)
 	return hex.EncodeToString(h.Sum(nil))[:20]
 }
 
@@ -689,46 +692,36 @@ func (svc *Service) FetchBuildSSH(key string) (map[string][]byte, bool) {
 	return keys, ok
 }
 
-// stashBuildContext holds a build-context tarball for an agent to fetch
-// (see Service.buildContexts' doc comment for why this is in-memory only).
-func (svc *Service) stashBuildContext(key string, tarball []byte) {
-	svc.buildContextsMu.Lock()
-	defer svc.buildContextsMu.Unlock()
-	if svc.buildContexts == nil {
-		svc.buildContexts = map[string][]byte{}
-	}
-	svc.buildContexts[key] = tarball
+// stashBuildContext keeps a build-context tarball for an agent to fetch (on
+// disk, see Service.stash).
+func (svc *Service) stashBuildContext(key string, tarball io.Reader) error {
+	return svc.stash.putReader("build-context", key, tarball)
 }
 
-// FetchBuildContext returns the tarball stashed for a workload key, for
-// the agent-facing endpoint that serves it to whichever node fetches it.
-func (svc *Service) FetchBuildContext(key string) ([]byte, bool) {
-	svc.buildContextsMu.Lock()
-	defer svc.buildContextsMu.Unlock()
-	data, ok := svc.buildContexts[key]
-	return data, ok
+// OpenBuildContext opens the tarball stashed for a workload key, for the
+// agent-facing endpoint that serves it to whichever node fetches it. The
+// caller closes it.
+func (svc *Service) OpenBuildContext(key string) (*os.File, bool) {
+	return svc.stash.open("build-context", key)
 }
 
-// stashVolumeSnapshot holds a directory bind mount's tarball for an agent
-// to fetch (see Service.volumeSnapshots' doc comment for why this is
-// in-memory only).
-func (svc *Service) stashVolumeSnapshot(key string, tarball []byte) {
-	svc.volumeSnapshotsMu.Lock()
-	defer svc.volumeSnapshotsMu.Unlock()
-	if svc.volumeSnapshots == nil {
-		svc.volumeSnapshots = map[string][]byte{}
-	}
-	svc.volumeSnapshots[key] = tarball
+// HasBuildContext reports whether a build context is stashed for key.
+func (svc *Service) HasBuildContext(key string) bool { return svc.stash.has("build-context", key) }
+
+// stashVolumeSnapshot keeps a directory bind mount's tarball (or a volume
+// seed) for an agent to fetch.
+func (svc *Service) stashVolumeSnapshot(key string, tarball io.Reader) error {
+	return svc.stash.putReader("volume", key, tarball)
 }
 
-// FetchVolumeSnapshot returns the tarball stashed for a volume key, for
-// the agent-facing endpoint that serves it to whichever node fetches it.
-func (svc *Service) FetchVolumeSnapshot(key string) ([]byte, bool) {
-	svc.volumeSnapshotsMu.Lock()
-	defer svc.volumeSnapshotsMu.Unlock()
-	data, ok := svc.volumeSnapshots[key]
-	return data, ok
+// OpenVolumeSnapshot opens the tarball stashed for a volume key; the caller
+// closes it.
+func (svc *Service) OpenVolumeSnapshot(key string) (*os.File, bool) {
+	return svc.stash.open("volume", key)
 }
+
+// HasVolumeSnapshot reports whether a tarball is stashed for key.
+func (svc *Service) HasVolumeSnapshot(key string) bool { return svc.stash.has("volume", key) }
 
 // resolveVolumeSnapshots tars up every directory bind mount in plan whose
 // owning workload is NOT pinned to this control-plane host (the only
@@ -759,11 +752,9 @@ func (svc *Service) resolveVolumeSnapshots(plan *compose.Plan) error {
 				if err != nil {
 					return fmt.Errorf("package volume %s for %s: %w", v.ContainerPath, wl.Service, err)
 				}
-				data, err := io.ReadAll(tarball)
-				if err != nil {
-					return fmt.Errorf("read volume tarball %s for %s: %w", v.ContainerPath, wl.Service, err)
+				if err := svc.stashVolumeSnapshot(key, tarball); err != nil {
+					return fmt.Errorf("stash volume tarball %s for %s: %w", v.ContainerPath, wl.Service, err)
 				}
-				svc.stashVolumeSnapshot(key, data)
 				v.HostPath = ""
 				v.RemoteDirKey = key
 				return nil
@@ -794,16 +785,23 @@ func (svc *Service) resolveVolumeSeeds(plan *compose.Plan) error {
 			key := fmt.Sprintf("%s:seed:%d", wl.Key(), j)
 			if volName, ok := strings.CutPrefix(sourcePath, compose.DockerVolumeSeedPrefix); ok {
 				jobs = append(jobs, func() error {
-					data, found, err := dockerutil.TarNamedVolume(context.Background(), volName)
+					found := false
+					err := svc.stash.put("volume", key, func(w io.Writer) error {
+						var err error
+						found, err = dockerutil.TarNamedVolume(context.Background(), volName, w)
+						if err == nil && !found {
+							return errNothingToStash
+						}
+						return err
+					})
+					if errors.Is(err, errNothingToStash) {
+						return nil
+					}
 					if err != nil {
 						// Not fatal: the volume just starts empty, as before.
 						log.Printf("controlplane: not adopting docker volume %s for %s: %v", volName, wl.Service, err)
 						return nil
 					}
-					if !found {
-						return nil
-					}
-					svc.stashVolumeSnapshot(key, data)
 					v.SeedDirKey = key
 					log.Printf("controlplane: seeding %s/%s %s from docker volume %s", wl.Project, wl.Service, v.ContainerPath, volName)
 					return nil
@@ -815,11 +813,9 @@ func (svc *Service) resolveVolumeSeeds(plan *compose.Plan) error {
 				if err != nil {
 					return fmt.Errorf("package volume seed %s for %s: %w", v.ContainerPath, wl.Service, err)
 				}
-				data, err := io.ReadAll(tarball)
-				if err != nil {
-					return fmt.Errorf("read volume seed tarball %s for %s: %w", v.ContainerPath, wl.Service, err)
+				if err := svc.stashVolumeSnapshot(key, tarball); err != nil {
+					return fmt.Errorf("stash volume seed tarball %s for %s: %w", v.ContainerPath, wl.Service, err)
 				}
-				svc.stashVolumeSnapshot(key, data)
 				v.SeedDirKey = key
 				return nil
 			})
@@ -1122,3 +1118,6 @@ func (svc *Service) ListServiceInstances(ctx context.Context, project, service s
 func (svc *Service) ListProjectServices(ctx context.Context, project string) ([]model.ServiceInstance, error) {
 	return svc.store.ListProjectServiceTargets(ctx, project)
 }
+
+// errNothingToStash aborts a stash write for a source that turned out empty.
+var errNothingToStash = errors.New("nothing to stash")

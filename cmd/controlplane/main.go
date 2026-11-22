@@ -29,6 +29,7 @@ func main() {
 		fmt.Println(buildinfo.String("controlplane"))
 		return
 	}
+	controlplane.CleanStaleStash() // tarball stashes left by a crashed earlier run
 	addr := envOr("HACO_LISTEN_ADDR", "127.0.0.1:8099")
 	agentAddr := envOr("HACO_AGENT_LISTEN_ADDR", ":8443")
 

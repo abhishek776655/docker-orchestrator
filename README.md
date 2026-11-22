@@ -274,6 +274,8 @@ Docker reads the file:
 | `HACO_LISTEN_ADDR` | `127.0.0.1:8099` | Operator API and web console address |
 | `HACO_AGENT_LISTEN_ADDR` | `:8443` | Agent API (mTLS) |
 | `HACO_DATA_DIR` | `~/.haco` | Database, credentials, TLS identity, volumes |
+| `HACO_STASH_DIR` | system temp dir | Where the control plane keeps the tarballs (build contexts, volume seeds, snapshots) agents fetch; they live on disk, not in memory, and are removed at the next start |
+| `HACO_ADOPT_DOCKER_VOLUMES` | on | Set to `0` to stop seeding a named volume from the Docker volume `docker compose up` would have created |
 | `HACO_NODE_ID` | saved in `~/.haco/node-id` | Override this machine's node ID |
 | `HACO_REGISTRY_ADDR` | unset | Use a build registry (`auto` starts a local one) |
 

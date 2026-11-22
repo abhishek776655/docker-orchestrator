@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 )
@@ -32,26 +31,13 @@ func (a *Agent) loadOneImage(ctx context.Context, it loadImage) error {
 	if err != nil {
 		return err
 	}
-	if a.cfg.Credential != "" {
-		req.Header.Set("Authorization", "Bearer "+a.cfg.Credential)
-		req.Header.Set("X-HACO-Node-ID", a.cfg.NodeID)
-	}
-	client := a.transferHTTP
-	if client == nil {
-		client = a.http
-	}
-	// A large image can take longer than the transfer client's whole-request
-	// timeout; the request context still bounds it.
-	long := *client
-	long.Timeout = 0
-	resp, err := long.Do(req)
+	resp, err := a.doStream(req)
 	if err != nil {
 		return fmt.Errorf("fetch archive: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<10))
-		return fmt.Errorf("fetch archive: control plane returned %s: %s", resp.Status, msg)
+		return fmt.Errorf("fetch archive: control plane returned %s: %s", resp.Status, errorBody(resp))
 	}
 	if err := a.docker.LoadImage(ctx, resp.Body); err != nil {
 		return err
