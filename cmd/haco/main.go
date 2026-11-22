@@ -68,24 +68,29 @@ func main() {
 }
 
 func printJoinCommand(baseURL string) error {
-	resp, err := http.Post(baseURL+"/v1/admin/join-token", "application/json", bytes.NewReader([]byte(`{}`)))
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("control plane returned %s", resp.Status)
-	}
-	var bundle agentjoin.Bundle
-	if err := json.NewDecoder(resp.Body).Decode(&bundle); err != nil {
-		return err
-	}
-	encoded, err := agentjoin.Encode(bundle)
+	encoded, err := fetchJoinToken(baseURL)
 	if err != nil {
 		return err
 	}
 	fmt.Printf("haco agent join '%s'\n", encoded)
 	return nil
+}
+
+// fetchJoinToken asks the control plane for a one-time join token.
+func fetchJoinToken(baseURL string) (string, error) {
+	resp, err := http.Post(baseURL+"/v1/admin/join-token", "application/json", bytes.NewReader([]byte(`{}`)))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return "", fmt.Errorf("control plane returned %s", resp.Status)
+	}
+	var bundle agentjoin.Bundle
+	if err := json.NewDecoder(resp.Body).Decode(&bundle); err != nil {
+		return "", err
+	}
+	return agentjoin.Encode(bundle)
 }
 
 // plan calls /v1/compose/plan and renders a human-readable table by
@@ -857,6 +862,8 @@ func node(baseURL string, args []string) error {
 		return nodeDetail(baseURL, rest)
 	case "join-token":
 		return printJoinCommand(baseURL)
+	case "add":
+		return nodeAdd(baseURL, rest)
 	case "cordon", "uncordon":
 		if len(rest) != 1 {
 			return fmt.Errorf("usage: haco node %s <id>", args[0])

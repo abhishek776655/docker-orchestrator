@@ -134,6 +134,20 @@ A binary built from source reports its version as `dev`.
 
 ## Setting up a cluster
 
+- Add a machine you can SSH into with one command (needs Docker running on
+  it; macOS or Linux):
+
+  ```bash
+  haco node add user@192.168.1.20 [--ssh-key ~/.ssh/id_ed25519] [--port 22]
+  ```
+
+  It copies the agent (the one next to your `haco` when the machine has the
+  same OS and CPU, otherwise the release archive for `--version <tag>`,
+  checked against `checksums.txt`), joins with a one-time token and runs
+  the agent as a service: a systemd user unit on Linux (plus `loginctl
+  enable-linger`, which may need `sudo`), a LaunchAgent on macOS (the user
+  must be logged in). Logs: `~/.haco/logs/agent.log` on macOS,
+  `journalctl --user -u haco-agent` on Linux.
 - Join tokens expire after 10 minutes. Get a fresh one any time from
   **Add node** in the console or with `haco node join-token`.
 - After a machine has joined once, restart its agent without a token:

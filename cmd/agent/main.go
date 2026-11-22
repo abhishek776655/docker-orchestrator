@@ -24,7 +24,8 @@ func main() {
 	}
 	nodeID := envOr("HACO_NODE_ID", agent.SavedNodeID())
 	credentialPath := envOr("HACO_AGENT_CREDENTIAL_FILE", filepath.Join(defaultDataDir(), "agent-credentials", nodeID+".json"))
-	if len(os.Args) == 3 && os.Args[1] == "join" {
+	noRun := len(os.Args) == 4 && os.Args[1] == "join" && os.Args[3] == "--no-run"
+	if (len(os.Args) == 3 || noRun) && os.Args[1] == "join" {
 		bundle, err := agentjoin.Decode(os.Args[2])
 		if err != nil {
 			log.Fatalf("decode join command: %v", err)
@@ -38,6 +39,9 @@ func main() {
 		}
 		log.Printf("joined control plane as node %s; credential saved to %s", nodeID, credentialPath)
 		cfg.CredentialPath = credentialPath
+		if noRun {
+			return // `haco node add` installs the service that runs it
+		}
 		run(cfg)
 		return
 	}

@@ -232,10 +232,14 @@ the control plane. 'haco start' and 'haco agent run' bring the same services bac
 		},
 		{
 			name: "node", group: groupNodes,
-			summary: "inspect and manage one node (show, cordon, rename, ...)",
+			summary: "add, inspect and manage nodes (add, show, cordon, rename, ...)",
 			detail: `Usage: haco node <command> [args]
 
   show <id>               one node's full detail ('haco node <id>' also works)
+  add <user@host> [--ssh-key FILE] [--port N] [--agent-binary FILE] [--version TAG]
+                          install the agent on another machine over SSH and join it:
+                          copies the agent, joins with a one-time token and runs it as a
+                          service (systemd user unit on Linux, LaunchAgent on macOS)
   join-token              print a one-time command that joins another machine
   cordon <id>             keep new services off this node; running ones continue
   uncordon <id>           allow new services again
