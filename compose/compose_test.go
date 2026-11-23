@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/abhishek/hardware-aware-container-orchestrator/agent"
 	"github.com/abhishek/hardware-aware-container-orchestrator/compose"
 	"github.com/abhishek/hardware-aware-container-orchestrator/model"
 )
@@ -1069,4 +1070,149 @@ services:
 	if got := by["db"].Runtime.Restart.Name; got != "" {
 		t.Fatalf("db restart = %q, services nobody waits on to finish keep Docker's default", got)
 	}
+}
+
+const kafkaStack = `
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7
+  kafka:
+    image: confluentinc/cp-kafka:7
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7
+  api:
+    image: api:1
+  redis:
+    image: redis:7
+`
+
+func groupOf(plan *compose.Plan) map[string]string {
+	out := map[string]string{}
+	for _, w := range plan.Workloads {
+		out[w.Service] = w.Group
+	}
+	return out
+}
+
+func pinnedTo(plan *compose.Plan) map[string]string {
+	out := map[string]string{}
+	for _, w := range plan.Workloads {
+		out[w.Service] = w.Constraints.PinnedNodeID
+	}
+	return out
+}
+
+func TestKafkaFamilyIsDetectedAsAGroupByImage(t *testing.T) {
+	plan, err := compose.Load(context.Background(), "demo", t.TempDir(), []byte(kafkaStack))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := groupOf(plan)
+	for _, s := range []string{"zookeeper", "kafka", "schema-registry"} {
+		if g[s] != "kafka" {
+			t.Errorf("%s group = %q, want kafka", s, g[s])
+		}
+	}
+	if g["api"] != "" || g["redis"] != "" {
+		t.Errorf("unrelated services grouped: %v", g)
+	}
+}
+
+func TestExplicitGroupAndSingletonGroups(t *testing.T) {
+	plan, err := compose.Load(context.Background(), "demo", t.TempDir(), []byte(`
+services:
+  web:
+    image: web:1
+    x-haco-group: shop
+  api:
+    image: api:1
+    x-haco-group: shop
+  lonely:
+    image: lonely:1
+    x-haco-group: solo
+  broker:
+    image: confluentinc/cp-kafka:7
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := groupOf(plan)
+	if g["web"] != "shop" || g["api"] != "shop" {
+		t.Fatalf("groups = %v", g)
+	}
+	if g["lonely"] != "" || g["broker"] != "" {
+		t.Fatalf("a group of one is no group: %v", g)
+	}
+}
+
+func TestGroupDefaultsPinTheWholeGroupToTheHost(t *testing.T) {
+	plan, _ := compose.Load(context.Background(), "demo", t.TempDir(), []byte(kafkaStack))
+	compose.ApplyGroupDefaults(plan, nil, true, nil)
+	host := agent.HostNodeID()
+	p := pinnedTo(plan)
+	for _, s := range []string{"zookeeper", "kafka", "schema-registry"} {
+		if p[s] != host {
+			t.Errorf("%s pinned to %q, want the host", s, p[s])
+		}
+	}
+	if p["api"] != "" || p["redis"] != "" {
+		t.Errorf("non-members must stay free: %v", p)
+	}
+	if !hasWarning(plan, "pinned to the control-plane host") {
+		t.Errorf("no pin warning: %v", plan.Warnings)
+	}
+	if hasWarning(plan, "different node") {
+		t.Errorf("a group kept together must not warn about a split: %v", plan.Warnings)
+	}
+}
+
+func TestUnpinningOneMemberWarnsWhatItIsSeparatedFrom(t *testing.T) {
+	plan, _ := compose.Load(context.Background(), "demo", t.TempDir(), []byte(kafkaStack))
+	compose.ApplyGroupDefaults(plan, nil, true, []string{"schema-registry"})
+	p := pinnedTo(plan)
+	if p["schema-registry"] != "" || p["kafka"] != agent.HostNodeID() {
+		t.Fatalf("pins = %v", p)
+	}
+	if !hasWarning(plan, "schema-registry may run on a different node than the rest") {
+		t.Fatalf("warnings = %v", plan.Warnings)
+	}
+}
+
+func TestExplicitPinsAreRespectedAndCanSplitTheGroup(t *testing.T) {
+	plan, _ := compose.Load(context.Background(), "demo", t.TempDir(), []byte(kafkaStack))
+	pins := map[string][]string{"worker-2": {"kafka"}}
+	compose.ApplyPinOverride(plan, pins)
+	compose.ApplyGroupDefaults(plan, pins, true, nil)
+	p := pinnedTo(plan)
+	if p["kafka"] != "worker-2" {
+		t.Fatalf("an explicit pin must win: %v", p)
+	}
+	if p["zookeeper"] != agent.HostNodeID() {
+		t.Fatalf("the rest default to the host: %v", p)
+	}
+	if !hasWarning(plan, "may run on a different node than the rest") {
+		t.Fatalf("a split group must warn: %v", plan.Warnings)
+	}
+}
+
+func TestAnExplicitHostChoiceTurnsTheGroupDefaultOff(t *testing.T) {
+	plan, _ := compose.Load(context.Background(), "demo", t.TempDir(), []byte(kafkaStack))
+	compose.ApplyGroupDefaults(plan, nil, false, nil) // the caller gave --pin-host
+	for s, node := range pinnedTo(plan) {
+		if node != "" {
+			t.Errorf("%s pinned to %q although the caller made its own host choice", s, node)
+		}
+	}
+	if hasWarning(plan, "pinned to the control-plane host") {
+		t.Errorf("nothing was pinned, so nothing to say: %v", plan.Warnings)
+	}
+}
+
+func hasWarning(plan *compose.Plan, sub string) bool {
+	for _, w := range plan.Warnings {
+		if strings.Contains(w, sub) {
+			return true
+		}
+	}
+	return false
 }

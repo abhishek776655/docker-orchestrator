@@ -193,6 +193,8 @@ func Load(ctx context.Context, project, workingDir string, yaml []byte) (*Plan, 
 		}
 	}
 
+	assignGroups(plan, proj)
+
 	// A job another service waits on to finish runs once, as Compose does
 	// when `restart` is left unset; without a policy the agent would start
 	// it again every poll.
@@ -1336,4 +1338,125 @@ func findCycle(workloads []model.Workload) []string {
 		}
 	}
 	return nil
+}
+
+// kafkaFamily are image-name fragments of services that exchange messages
+// constantly, so splitting them across machines costs a network hop per
+// message.
+var kafkaFamily = []string{"kafka", "zookeeper", "schema-registry", "ksql"}
+
+// assignGroups names each service's chatty group: `x-haco-group: <name>` in
+// the Compose file, else the Kafka family by image. A group with a single
+// member is no group at all.
+func assignGroups(plan *Plan, proj *types.Project) {
+	members := map[string][]int{}
+	for i := range plan.Workloads {
+		wl := &plan.Workloads[i]
+		svc := proj.Services[wl.Service]
+		group := ""
+		if v, ok := svc.Extensions["x-haco-group"].(string); ok {
+			group = strings.TrimSpace(v)
+		}
+		if group == "" {
+			image := strings.ToLower(svc.Image)
+			for _, frag := range kafkaFamily {
+				if strings.Contains(image, frag) {
+					group = "kafka"
+					break
+				}
+			}
+		}
+		if group != "" {
+			members[group] = append(members[group], i)
+		}
+	}
+	for group, idx := range members {
+		if len(idx) < 2 {
+			continue
+		}
+		for _, i := range idx {
+			plan.Workloads[i].Group = group
+		}
+	}
+}
+
+// ApplyGroupDefaults keeps each chatty group together. Unless the caller made
+// an explicit host choice (applyDefault false), every member that no pin
+// names and that is not in unpin is pinned to the control-plane host; then
+// any group that still ends up apart gets a warning naming who is separated
+// from whom. pins is the explicit pin map already applied, if any.
+func ApplyGroupDefaults(plan *Plan, pins map[string][]string, applyDefault bool, unpin []string) {
+	named := map[string]bool{}
+	for _, services := range pins {
+		for _, s := range services {
+			named[strings.TrimSpace(s)] = true
+		}
+	}
+	opted := map[string]bool{}
+	for _, s := range unpin {
+		opted[strings.TrimSpace(s)] = true
+	}
+	host := agent.HostNodeID()
+	groups := map[string][]int{}
+	for i := range plan.Workloads {
+		if g := plan.Workloads[i].Group; g != "" {
+			groups[g] = append(groups[g], i)
+		}
+	}
+	names := make([]string, 0, len(groups))
+	for g := range groups {
+		names = append(names, g)
+	}
+	sort.Strings(names)
+
+	for _, g := range names {
+		var pinnedNow []string
+		for _, i := range groups[g] {
+			wl := &plan.Workloads[i]
+			if !applyDefault || named[wl.Service] || opted[wl.Service] || wl.Constraints.PinnedNodeID != "" {
+				continue
+			}
+			wl.Constraints.PinnedNodeID = host
+			if wl.Storage.Class == model.NodeLocalPersistent {
+				wl.Storage.PinnedNodeID = host
+			}
+			pinnedNow = append(pinnedNow, wl.Service)
+		}
+		if len(pinnedNow) > 0 {
+			plan.Warnings = append(plan.Warnings, fmt.Sprintf("group %s (%s): %s pinned to the control-plane host so they stay together; use --unpin to let the scheduler place one elsewhere", g, groupNames(plan, groups[g]), strings.Join(pinnedNow, ", ")))
+		}
+
+		// Where does each member run? "" means the scheduler decides.
+		where := map[string]int{}
+		for _, i := range groups[g] {
+			where[plan.Workloads[i].Constraints.PinnedNodeID]++
+		}
+		if len(where) <= 1 {
+			continue // all together, or all free (the scheduler keeps free members with each other)
+		}
+		var apart []string
+		best, bestN := "", -1
+		for loc, n := range where {
+			if loc != "" && (n > bestN || (n == bestN && loc == host)) {
+				best, bestN = loc, n
+			}
+		}
+		for _, i := range groups[g] {
+			if plan.Workloads[i].Constraints.PinnedNodeID != best {
+				apart = append(apart, plan.Workloads[i].Service)
+			}
+		}
+		if len(apart) > 0 {
+			plan.Warnings = append(plan.Warnings, fmt.Sprintf("group %s (%s): %s may run on a different node than the rest; these services talk constantly, so every message would cross the network and the stack may get slower", g, groupNames(plan, groups[g]), strings.Join(apart, ", ")))
+		}
+	}
+}
+
+func groupNames(plan *Plan, idx []int) string {
+	names := make([]string, 0, len(idx))
+	for _, i := range idx {
+		names = append(names, plan.Workloads[i].Service)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
 }

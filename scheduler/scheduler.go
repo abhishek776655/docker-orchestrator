@@ -24,11 +24,13 @@ type Weights struct {
 	Cache   float64
 	// Spread weighs how many services a node already carries per CPU core.
 	Spread float64
+	// Group weighs holding the rest of the workload's group.
+	Group float64
 }
 
 // DefaultWeights favors CPU/memory headroom, with thermal and image-cache
 // locality as smaller tie-breaking signals (SRS §9.3, M7).
-var DefaultWeights = Weights{CPU: 0.35, Memory: 0.35, Thermal: 0.1, Cache: 0.1, Spread: 0.1}
+var DefaultWeights = Weights{CPU: 0.35, Memory: 0.35, Thermal: 0.1, Cache: 0.1, Spread: 0.1, Group: 0.3}
 
 type nodeState struct {
 	node         model.Node
@@ -37,6 +39,7 @@ type nodeState struct {
 	reservedMem  int64
 	reservedVRAM int64
 	usedPorts    map[int]string // host port -> key of the workload holding it
+	groups       map[string]int // group name -> members already placed here
 }
 
 // Scheduler holds cluster state: the known nodes and the reservations
@@ -60,7 +63,7 @@ func NewWithWeights(nodes []model.Node, weights Weights) *Scheduler {
 		nodes:   make(map[string]*nodeState, len(nodes)),
 	}
 	for _, n := range nodes {
-		s.nodes[n.ID] = &nodeState{node: n, usedPorts: make(map[int]string)}
+		s.nodes[n.ID] = &nodeState{node: n, usedPorts: make(map[int]string), groups: map[string]int{}}
 		s.order = append(s.order, n.ID)
 	}
 	// Deterministic regardless of input order.
@@ -303,6 +306,10 @@ func (s *Scheduler) score(ns *nodeState, w model.Workload) model.ScoreFactors {
 	thermalFit := thermalFit(n.Thermal)
 	cacheFit := cacheFit(n.CachedImages, w.Image)
 	spreadFit := spreadFit(n.Allocatable.CPUMillis, ns.count)
+	groupFit := 0.0
+	if w.Group != "" && ns.groups[w.Group] > 0 {
+		groupFit = 1
+	}
 
 	return model.ScoreFactors{
 		NodeID:     n.ID,
@@ -311,7 +318,8 @@ func (s *Scheduler) score(ns *nodeState, w model.Workload) model.ScoreFactors {
 		ThermalFit: thermalFit,
 		CacheFit:   cacheFit,
 		SpreadFit:  spreadFit,
-		Total:      s.weights.CPU*cpuFit + s.weights.Memory*memFit + s.weights.Thermal*thermalFit + s.weights.Cache*cacheFit + s.weights.Spread*spreadFit,
+		GroupFit:   groupFit,
+		Total:      s.weights.CPU*cpuFit + s.weights.Memory*memFit + s.weights.Thermal*thermalFit + s.weights.Cache*cacheFit + s.weights.Spread*spreadFit + s.weights.Group*groupFit,
 	}
 }
 
@@ -371,6 +379,9 @@ func headroomFit(allocatable, reserved, request int64) float64 {
 // node so subsequent Schedule calls cannot overcommit it.
 func (s *Scheduler) reserve(ns *nodeState, w model.Workload) {
 	ns.count++
+	if w.Group != "" {
+		ns.groups[w.Group]++
+	}
 	ns.reservedCPU += w.Resources.CPUMillis
 	ns.reservedMem += w.Resources.MemoryBytes
 	if w.Constraints.GPU.Required {

@@ -594,3 +594,39 @@ func TestSpreadCountsEachServiceScheduledInThisBatch(t *testing.T) {
 		t.Fatalf("placed %v, want an even split of identical services", placed)
 	}
 }
+
+// A free group member lands with the rest of its group, even on a node with
+// less headroom, and the explanation says so.
+func TestGroupMembersPreferTheNodeHoldingTheRestOfTheGroup(t *testing.T) {
+	s := scheduler.New([]model.Node{
+		node("big", "amd64", 16000, 32_000_000_000),
+		node("small", "amd64", 4000, 8_000_000_000),
+	})
+	first := testdata.SmallWorkload("p", "kafka")
+	first.Group = "kafka"
+	first.Constraints.PinnedNodeID = "small" // e.g. the host
+	if d, err := s.Schedule(first); err != nil || d.Selected != "small" {
+		t.Fatalf("first member: %v %v", d, err)
+	}
+	second := testdata.SmallWorkload("p", "schema-registry")
+	second.Group = "kafka"
+	d, err := s.Schedule(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Selected != "small" {
+		t.Fatalf("selected %s, want small (where the group already is); scores %+v", d.Selected, d.Scores)
+	}
+	for _, sc := range d.Scores {
+		if (sc.NodeID == "small") != (sc.GroupFit == 1) {
+			t.Fatalf("GroupFit wrong for %s: %+v", sc.NodeID, sc)
+		}
+	}
+
+	// A workload outside any group is unaffected: it takes the roomier node.
+	other := testdata.SmallWorkload("p", "api")
+	d, _ = s.Schedule(other)
+	if d.Selected != "big" {
+		t.Fatalf("ungrouped workload selected %s, want big", d.Selected)
+	}
+}

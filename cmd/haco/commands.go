@@ -41,7 +41,10 @@ const composeFlagHelp = `  [service...]            only these services and what 
   --pin-host <svc,...>    for this call only, pin just these services to this machine (say, a
                           database and the service you are editing); all others schedule anywhere
   --pin-node <node>=<svc,...>
-                          the same, but pin the services to that node (repeatable)`
+                          the same, but pin the services to that node (repeatable)
+  --unpin <svc,...>       services of a chatty group (Kafka and friends, or x-haco-group) to leave
+                          off this machine; by default a group is pinned here together, unless
+                          you give --pin-host`
 
 // commandTable lists every command. It is a function, not a variable, so
 // help can read it without an initialization cycle.

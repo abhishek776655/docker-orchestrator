@@ -93,14 +93,16 @@ func (svc *Service) WithJoinManager(m *JoinManager) *Service {
 // anything (SRS UC-02, FR-023), and dry-run schedules every workload
 // against current node/reservation state so the plan shows where each
 // service would land without persisting or starting anything.
-func (svc *Service) ComposePlan(ctx context.Context, project, workingDir string, yaml []byte, onlyService string, pinHost *[]string, pinNodes map[string][]string, fresh bool, force []string) (*compose.Plan, []*model.Decision, error) {
+func (svc *Service) ComposePlan(ctx context.Context, project, workingDir string, yaml []byte, onlyService string, pinHost *[]string, pinNodes map[string][]string, fresh bool, force []string, unpin []string) (*compose.Plan, []*model.Decision, error) {
 	plan, err := compose.Load(ctx, project, workingDir, yaml)
 	if err != nil {
 		return nil, nil, err
 	}
-	if pins, ok := compose.MergePinOverride(pinHost, pinNodes); ok {
+	pins, pinned := compose.MergePinOverride(pinHost, pinNodes)
+	if pinned {
 		compose.ApplyPinOverride(plan, pins)
 	}
+	compose.ApplyGroupDefaults(plan, pins, pinHost == nil, unpin)
 	compose.MarkForced(plan, force)
 	if onlyService != "" {
 		plan, err = filterToClosure(plan, onlyService)
@@ -337,6 +339,9 @@ type DeployOptions struct {
 	// PinNodes pins each named service to an explicit node ID, for pinning
 	// something to a worker node rather than the control-plane host.
 	PinNodes map[string][]string
+	// Unpin lists services of a chatty group to leave out of the default
+	// pin to the control-plane host (compose.ApplyGroupDefaults).
+	Unpin []string
 	// Force lists services whose PinNodes placement overrides the
 	// scheduler's hard filters (see model.Constraints.Forced).
 	Force []string
@@ -363,9 +368,11 @@ func (svc *Service) ComposeDeploy(ctx context.Context, project, workingDir strin
 	if err != nil {
 		return nil, nil, err
 	}
-	if pins, ok := compose.MergePinOverride(opts.PinHost, opts.PinNodes); ok {
+	pins, pinned := compose.MergePinOverride(opts.PinHost, opts.PinNodes)
+	if pinned {
 		compose.ApplyPinOverride(plan, pins)
 	}
+	compose.ApplyGroupDefaults(plan, pins, opts.PinHost == nil, opts.Unpin)
 	compose.MarkForced(plan, opts.Force)
 	if opts.OnlyService != "" {
 		plan, err = filterToClosure(plan, opts.OnlyService)
@@ -872,9 +879,11 @@ func (svc *Service) ComposeBuild(ctx context.Context, project, workingDir string
 	if err != nil {
 		return nil, nil, err
 	}
-	if pins, ok := compose.MergePinOverride(opts.PinHost, opts.PinNodes); ok {
+	pins, pinned := compose.MergePinOverride(opts.PinHost, opts.PinNodes)
+	if pinned {
 		compose.ApplyPinOverride(plan, pins)
 	}
+	compose.ApplyGroupDefaults(plan, pins, opts.PinHost == nil, opts.Unpin)
 	if opts.OnlyService != "" {
 		plan, err = filterToClosure(plan, opts.OnlyService)
 		if err != nil {

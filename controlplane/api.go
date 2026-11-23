@@ -556,6 +556,10 @@ type composeRequest struct {
 	// {"192-168-1-3": ["metaapi"]} to pin metaapi to that worker node
 	// specifically, rather than the control-plane host.
 	PinNodes map[string][]string `json:"pin_nodes"`
+	// Unpin lists services of a chatty group to leave off the control-plane
+	// host: by default a group (the Kafka family, or `x-haco-group`) is pinned
+	// there together, unless pin_host is given.
+	Unpin []string `json:"unpin"`
 	// KeepRunning: see DeployOptions.KeepRunning.
 	KeepRunning []string `json:"keep_running"`
 	// Fresh skips reusing any currently-unpinned service's existing stored
@@ -574,7 +578,7 @@ func (svc *Service) handleComposePlan(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	plan, decisions, err := svc.ComposePlan(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), req.OnlyService, req.PinHost, req.PinNodes, req.Fresh, req.Force)
+	plan, decisions, err := svc.ComposePlan(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), req.OnlyService, req.PinHost, req.PinNodes, req.Fresh, req.Force, req.Unpin)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -592,7 +596,7 @@ func (svc *Service) handleComposeBuild(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	plan, results, err := svc.ComposeBuild(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), DeployOptions{NoCache: req.NoCache, OnlyService: req.OnlyService, PinHost: req.PinHost, PinNodes: req.PinNodes})
+	plan, results, err := svc.ComposeBuild(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), DeployOptions{NoCache: req.NoCache, OnlyService: req.OnlyService, PinHost: req.PinHost, PinNodes: req.PinNodes, Unpin: req.Unpin})
 	if err != nil {
 		status := http.StatusInternalServerError
 		if plan != nil && !plan.Valid() {
@@ -610,7 +614,7 @@ func (svc *Service) handleComposeDeploy(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	plan, results, err := svc.ComposeDeploy(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), DeployOptions{NoCache: req.NoCache, OnlyService: req.OnlyService, PinHost: req.PinHost, PinNodes: req.PinNodes, Fresh: req.Fresh, Force: req.Force, KeepRunning: req.KeepRunning})
+	plan, results, err := svc.ComposeDeploy(r.Context(), req.Project, req.WorkingDir, []byte(req.Yaml), DeployOptions{NoCache: req.NoCache, OnlyService: req.OnlyService, PinHost: req.PinHost, PinNodes: req.PinNodes, Unpin: req.Unpin, Fresh: req.Fresh, Force: req.Force, KeepRunning: req.KeepRunning})
 	if err != nil {
 		status := http.StatusInternalServerError
 		if plan != nil && !plan.CanDeploy() {

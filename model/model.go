@@ -243,6 +243,11 @@ type Workload struct {
 	// migration, a seed) that must have exited with code 0 before this
 	// workload starts; a non-zero exit fails this workload too.
 	DependsOnCompleted []string
+	// Group names a set of services that talk to each other constantly
+	// (the Kafka family, or `x-haco-group` in the Compose file). Set at plan
+	// time only, not stored: the scheduler keeps a group on one node, and the
+	// plan warns when it ends up split.
+	Group string
 	// HealthCheck is this workload's own Docker healthcheck, when its
 	// Compose service declares one and it isn't disabled — nil otherwise.
 	// When set, the agent waits for Docker to report it healthy before
@@ -454,7 +459,10 @@ type ScoreFactors struct {
 	// with its pinned services) gets fewer of the rest. 1.0 when empty,
 	// falling toward 0 as it fills up.
 	SpreadFit float64
-	Total     float64
+	// GroupFit is 1 on a node that already holds other members of the
+	// workload's group, 0 otherwise, so a group tends to stay together.
+	GroupFit float64
+	Total    float64
 }
 
 // Decision is the full, inspectable outcome of one scheduling attempt

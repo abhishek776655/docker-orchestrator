@@ -244,7 +244,18 @@ Docker reads the file:
 | `x-haco-pin-node: <node-id>` | Always run on that node |
 | `x-haco-place-anywhere: true` | Opt out of the automatic bind-mount handling; place it like any other service |
 | `x-haco-allow-fresh-volume: true` | If its data's node is lost, reschedule onto an empty volume instead of failing |
+| `x-haco-group: <name>` | Services sharing a name talk constantly; they are kept together (see below) |
 | `x-haco-bind-host-path: true` | Also ship other bind-mounted folders with the service (mounted live when it is pinned to the control-plane machine) |
+
+Services that talk to each other constantly (the Kafka family — Kafka,
+ZooKeeper, Schema Registry, ksql — found by image name, or any services you
+give the same `x-haco-group`) are pinned to the control-plane machine
+together by default, because splitting them across Wi-Fi costs a network hop
+per message. `--unpin <service,...>` on `plan` and `deploy` lets the scheduler
+place one elsewhere; the plan then warns what it is separated from, and the
+scheduler prefers the node that already holds the rest of its group. An
+explicit `--pin-host` list means you made your own choice, so the default
+steps aside.
 
 ## How it works
 

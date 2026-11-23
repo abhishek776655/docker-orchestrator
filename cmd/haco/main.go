@@ -119,12 +119,13 @@ func plan(baseURL string, args []string) error {
 			"only_service": o.services,
 			"pin_host":     o.pinHost,
 			"pin_nodes":    o.pinNodes,
+			"unpin":        o.unpin,
 			"fresh":        o.fresh,
 		})
 		return post(baseURL, "/v1/compose/plan", body)
 	}
 
-	out, err := fetchPlan(baseURL, project, workingDir, yaml, o.services, o.pinHost, o.pinNodes, o.fresh)
+	out, err := fetchPlan(baseURL, project, workingDir, yaml, o.services, o.pinHost, o.pinNodes, o.unpin, o.fresh)
 	if err != nil {
 		return err
 	}
@@ -196,7 +197,7 @@ type planView struct {
 
 // fetchPlan POSTs to /v1/compose/plan and returns the decoded response.
 // Shared by `plan` (display) and `deploy` (fresh-volume consent check).
-func fetchPlan(baseURL, project, workingDir string, yaml []byte, onlyService string, pinHost *[]string, pinNodes map[string][]string, fresh bool) (planView, error) {
+func fetchPlan(baseURL, project, workingDir string, yaml []byte, onlyService string, pinHost *[]string, pinNodes map[string][]string, unpin []string, fresh bool) (planView, error) {
 	body, _ := json.Marshal(map[string]any{
 		"project":      project,
 		"working_dir":  workingDir,
@@ -204,6 +205,7 @@ func fetchPlan(baseURL, project, workingDir string, yaml []byte, onlyService str
 		"only_service": onlyService,
 		"pin_host":     pinHost,
 		"pin_nodes":    pinNodes,
+		"unpin":        unpin,
 		"fresh":        fresh,
 	})
 	resp, err := http.Post(baseURL+"/v1/compose/plan", "application/json", bytes.NewReader(body))
@@ -292,6 +294,7 @@ func buildCmd(baseURL string, args []string) error {
 		"only_service": o.services,
 		"pin_host":     o.pinHost,
 		"pin_nodes":    o.pinNodes,
+		"unpin":        o.unpin,
 	})
 	return post(baseURL, "/v1/compose/build", body)
 }
@@ -311,9 +314,9 @@ func deploy(baseURL string, args []string) error {
 		return err
 	}
 	yes, noCache, fresh := o.yes, o.noCache, o.fresh
-	onlyService, pinHost, pinNodes := o.services, o.pinHost, o.pinNodes
+	onlyService, pinHost, pinNodes, unpin := o.services, o.pinHost, o.pinNodes, o.unpin
 
-	if planned, err := fetchPlan(baseURL, project, workingDir, yaml, onlyService, pinHost, pinNodes, fresh); err == nil {
+	if planned, err := fetchPlan(baseURL, project, workingDir, yaml, onlyService, pinHost, pinNodes, unpin, fresh); err == nil {
 		if warnings := freshVolumeWarnings(planned); len(warnings) > 0 {
 			fmt.Println("WARNING: the following pinned services will get a brand-new, empty volume — data on their current node will NOT be migrated:")
 			for service, msgs := range warnings {
@@ -349,6 +352,7 @@ func deploy(baseURL string, args []string) error {
 		"only_service": onlyService,
 		"pin_host":     pinHost,
 		"pin_nodes":    pinNodes,
+		"unpin":        unpin,
 		"fresh":        fresh,
 	})
 	return deployAndWatch(baseURL, project, body)

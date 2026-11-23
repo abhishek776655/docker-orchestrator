@@ -23,6 +23,7 @@ type composeOpts struct {
 	jsonOut  bool
 	pinHost  *[]string
 	pinNodes map[string][]string
+	unpin    []string // chatty-group services to leave off the host
 	// legacy is set when the older "<project> <file>" form was used.
 	legacy bool
 }
@@ -79,6 +80,12 @@ func parseComposeArgs(cmd string, args []string, flags ...string) (composeOpts, 
 			}
 			list := splitPinHost(v)
 			o.pinHost = &list
+		case "--unpin":
+			v, err := value()
+			if err != nil {
+				return o, err
+			}
+			o.unpin = append(o.unpin, splitPinHost(v)...)
 		case "--pin-node":
 			v, err := value()
 			if err != nil {
